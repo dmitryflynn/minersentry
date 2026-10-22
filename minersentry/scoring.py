@@ -28,9 +28,16 @@ def name_stem(name: str) -> str:
 
 
 def is_miner_name(name: str, cfg: Config) -> bool:
-    """True if the process name matches a known miner (exact stem or substring)."""
+    """True if the process name matches a known miner.
+
+    Exact stem match against the full name list, plus a substring match against
+    only the *distinctive* identifiers — so a renamed `xmrig-notls.exe` is caught
+    while an unrelated `examiner.exe` / `DataMiner.exe` is not.
+    """
     stem = name_stem(name)
-    return stem in cfg.known_miner_names or any(k in stem for k in cfg.known_miner_names)
+    if stem in cfg.known_miner_names:
+        return True
+    return any(k in stem for k in cfg.known_miner_substrings)
 
 
 def score_cpu(recent: list[float], ncpu: int, cfg: Config) -> Signal:

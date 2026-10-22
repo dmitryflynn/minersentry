@@ -47,11 +47,22 @@ class Config:
     net_score_weak: int = 30
 
     # -- name/path signal ----------------------------------------------------
+    # Exact stem matches (the whole process name, .exe stripped). Generic tokens
+    # like "miner" live here ONLY — matched exactly, never as a substring, so
+    # legit apps such as examiner.exe / DataMiner.exe are not flagged.
     known_miner_names: frozenset[str] = field(default_factory=lambda: frozenset({
         "xmrig", "xmr-stak", "nbminer", "phoenixminer", "t-rex", "trex",
         "lolminer", "ethminer", "cgminer", "bfgminer", "ccminer", "cpuminer",
         "minerd", "nanominer", "gminer", "teamredminer", "srbminer",
         "xmrig-cuda", "wildrig", "miner", "winring0",
+    }))
+    # Distinctive identifiers matched as a SUBSTRING too, to catch renamed
+    # variants (e.g. "xmrig-notls.exe"). Only tokens unlikely to appear inside an
+    # unrelated program name belong here — never bare "miner".
+    known_miner_substrings: frozenset[str] = field(default_factory=lambda: frozenset({
+        "xmrig", "xmr-stak", "nbminer", "phoenixminer", "lolminer", "cgminer",
+        "bfgminer", "ccminer", "cpuminer", "nanominer", "teamredminer",
+        "srbminer", "wildrig",
     }))
     suspicious_dir_hints: tuple[str, ...] = (
         "\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",

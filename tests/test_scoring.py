@@ -2,8 +2,8 @@
 
 from minersentry.config import Config
 from minersentry.scoring import (
-    Signal, combine, score_cpu, score_dataset, score_gpu, score_memory,
-    score_name, score_network, score_probe,
+    Signal, combine, is_miner_name, score_cpu, score_dataset, score_gpu,
+    score_memory, score_name, score_network, score_probe,
 )
 
 CFG = Config()
@@ -131,6 +131,20 @@ def test_name_known_miner():
 
 def test_name_unremarkable():
     assert score_name("notepad.exe", "c:\\windows\\system32\\notepad.exe", CFG).score == 0
+
+
+def test_is_miner_name_exact_and_variant():
+    assert is_miner_name("xmrig.exe", CFG)          # exact
+    assert is_miner_name("miner.exe", CFG)          # exact generic token
+    assert is_miner_name("xmrig-notls.exe", CFG)    # renamed variant (substring)
+
+
+def test_is_miner_name_no_substring_false_positive():
+    # legit apps containing "miner" must NOT be flagged (the bare-"miner"
+    # substring bug): examiner, DataMiner, etc.
+    assert not is_miner_name("examiner.exe", CFG)
+    assert not is_miner_name("DataMiner.exe", CFG)
+    assert not is_miner_name("notepad.exe", CFG)
 
 
 # -- probe signal -----------------------------------------------------------
