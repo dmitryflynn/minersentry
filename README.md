@@ -39,10 +39,11 @@ of visible processes (a rootkit-hidden PID), or sustained load inside a VM/WSL
 host (`vmmem`/`vmwp`) you can't see into.
 
 The deep memory scan targets not just the busiest processes but **any process
-holding a pool connection or carrying a miner-like name**, regardless of CPU —
-so a heavily throttled stealth miner can't hide under the CPU floor: its pool
-connection pulls it in for a memory scan, and the resident strings then
-corroborate the connection into a verdict.
+holding a pool connection, a miner-like name, or a RandomX-dataset-sized (~2 GiB)
+private allocation — regardless of CPU**. So a heavily throttled stealth miner
+can't hide under the CPU floor: a RandomX miner's 2 GiB dataset (or its pool
+connection) pulls it in for a memory scan, and the resident strings then
+corroborate it into a verdict even when it's using almost no CPU.
 
 ### Conviction rules
 
@@ -166,6 +167,11 @@ an isolated VM, which the harness never runs itself.
 - A miner running *under* a validly-signed interpreter (e.g. a Python/Node
   script) is dampened along with the interpreter; this is the deliberate
   low-false-positive trade (behavioral cpu/gpu/probe signals are never dampened).
+- Remaining sensitivity floor: a miner that is throttled below the CPU floor
+  **and** has no pool connection, no miner-like name, no resident miner strings,
+  and no large dataset (e.g. a tiny cache-mode variant) can still slip. Catching
+  that needs per-process hardware performance counters (cache-miss / AES-rate
+  fingerprinting via ETW/PMU) — the planned next detection signal.
 
 ## Testing
 

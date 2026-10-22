@@ -72,6 +72,13 @@ def test_deep_targets_capped():
     assert len(e.deep_scan_targets(limit=6)) <= 6 * 3
 
 
+def test_deep_targets_include_big_memory_pid():
+    # a ~2 GiB private allocation (RandomX dataset) is scanned regardless of CPU
+    e = _engine()
+    e._big_mem_pids = {55501}
+    assert 55501 in e.deep_scan_targets()
+
+
 def test_deep_targets_force_survives_cap():
     # explicitly-forced PIDs must never be dropped by the cap, even when many
     # pool-connected processes would otherwise fill it

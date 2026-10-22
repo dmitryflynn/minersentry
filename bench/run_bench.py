@@ -33,7 +33,8 @@ FAKE_MINER = os.path.join(ROOT, "samples", "fake_miner.py")
 PROFILES = [
     ("stock full-core", ["--threads", "1"], "an un-throttled CPU miner"),
     ("cpu-capped 60%", ["--threads", "1", "--cap", "60"], "a miner throttled to stay busy but moderate"),
-    ("cpu-capped 20%", ["--threads", "1", "--cap", "20"], "a heavily-throttled stealth miner (no pool)"),
+    ("cpu-capped 20% (bare)", ["--threads", "1", "--cap", "20"], "a throttled miner with no dataset/pool/name (the sensitivity floor)"),
+    ("cpu-capped 20% + RandomX dataset", ["--threads", "1", "--cap", "20", "--dataset", "2048"], "a throttled RandomX miner — its ~2 GiB dataset gives it away"),
     ("cpu-capped 25% + pool", ["--threads", "1", "--cap", "25", "--net"], "a stealth miner that still talks to a pool"),
     ("pool connection", ["--threads", "1", "--net"], "a miner holding a stratum pool connection"),
     ("evasion (headless)", ["--threads", "1", "--evade"], "a miner that pauses when a monitor opens"),

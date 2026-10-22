@@ -134,6 +134,9 @@ class Config:
         ("gpu", 60, "name", 70, 85),
         ("gpu", 55, "network", 60, 85),
         ("gpu", 60, "cpu", 45, 80),
+        # RandomX ~2 GiB dataset + resident miner strings is diagnostic even at
+        # low CPU — this is what catches a heavily-throttled stealth miner.
+        ("dataset", 60, "memory", 60, 82),
     )
 
     # -- trust dampening -----------------------------------------------------
@@ -157,6 +160,11 @@ class Config:
     # ~0.3 of a core). A CPU miner is by definition busy, so this keeps the deep
     # scan fast and skips idle processes whose resident strings are irrelevant.
     deep_cpu_floor: float = 30.0
+    # A process holding a private allocation this large is a RandomX-dataset-sized
+    # working set (~2 GiB). It is memory-scanned regardless of CPU, so a heavily
+    # throttled stealth miner can't hide under the CPU floor.
+    dataset_private_bytes: int = 1900 * 1024 * 1024
+    dataset_score: int = 70
 
     @classmethod
     def load(cls, path: str | None = None) -> "Config":

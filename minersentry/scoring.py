@@ -161,6 +161,17 @@ def score_probe(drop: float, cfg: Config) -> Signal:
     return Signal("probe", 0, "no evasion reaction observed")
 
 
+def score_dataset(large_dataset: bool, cfg: Config) -> Signal:
+    """A confirmed RandomX-dataset-sized committed region (~2 GiB). Not part of
+    the weighted blend on its own (a database or VM can hold 2 GiB too); it
+    convicts only in combination with resident miner strings (see the
+    dataset+memory conviction rule), which together are diagnostic even when the
+    miner is throttled below the CPU floor."""
+    if large_dataset:
+        return Signal("dataset", cfg.dataset_score, "~2 GiB RandomX-sized dataset resident")
+    return Signal("dataset", 0, "no large dataset region")
+
+
 def combine(signals: list[Signal], cfg: Config) -> tuple[int, str]:
     """Blend signal scores into a final (score, verdict).
 

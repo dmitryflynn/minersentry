@@ -21,8 +21,8 @@ from . import memscan, power, trust
 from .audit import AuditLog
 from .config import Config
 from .scoring import (
-    Signal, combine, is_miner_name, name_stem, score_cpu, score_gpu,
-    score_memory, score_name, score_network, score_probe,
+    Signal, combine, is_miner_name, name_stem, score_cpu, score_dataset,
+    score_gpu, score_memory, score_name, score_network, score_probe,
 )
 
 
@@ -86,6 +86,9 @@ class Engine:
         # as a stable snapshot by the GUI's background deep thread (so that thread
         # never walks the live _cpu_hist/_meta/_conn_seen dicts concurrently).
         self._deep_targets: list[int] = []
+        # PIDs holding a RandomX-dataset-sized private allocation (huge memory,
+        # any CPU) — always worth a memory scan.
+        self._big_mem_pids: set[int] = set()
         self.audit = audit or AuditLog()
         self.last_scan_errors = 0  # memory OpenProcess failures last deep pass
         for p in psutil.process_iter():  # prime per-process cpu_percent baselines
@@ -158,11 +161,13 @@ class Engine:
                 name_sig = Signal("name", int(name_sig.score * cfg.trusted_dampen),
                                   name_sig.detail + " (trusted-signed: dampened)")
 
+        large_dataset = bool(info.mem_result and info.mem_result.large_page_dataset)
         return [
             cpu_sig, gpu_sig, mem_sig,
             score_network(self._pool_hits(info.pid, raddrs, now), cfg),
             name_sig,
             score_probe(self._probe_drops.get(info.pid, 0.0), cfg),
+            score_dataset(large_dataset, cfg),
         ]
 
     # -- deep (memory) scanning: driven async by the GUI, or sync by CLI -----
@@ -209,6 +214,8 @@ class Engine:
         for pid, meta in list(self._meta.items()):     # miner-like name, any CPU
             if is_miner_name(meta[0], self.cfg):
                 _add(pid)
+        for pid in list(self._big_mem_pids):            # ~2 GiB dataset, any CPU
+            _add(pid)
         # Cap only the auto-discovered additions so the list can't grow without
         # bound, while always keeping the busy and explicitly-forced targets.
         return targets[:max(protected, max(1, limit) * 3)]
@@ -230,19 +237,27 @@ class Engine:
         a background thread so the live loop never blocks)."""
         now = time.time()
         procs: list[tuple[psutil.Process, float]] = []
-        # Batch name + cpu_percent through process_iter so each process costs a
-        # single proc_info syscall this pass (reading them separately doubled it).
-        for p in psutil.process_iter(["pid", "name", "cpu_percent"]):
+        big_mem: set[int] = set()
+        # Batch name + cpu_percent + memory_info through process_iter so each
+        # process costs a single proc_info syscall this pass (reading them
+        # separately multiplied it). memory_info lets us spot a RandomX-dataset-
+        # sized private allocation cheaply, regardless of CPU.
+        for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_info"]):
             if p.pid == 0:
                 continue
             raw = p.info.get("cpu_percent")
             if raw is None:
                 continue
             procs.append((p, raw))
+            mi = p.info.get("memory_info")
+            if mi is not None and getattr(mi, "private", 0) >= self.cfg.dataset_private_bytes \
+                    and p.pid != self._self_pid:
+                big_mem.add(p.pid)
             if p.pid not in self._warm:  # drop the unreliable first reading
                 self._warm.add(p.pid)
                 continue
             self._cpu_hist[p.pid].append((now, raw))
+        self._big_mem_pids = big_mem
 
         if deep:
             self.last_scan_errors = 0

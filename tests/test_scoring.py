@@ -2,8 +2,8 @@
 
 from minersentry.config import Config
 from minersentry.scoring import (
-    Signal, combine, score_cpu, score_gpu, score_memory, score_name,
-    score_network, score_probe,
+    Signal, combine, score_cpu, score_dataset, score_gpu, score_memory,
+    score_name, score_network, score_probe,
 )
 
 CFG = Config()
@@ -163,6 +163,26 @@ def test_cpu_plus_network_is_conviction():
 def test_probe_catch_with_cpu_is_conviction():
     score, verdict = combine([sig("cpu", 60), sig("probe", 95)], CFG)
     assert verdict == "Likely Miner"
+
+
+def test_dataset_signal():
+    assert score_dataset(True, CFG).score == CFG.dataset_score
+    assert score_dataset(False, CFG).score == 0
+
+
+def test_dataset_plus_memory_convicts_even_at_low_cpu():
+    # the stealth-cap RandomX case: throttled below the CPU floor (cpu 0) but
+    # holding the ~2 GiB dataset + resident miner strings
+    score, verdict = combine(
+        [sig("cpu", 0), sig("dataset", 70), sig("memory", 100)], CFG)
+    assert verdict == "Likely Miner"
+
+
+def test_big_dataset_without_strings_stays_clean():
+    # a database / VM can hold a 2 GiB region and pin CPU; with no miner strings
+    # it must NOT be convicted (dataset is out of the weighted blend on purpose)
+    score, verdict = combine([sig("dataset", 70), sig("cpu", 92)], CFG)
+    assert verdict != "Likely Miner"
 
 
 def test_memory_plus_network_is_conviction():
