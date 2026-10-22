@@ -1,0 +1,5 @@
+psutil>=5.9
+# pyinstaller is only needed to build the standalone .exe, not to run from source.
+pyinstaller>=6.0
+# pytest is dev-only (running the unit suite), not required to run the app.
+pytest>=7.0
