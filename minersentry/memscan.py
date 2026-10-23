@@ -20,9 +20,14 @@ STRING_MARKERS = {
     b"stratum+tcp": ("stratum pool URL scheme", 40),
     b"stratum+ssl": ("stratum pool URL scheme (TLS)", 40),
     b"xmrig": ("XMRig miner identifier", 45),
-    b"randomx": ("RandomX algorithm name", 35),
-    b"rx/0": ("RandomX variant tag", 30),
-    b"cryptonight": ("CryptoNight algorithm name", 35),
+    # Algorithm NAMES are weak — they appear in crypto libraries, benchmark
+    # tools, and even coincidentally in a plain interpreter's memory — so they
+    # must never reach the memory conviction/hard-evidence thresholds on their
+    # own. Only the stratum/xmrig/pool PROTOCOL strings (near-zero in legit
+    # software) carry real weight.
+    b"randomx": ("RandomX algorithm name", 10),
+    b"rx/0": ("RandomX variant tag", 12),
+    b"cryptonight": ("CryptoNight algorithm name", 10),
     b"\"method\":\"login\"": ("stratum login handshake", 40),
     b"\"method\":\"submit\"": ("stratum share submission", 45),
     b"\"job_id\"": ("stratum job payload", 30),

@@ -35,6 +35,7 @@ def run_session(duration: float, cfg: Config | None = None,
     those processes, not just filters the report).
     """
     e = Engine(cfg=cfg or Config.load())
+    e.start_pool_intel()
     interval = interval if interval is not None else e.cfg.scan_interval
     start = time.time()
     first_hit: dict[int, float] = {}

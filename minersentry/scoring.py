@@ -78,23 +78,26 @@ def score_memory(mem_scanned: bool, mem_score: int, labels: list[str],
     return Signal("memory", mem_score, "; ".join(labels[:5]))
 
 
-def score_network(hits: list[tuple[str, int, bool, bool]], cfg: Config) -> Signal:
-    """hits: list of (remote_ip, remote_port, is_common_legit_port, persisted).
-
-    A connection that has stayed ESTABLISHED to a pool-range port across many
-    scans (persisted) is far more miner-like than a transient one, so it earns a
-    bump and a persisted ambiguous port is promoted above transient noise.
-    """
+def score_network(hits: list[tuple[str, int, bool, bool, bool]], cfg: Config) -> Signal:
+    """hits: list of (remote_ip, remote_port, is_common_legit_port, persisted,
+    known_pool). A connection to a resolved known-pool IP ranks highest; failing
+    that, a stratum-typical port, with a bump when the connection has persisted
+    across many scans (a transient hit is far weaker)."""
     if not hits:
         return Signal("network", 0, "no pool-like connections")
+    known = [h for h in hits if h[4]]
+    if known:
+        ip, port, _, _, _ = known[0]
+        return Signal("network", cfg.net_score_known_pool,
+                      f"connected to a KNOWN mining pool at {ip}:{port}")
     strong = [h for h in hits if not h[2]]
     if strong:
-        ip, port, _, persisted = strong[0]
+        ip, port, _, persisted, _ = strong[0]
         score = cfg.net_score_strong + (cfg.net_score_persist if persisted else 0)
         note = " (long-lived)" if persisted else ""
         return Signal("network", min(100, score),
                       f"established to {ip}:{port} (stratum-typical port){note}")
-    ip, port, _, persisted = hits[0]
+    ip, port, _, persisted, _ = hits[0]
     if persisted:
         return Signal("network", cfg.net_score_strong,
                       f"long-lived connection to {ip}:{port} (ambiguous port, persisted)")

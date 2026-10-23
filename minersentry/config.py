@@ -60,6 +60,9 @@ class Config:
     }))
     net_score_strong: int = 70
     net_score_weak: int = 30
+    net_score_known_pool: int = 90    # connected to a resolved known-pool IP
+    pool_intel_enabled: bool = True
+    pool_refresh_seconds: float = 900.0
 
     # -- name/path signal ----------------------------------------------------
     # Exact stem matches (the whole process name, .exe stripped). Generic tokens
@@ -166,6 +169,13 @@ class Config:
         ("perf", 70, "dataset", 60, 85),
         ("perf", 40, "memory", 60, 82),
         ("perf", 40, "name", 70, 85),
+        # A connection to a RESOLVED known-pool IP (network >= 88) is near
+        # conclusive — legit software has no reason to talk to supportxmr — so a
+        # minimal behavioral corroborator convicts.
+        ("network", 88, "cpu", 28, 82),
+        ("network", 88, "gpu", 40, 82),
+        ("network", 88, "memory", 40, 85),
+        ("network", 88, "dataset", 60, 85),
     )
 
     # -- trust dampening -----------------------------------------------------

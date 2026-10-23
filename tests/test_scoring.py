@@ -61,25 +61,37 @@ def test_memory_hits_pass_through_score():
     assert s.score == 100
 
 
-# -- network signal ---------------------------------------------------------
+# -- network signal --------------------------------------------------------
+# hit tuple: (ip, port, is_common_legit, persisted, known_pool)
 def test_network_strong_port():
-    s = score_network([("1.2.3.4", 3333, False, False)], CFG)
+    s = score_network([("1.2.3.4", 3333, False, False, False)], CFG)
     assert s.score == CFG.net_score_strong
 
 
 def test_network_ambiguous_port_is_weak():
-    s = score_network([("1.2.3.4", 8080, True, False)], CFG)
+    s = score_network([("1.2.3.4", 8080, True, False, False)], CFG)
     assert s.score == CFG.net_score_weak
 
 
 def test_network_persisted_strong_gets_bump():
-    s = score_network([("1.2.3.4", 3333, False, True)], CFG)
+    s = score_network([("1.2.3.4", 3333, False, True, False)], CFG)
     assert s.score == min(100, CFG.net_score_strong + CFG.net_score_persist)
 
 
+def test_network_known_pool_ranks_highest():
+    # a connection to a resolved known-pool IP on any port outranks everything
+    s = score_network([("1.2.3.4", 443, False, False, True)], CFG)
+    assert s.score == CFG.net_score_known_pool
+
+
+def test_known_pool_plus_minimal_cpu_convicts():
+    score, verdict = combine([sig("network", CFG.net_score_known_pool), sig("cpu", 35)], CFG)
+    assert verdict == "Likely Miner"
+
+
 def test_network_persisted_ambiguous_promoted():
-    weak = score_network([("1.2.3.4", 8080, True, False)], CFG).score
-    persisted = score_network([("1.2.3.4", 8080, True, True)], CFG).score
+    weak = score_network([("1.2.3.4", 8080, True, False, False)], CFG).score
+    persisted = score_network([("1.2.3.4", 8080, True, True, False)], CFG).score
     assert persisted > weak
 
 

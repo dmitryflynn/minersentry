@@ -58,7 +58,7 @@ that corroboration requirement is what keeps false positives down.
 | **cpu** | Sustained, steady **core saturation** (a high *floor*, not a bursty peak). Measured per-core, so a one-thread miner on a 20-core box is still caught. |
 | **gpu** | Sustained **GPU compute-engine** utilization by a headless process — catches GPU-only miners that CPU accounting can't see. Per-process compute load comes from the Windows PDH "GPU Engine" counters (vendor-neutral); a CUDA compute context (nvidia-smi) raises confidence. Windowed apps (games/creative) and an allowlist (Blender, OBS, DaVinci, ffmpeg…) are dampened. |
 | **memory** | Read-only scan of each process's committed memory for miner fingerprints: `stratum+tcp`, `xmrig`, `RandomX`, stratum login/submit JSON, pool names, and a ~2 GiB RandomX dataset. Finds miners injected into signed processes. |
-| **network** | Established TCP connections to stratum-typical pool ports. A connection that stays open across many scans (persisted) scores higher than a transient one. |
+| **network** | Established TCP connections to stratum-typical pool ports, and — via bundled threat intel — connections to a **resolved known mining-pool IP on *any* port** (e.g. a pool on 443). A persisted connection scores higher than a transient one. |
 | **name** | Known miner binary names and execution from suspicious directories (Temp, ProgramData, roaming on Windows; /tmp, /dev/shm, /var/tmp on Linux). |
 | **probe** | The **evasion probe** (see below). |
 | **perf** *(Linux)* | Per-process **cache-misses-per-instruction** via user-mode `perf_event_open`. RandomX's random reads across its ~2 GB dataset produce an order-of-magnitude higher miss rate than ordinary compute — a fingerprint of the algorithm visible even when the miner is CPU-capped. Degrades to a no-op where `perf_event_paranoid` forbids it. |
@@ -184,6 +184,31 @@ scanner correctly won't flag them, so the table measures MinerSentry's
 *behavioral* coverage (including its sensitivity floor on heavily CPU-capped
 miners), not a signature head-to-head — a real comparison needs live malware in
 an isolated VM, which the harness never runs itself.
+
+## False positives
+
+A cryptominer detector is only useful if it doesn't flag the legitimate heavy
+software people actually run. `bench/fp_corpus.py` drives real, benign workloads
+that deliberately **resemble a miner** — sustained full-core CPU, and (worst
+case) real cryptographic hashing with crypto constants resident in memory — and
+checks that none is flagged:
+
+```bash
+python bench/fp_corpus.py        # -> bench/fp_results.md
+```
+
+| Benign workload (resembles a miner) | Verdict | Signals that fired |
+|---|---|---|
+| 7-Zip LZMA benchmark (pins every core) | **Clean** | cpu 92 |
+| Python SHA-256 hashing (unsigned; CPU + crypto constants) | **Clean** | cpu 92, memory (weak) |
+| Python CPU compute (steady full core) | **Clean** | cpu 92 |
+| node CPU compute | **Clean** | cpu 92 |
+
+**0 false positives.** Sustained CPU — even alongside crypto constants — is
+capped at *Suspicious* by the corroboration rule: a verdict needs a behavioral
+signal **plus** a miner-specific artifact (resident stratum/XMRig strings, a
+known-pool connection, a ~2 GiB RandomX dataset, a miner name, or the evasion
+reaction), none of which legitimate software has.
 
 ## Limitations (honest ones)
 

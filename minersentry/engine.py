@@ -17,7 +17,7 @@ from collections import defaultdict, deque
 
 import psutil
 
-from . import memscan, perfcounters, power, trust
+from . import memscan, perfcounters, poolintel, power, trust
 from .audit import AuditLog
 from .config import Config
 from .scoring import (
@@ -79,6 +79,9 @@ class Engine:
         self.system_cpu_pct = 0.0  # single-owner system CPU reading (0-100)
         # Network-connection persistence: (pid, ip, port) -> first-seen ts.
         self._conn_seen: dict[tuple[int, str, int], float] = {}
+        # Resolved known-mining-pool IPs (populated by a background thread via
+        # start_pool_intel(); empty until then, so tests do no DNS).
+        self._pool_ips: set[str] = set()
         # Hidden-compute tracking.
         self._gap_streak = 0
         self.hidden_report = power.HiddenComputeReport()
@@ -106,12 +109,15 @@ class Engine:
                    now: float) -> list[tuple[str, int, bool, bool]]:
         hits = []
         for ip, port in raddrs:
-            if port not in self.cfg.pool_ports:
+            known_pool = ip in self._pool_ips
+            # a known-pool IP counts on ANY port; otherwise only pool-range ports
+            if port not in self.cfg.pool_ports and not known_pool:
                 continue
             key = (pid, ip, port)
             first = self._conn_seen.setdefault(key, now)
             persisted = (now - first) >= self.cfg.net_persist_seconds
-            hits.append((ip, port, port in self.cfg.common_legit_ports, persisted))
+            hits.append((ip, port, port in self.cfg.common_legit_ports,
+                         persisted, known_pool))
         return hits
 
     def _mem_labels(self, r: memscan.MemScanResult | None) -> tuple[bool, int, list[str], str | None, int]:
@@ -408,6 +414,26 @@ class Engine:
 
     def set_probe_drops(self, drops: dict[int, float]) -> None:
         self._probe_drops = dict(drops)
+
+    def set_pool_ips(self, ips: set[str]) -> None:
+        self._pool_ips = set(ips)
+
+    def start_pool_intel(self) -> None:
+        """Start a background thread that resolves the known mining-pool domains
+        to IPs and refreshes them periodically. No-op if disabled; never started
+        by tests (they'd do real DNS), so _pool_ips stays empty there."""
+        if not self.cfg.pool_intel_enabled:
+            return
+
+        def _loop():
+            while True:
+                try:
+                    self.set_pool_ips(poolintel.resolve_pool_ips())
+                except Exception:  # noqa: BLE001 - DNS must never crash the app
+                    pass
+                time.sleep(max(60.0, self.cfg.pool_refresh_seconds))
+
+        threading.Thread(target=_loop, daemon=True).start()
 
     def set_gpu_util(self, util: dict[int, float], window_pids: set[int] | None = None,
                      ctx_pids: set[int] | None = None) -> None:
