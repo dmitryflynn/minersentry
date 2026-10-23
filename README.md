@@ -4,10 +4,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 
-A behavioral cryptominer detector for Windows 10/11. It catches CPU/GPU mining
-malware by **the work it has to do**, not by file hashes — so recompiled,
-packed, renamed, or process-injected miners still show up where a signature
-scanner misses them.
+A behavioral cryptominer detector for **Windows 10/11 and Linux**. It catches
+CPU/GPU mining malware by **the work it has to do**, not by file hashes — so
+recompiled, packed, renamed, or process-injected miners still show up where a
+signature scanner misses them. On Linux it adds a hardware-performance-counter
+signal that detects a RandomX miner by its memory-hardness even when throttled.
 
 > Defensive security tool. The included `samples/fake_miner.py` is a **benign**
 > test target — it reproduces miner *behaviors* but mines nothing and connects
@@ -34,8 +35,9 @@ corroboration requirement is what keeps false positives down.
 | **gpu** | Sustained **GPU compute-engine** utilization by a headless process — catches GPU-only miners that CPU accounting can't see. Per-process compute load comes from the Windows PDH "GPU Engine" counters (vendor-neutral); a CUDA compute context (nvidia-smi) raises confidence. Windowed apps (games/creative) and an allowlist (Blender, OBS, DaVinci, ffmpeg…) are dampened. |
 | **memory** | Read-only scan of each process's committed memory for miner fingerprints: `stratum+tcp`, `xmrig`, `RandomX`, stratum login/submit JSON, pool names, and a ~2 GiB RandomX dataset. Finds miners injected into signed processes. |
 | **network** | Established TCP connections to stratum-typical pool ports. A connection that stays open across many scans (persisted) scores higher than a transient one. |
-| **name** | Known miner binary names and execution from suspicious directories (Temp, ProgramData, roaming). |
+| **name** | Known miner binary names and execution from suspicious directories (Temp, ProgramData, roaming on Windows; /tmp, /dev/shm, /var/tmp on Linux). |
 | **probe** | The **evasion probe** (see below). |
+| **perf** *(Linux)* | Per-process **cache-misses-per-instruction** via user-mode `perf_event_open`. RandomX's random reads across its ~2 GB dataset produce an order-of-magnitude higher miss rate than ordinary compute — a fingerprint of the algorithm visible even when the miner is CPU-capped. Degrades to a no-op where `perf_event_paranoid` forbids it. |
 
 Alongside the per-process signals, a **hidden-compute** banner flags work the
 process list can't explain: a persistent gap between system-wide CPU and the sum
@@ -180,11 +182,14 @@ an isolated VM, which the harness never runs itself.
 - A miner running *under* a validly-signed interpreter (e.g. a Python/Node
   script) is dampened along with the interpreter; this is the deliberate
   low-false-positive trade (behavioral cpu/gpu/probe signals are never dampened).
-- Remaining sensitivity floor: a miner that is throttled below the CPU floor
-  **and** has no pool connection, no miner-like name, no resident miner strings,
-  and no large dataset (e.g. a tiny cache-mode variant) can still slip. Catching
-  that needs per-process hardware performance counters (cache-miss / AES-rate
-  fingerprinting via ETW/PMU) — the planned next detection signal.
+- The hardware-counter (`perf`) signal is **Linux-only** for now — it uses
+  user-mode `perf_event_open`, which has no driver-free equivalent on Windows
+  (the Windows PMU path needs a kernel driver / ETW PMU session and is deferred).
+  On Linux it also requires `/proc/sys/kernel/perf_event_paranoid` ≤ 2 (own
+  processes) or `CAP_PERFMON`/root (other users); otherwise it degrades to off.
+- Remaining sensitivity floor: a miner throttled below the CPU floor with no
+  pool, name, strings, or large dataset **and** on a host where `perf` is
+  unavailable can still slip — the narrow residual case.
 
 ## Testing
 

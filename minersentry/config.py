@@ -14,7 +14,22 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass, field, fields, replace
+
+_IS_WINDOWS = sys.platform == "win32"
+
+# Platform-aware directory defaults (trusted system locations vs. the dirs
+# miners commonly run from). Overridable via config.json like any other field.
+_TRUSTED_DIRS_WIN = ("c:\\program files", "c:\\program files (x86)",
+                     "c:\\windows\\system32", "c:\\windows\\syswow64")
+_TRUSTED_DIRS_POSIX = ("/usr/bin", "/usr/sbin", "/bin", "/sbin",
+                       "/usr/lib", "/usr/libexec", "/opt")
+_SUSPICIOUS_DIRS_WIN = ("\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
+                        "\\programdata\\", "\\windows\\fonts\\", "\\recycle",
+                        "\\appdata\\roaming\\")
+_SUSPICIOUS_DIRS_POSIX = ("/tmp/", "/var/tmp/", "/dev/shm/", "/run/user/",
+                          "/var/www/", "/.cache/")
 
 
 @dataclass
@@ -64,15 +79,10 @@ class Config:
         "bfgminer", "ccminer", "cpuminer", "nanominer", "teamredminer",
         "srbminer", "wildrig",
     }))
-    suspicious_dir_hints: tuple[str, ...] = (
-        "\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
-        "\\programdata\\", "\\windows\\fonts\\", "\\recycle",
-        "\\appdata\\roaming\\",
-    )
-    trusted_dirs: tuple[str, ...] = (
-        "c:\\program files", "c:\\program files (x86)",
-        "c:\\windows\\system32", "c:\\windows\\syswow64",
-    )
+    suspicious_dir_hints: tuple[str, ...] = field(
+        default_factory=lambda: _SUSPICIOUS_DIRS_WIN if _IS_WINDOWS else _SUSPICIOUS_DIRS_POSIX)
+    trusted_dirs: tuple[str, ...] = field(
+        default_factory=lambda: _TRUSTED_DIRS_WIN if _IS_WINDOWS else _TRUSTED_DIRS_POSIX)
     name_score_known: int = 85
     name_score_susp_dir: int = 22
     name_score_short: int = 20
@@ -148,6 +158,11 @@ class Config:
         # RandomX ~2 GiB dataset + resident miner strings is diagnostic even at
         # low CPU — this is what catches a heavily-throttled stealth miner.
         ("dataset", 60, "memory", 60, 82),
+        # Memory-hard cache-miss fingerprint (Linux PMU) + a corroborating
+        # artifact — catches a RandomX miner by its work even when throttled.
+        ("perf", 70, "dataset", 60, 85),
+        ("perf", 70, "memory", 60, 82),
+        ("perf", 70, "name", 70, 85),
     )
 
     # -- trust dampening -----------------------------------------------------
@@ -176,6 +191,14 @@ class Config:
     # throttled stealth miner can't hide under the CPU floor.
     dataset_private_bytes: int = 1900 * 1024 * 1024
     dataset_score: int = 70
+
+    # -- hardware perf-counter signal (Linux, user-mode perf_event_open) ------
+    perf_enabled: bool = True
+    perf_interval: float = 0.3          # seconds to count per candidate PID
+    perf_strong: float = 150.0          # cache misses / 1k instr -> strong
+    perf_moderate: float = 60.0
+    perf_score_strong: int = 75
+    perf_score_moderate: int = 40
 
     @classmethod
     def load(cls, path: str | None = None) -> "Config":

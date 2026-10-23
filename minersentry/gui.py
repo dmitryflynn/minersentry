@@ -263,7 +263,7 @@ class MinerSentryApp:
                 return
             errors = 0
             for pid in pids:
-                r = self.engine.scan_memory(pid)
+                r = self.engine.deep_probe(pid)
                 if r.error and "OpenProcess" in (r.error or ""):
                     errors += 1
             self.q.put(("deepdone", len(pids), errors))

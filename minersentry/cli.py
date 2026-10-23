@@ -45,7 +45,7 @@ def run_session(duration: float, cfg: Config | None = None,
         elapsed = time.time() - start
         if deep and not deep_done and elapsed >= deep_at:
             for pid in e.deep_scan_targets(force=force_pids):
-                e.scan_memory(pid)
+                e.deep_probe(pid)
             deep_done = True
         if gpu_sample:
             util, windows, ctx = gpu_mod.sample()

@@ -55,6 +55,7 @@ PAGE_GUARD = 0x100
 PAGE_NOACCESS = 0x01
 
 IS_WINDOWS = sys.platform == "win32"
+IS_LINUX = sys.platform.startswith("linux")
 
 
 @dataclass
@@ -135,14 +136,23 @@ def scan_process(pid: int, budget_bytes: int = MAX_BYTES_PER_PROC,
                  large_dataset_bytes: int = LARGE_DATASET_BYTES) -> MemScanResult:
     """Walk readable committed memory of `pid`, looking for miner fingerprints.
 
+    Dispatches to the Windows (ReadProcessMemory) or Linux (/proc) backend.
     Budgets (per-process cap, per-region read, large-dataset threshold) are
     passed in so the engine can drive them from Config; defaults match the
     module constants.
     """
+    if IS_WINDOWS:
+        return _scan_windows(pid, budget_bytes, max_region_read, large_dataset_bytes)
+    if IS_LINUX:
+        return _scan_linux(pid, budget_bytes, max_region_read, large_dataset_bytes)
+    r = MemScanResult(pid=pid)
+    r.error = "memory scan unsupported on this platform"
+    return r
+
+
+def _scan_windows(pid: int, budget_bytes: int, max_region_read: int,
+                  large_dataset_bytes: int) -> MemScanResult:
     result = MemScanResult(pid=pid)
-    if not IS_WINDOWS:
-        result.error = "memory scan requires Windows"
-        return result
     if pid <= 4:
         result.error = "system process"
         return result
@@ -190,4 +200,80 @@ def scan_process(pid: int, budget_bytes: int = MAX_BYTES_PER_PROC,
         result.scanned = True
     finally:
         _k32.CloseHandle(handle)
+    return result
+
+
+# -- Linux backend (/proc) --------------------------------------------------
+def parse_maps(text: str) -> list[tuple[int, int, str, str]]:
+    """Parse the contents of /proc/<pid>/maps into (start, end, perms, path)
+    tuples. Pure, so it is unit-testable without a live process."""
+    regions: list[tuple[int, int, str, str]] = []
+    for line in text.splitlines():
+        parts = line.split(None, 5)
+        if len(parts) < 5 or "-" not in parts[0]:
+            continue
+        lo, _, hi = parts[0].partition("-")
+        try:
+            start, end = int(lo, 16), int(hi, 16)
+        except ValueError:
+            continue
+        path = parts[5] if len(parts) >= 6 else ""
+        regions.append((start, end, parts[1], path))
+    return regions
+
+
+def maps_has_large_dataset(regions: list[tuple[int, int, str, str]],
+                           large_dataset_bytes: int) -> bool:
+    """True if any private region is RandomX-dataset-sized (~2 GiB). Pure."""
+    return any("p" in perms and (end - start) >= large_dataset_bytes
+               for start, end, perms, _path in regions)
+
+
+def _scan_linux(pid: int, budget_bytes: int, max_region_read: int,
+                large_dataset_bytes: int) -> MemScanResult:
+    result = MemScanResult(pid=pid)
+    if pid <= 0:
+        result.error = "invalid pid"
+        return result
+    try:
+        with open(f"/proc/{pid}/maps", "r", encoding="utf-8", errors="replace") as f:
+            regions = parse_maps(f.read())
+    except FileNotFoundError:
+        result.error = "no such process"
+        return result
+    except PermissionError:
+        result.error = "permission denied (need same user / CAP_SYS_PTRACE / root)"
+        return result
+    except OSError as e:
+        result.error = f"maps read failed: {e}"
+        return result
+
+    # The large-dataset flag comes from region SIZES in maps alone, so it is set
+    # even when we lack permission to read the bytes.
+    result.large_page_dataset = maps_has_large_dataset(regions, large_dataset_bytes)
+
+    seen: set[str] = set()
+    try:
+        mem = open(f"/proc/{pid}/mem", "rb", buffering=0)
+    except (PermissionError, OSError) as e:
+        result.scanned = True  # maps-based large_dataset flag still valid
+        result.error = f"mem read unavailable: {e}"
+        return result
+    try:
+        for start, end, perms, _path in regions:
+            if "r" not in perms or result.bytes_scanned >= budget_bytes:
+                continue
+            to_read = min(end - start, max_region_read)
+            try:
+                mem.seek(start)
+                data = mem.read(to_read)
+            except (OSError, ValueError, OverflowError):
+                continue
+            if data:
+                _search_chunk(data, result, seen)
+                result.bytes_scanned += len(data)
+                result.regions_scanned += 1
+        result.scanned = True
+    finally:
+        mem.close()
     return result

@@ -17,12 +17,12 @@ from collections import defaultdict, deque
 
 import psutil
 
-from . import memscan, power, trust
+from . import memscan, perfcounters, power, trust
 from .audit import AuditLog
 from .config import Config
 from .scoring import (
     Signal, combine, is_miner_name, name_stem, score_cpu, score_dataset,
-    score_gpu, score_memory, score_name, score_network, score_probe,
+    score_gpu, score_memory, score_name, score_network, score_perf, score_probe,
 )
 
 
@@ -89,6 +89,8 @@ class Engine:
         # PIDs holding a RandomX-dataset-sized private allocation (huge memory,
         # any CPU) — always worth a memory scan.
         self._big_mem_pids: set[int] = set()
+        # Per-PID cache-miss-ratio from the Linux PMU (set during deep probes).
+        self._perf_ratio: dict[int, float] = {}
         self.audit = audit or AuditLog()
         self.last_scan_errors = 0  # memory OpenProcess failures last deep pass
         for p in psutil.process_iter():  # prime per-process cpu_percent baselines
@@ -168,6 +170,7 @@ class Engine:
             name_sig,
             score_probe(self._probe_drops.get(info.pid, 0.0), cfg),
             score_dataset(large_dataset, cfg),
+            score_perf(self._perf_ratio.get(info.pid), cfg),
         ]
 
     # -- deep (memory) scanning: driven async by the GUI, or sync by CLI -----
@@ -229,6 +232,16 @@ class Engine:
         self._mem_cache[pid] = r
         return r
 
+    def deep_probe(self, pid: int) -> memscan.MemScanResult:
+        """Full deep look at one PID: memory fingerprint scan + (Linux) a
+        hardware cache-miss-ratio sample. Used by every deep-scan caller."""
+        r = self.scan_memory(pid)
+        if self.cfg.perf_enabled:
+            ratio = perfcounters.sample_miss_ratio(pid, self.cfg.perf_interval)
+            if ratio is not None:
+                self._perf_ratio[pid] = ratio
+        return r
+
     # -- one pass -----------------------------------------------------------
     def scan_once(self, deep: bool = False) -> list[ProcInfo]:
         """One light pass over all processes. Cached memory results are applied
@@ -250,9 +263,14 @@ class Engine:
                 continue
             procs.append((p, raw))
             mi = p.info.get("memory_info")
-            if mi is not None and getattr(mi, "private", 0) >= self.cfg.dataset_private_bytes \
-                    and p.pid != self._self_pid:
-                big_mem.add(p.pid)
+            if mi is not None and p.pid != self._self_pid:
+                # Windows exposes committed private bytes; Linux has no "private"
+                # field, so fall back to RSS (a RandomX dataset is resident).
+                size = getattr(mi, "private", None)
+                if size is None:
+                    size = getattr(mi, "rss", 0)
+                if size >= self.cfg.dataset_private_bytes:
+                    big_mem.add(p.pid)
             if p.pid not in self._warm:  # drop the unreliable first reading
                 self._warm.add(p.pid)
                 continue
@@ -262,7 +280,7 @@ class Engine:
         if deep:
             self.last_scan_errors = 0
             for pid in self.deep_scan_targets():
-                r = self.scan_memory(pid)
+                r = self.deep_probe(pid)
                 if r.error and "OpenProcess" in (r.error or ""):
                     self.last_scan_errors += 1
 
@@ -357,6 +375,8 @@ class Engine:
             self._last_verdict.pop(dead, None)
         for dead in set(self._meta) - live_pids:
             self._meta.pop(dead, None)
+        for dead in set(self._perf_ratio) - live_pids:
+            self._perf_ratio.pop(dead, None)
         self._warm &= live_pids
         # Prune GPU history in place under the lock (reassigning the dict would
         # race the sampler thread's defaultdict insert -> "changed size" errors).

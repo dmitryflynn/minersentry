@@ -51,25 +51,32 @@ def _spawn_decoy(window: float) -> tuple[subprocess.Popen | None, str | None, st
     .exe, because it depends on no Python interpreter being present.
     """
     tmpdir = tempfile.mkdtemp(prefix="msentry_")
-    decoy_exe = os.path.join(tmpdir, "taskmgr.exe")
-    sysroot = os.environ.get("SystemRoot", r"C:\Windows")
     creation = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 
-    # (source binary, args that keep it alive ~`window` seconds, needs stdin?)
-    # ping -n N 127.0.0.1 waits ~(N-1)s and never reads stdin.
-    pings = max(2, int(window) + 1)
-    candidates = [
-        (os.path.join(sysroot, "System32", "PING.EXE"), ["-n", str(pings), "127.0.0.1"]),
-        (os.path.join(sysroot, "System32", "ping.exe"), ["-n", str(pings), "127.0.0.1"]),
-    ]
+    # (source binary, args to stay alive ~`window` seconds). The decoy is named
+    # after the monitor a miner watches for: taskmgr.exe on Windows, htop on
+    # Linux. ping -n N / sleep N wait without reading stdin.
+    if sys.platform == "win32":
+        decoy = os.path.join(tmpdir, "taskmgr.exe")
+        sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+        pings = str(max(2, int(window) + 1))
+        candidates = [
+            (os.path.join(sysroot, "System32", "PING.EXE"), ["-n", pings, "127.0.0.1"]),
+            (os.path.join(sysroot, "System32", "ping.exe"), ["-n", pings, "127.0.0.1"]),
+        ]
+    else:
+        decoy = os.path.join(tmpdir, "htop")
+        secs = str(max(2, int(window)))
+        candidates = [("/bin/sleep", [secs]), ("/usr/bin/sleep", [secs])]
+
     last_err = None
     for src, args in candidates:
         if not os.path.exists(src):
             continue
         try:
-            shutil.copy2(src, decoy_exe)
+            shutil.copy2(src, decoy)
             proc = subprocess.Popen(
-                [decoy_exe, *args],
+                [decoy, *args],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL, creationflags=creation,
             )

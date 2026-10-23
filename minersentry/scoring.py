@@ -179,6 +179,23 @@ def score_dataset(large_dataset: bool, cfg: Config) -> Signal:
     return Signal("dataset", 0, "no large dataset region")
 
 
+def score_perf(miss_ratio: float | None, cfg: Config) -> Signal:
+    """Score a process's cache-misses-per-1000-instructions (Linux PMU).
+
+    RandomX is memory-hard — random reads across a ~2 GiB dataset — so it shows
+    an order of magnitude more LLC misses per instruction than ordinary compute.
+    Like cpu/gpu this is kept out of the weighted blend (memory-bound databases
+    also miss a lot); it convicts only in combination (see conviction rules)."""
+    if miss_ratio is None:
+        return Signal("perf", 0, "no perf-counter data")
+    detail = f"{miss_ratio:.0f} cache misses / 1k instr"
+    if miss_ratio >= cfg.perf_strong:
+        return Signal("perf", cfg.perf_score_strong, detail + " — memory-hard (RandomX-like)")
+    if miss_ratio >= cfg.perf_moderate:
+        return Signal("perf", cfg.perf_score_moderate, detail + " — elevated")
+    return Signal("perf", 0, detail)
+
+
 def combine(signals: list[Signal], cfg: Config) -> tuple[int, str]:
     """Blend signal scores into a final (score, verdict).
 
