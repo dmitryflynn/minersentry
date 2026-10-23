@@ -1,5 +1,9 @@
 # MinerSentry
 
+[![CI](https://github.com/dmitryflynn/minersentry/actions/workflows/ci.yml/badge.svg)](https://github.com/dmitryflynn/minersentry/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+
 A behavioral cryptominer detector for Windows 10/11. It catches CPU/GPU mining
 malware by **the work it has to do**, not by file hashes — so recompiled,
 packed, renamed, or process-injected miners still show up where a signature
@@ -72,11 +76,20 @@ react to Task Manager appearing; a process that goes quiet is self-incriminating
 
 ## Run it
 
-From source:
+Install (gives you the `minersentry` GUI and `minersentry-scan` CLI commands):
 
 ```bash
-pip install -r requirements.txt
-python main.py
+pipx install git+https://github.com/dmitryflynn/minersentry
+# or:  pip install git+https://github.com/dmitryflynn/minersentry
+minersentry          # GUI
+minersentry-scan     # headless scan
+```
+
+Or from a checkout:
+
+```bash
+pip install -e .
+python main.py       # GUI  (same as `minersentry`)
 ```
 
 Build a standalone `.exe` (no Python needed to run it afterward):

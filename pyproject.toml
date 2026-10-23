@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minersentry"
+dynamic = ["version"]
+description = "Behavioral cryptominer detector — catches CPU/GPU miners by the work they do, not file hashes."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Dmitry Flynn" }]
+keywords = [
+    "cryptominer", "cryptojacking", "malware-detection", "security",
+    "behavioral-detection", "xmrig", "randomx", "blue-team", "edr",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: System :: Monitoring",
+]
+dependencies = ["psutil>=5.9"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pyflakes>=3.0"]
+build = ["pyinstaller>=6.0"]
+
+[project.urls]
+Homepage = "https://github.com/dmitryflynn/minersentry"
+Issues = "https://github.com/dmitryflynn/minersentry/issues"
+
+[project.scripts]
+minersentry = "minersentry.gui:main"
+minersentry-scan = "minersentry.cli:main"
+
+[tool.setuptools]
+packages = ["minersentry"]
+
+[tool.setuptools.dynamic]
+version = { attr = "minersentry.__version__" }
