@@ -15,6 +15,17 @@ signal that detects a RandomX miner by its memory-hardness even when throttled.
 > nowhere. MinerSentry only reads process state and never modifies the system
 > except an optional local detection log and a user-confirmed process terminate.
 
+Catching a RandomX miner **throttled to 1% CPU** (no CPU spike to see, no pool
+connection) — flagged by its 2 GB dataset + resident strings:
+
+```text
+$ minersentry-scan --duration 28 --watch target
+    PID   CPU%  GPU% SCORE  VERDICT       NAME
+  11288      1     0    82  Likely Miner  target.exe  (detected +14.0s)
+
+1 likely miner(s), 0 suspicious
+```
+
 ## Why behavioral
 
 Defender and Malwarebytes lean heavily on signatures and known-bad lists. Miners
@@ -23,11 +34,24 @@ code is injected into `svchost`, pool traffic is encrypted. But a miner cannot
 hide the one thing it exists to do — run a hashing algorithm, nonstop, on the
 CPU. MinerSentry scores that behavior directly.
 
-## The five signals
+| Evasion technique | Signature / hash scanner | MinerSentry (behavioral) |
+|---|---|---|
+| Fresh or recompiled build (new hash) | ✗ nothing to match | ✓ work is unchanged |
+| Renamed / packed binary | ✗ | ✓ |
+| Injected into a signed process (`svchost`) | ✗ (process is signed) | ✓ memory scan of any PID |
+| CPU-capped to 1–20% | ✗ | ✓ dataset + (Linux) cache-miss fingerprint |
+| Pauses when a monitor opens | ✗ | ✓ the evasion probe |
+| Encrypted pool traffic | ✗ (can't inspect payload) | ✓ port + connection persistence |
 
-Each process gets five independent sub-scores (0–100), combined into one verdict.
-A process only reaches **Likely Miner** when several signals agree — that
-corroboration requirement is what keeps false positives down.
+The honest caveat: this contrasts *approaches*. A measured head-to-head against
+Defender/Malwarebytes needs live malware in an isolated VM (see the benchmark),
+which this project never runs on your host.
+
+## The signals
+
+Each process gets a set of independent sub-scores (0–100), combined into one
+verdict. A process only reaches **Likely Miner** when several signals agree —
+that corroboration requirement is what keeps false positives down.
 
 | Signal | What it measures |
 |---|---|
