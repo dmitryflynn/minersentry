@@ -160,9 +160,12 @@ class Config:
         ("dataset", 60, "memory", 60, 82),
         # Memory-hard cache-miss fingerprint (Linux PMU) + a corroborating
         # artifact — catches a RandomX miner by its work even when throttled.
+        # perf+dataset needs a STRONG miss rate (a busy DB with a 2 GiB cache
+        # also misses), but even a MODERATE miss rate convicts alongside resident
+        # miner strings or a miner binary name (both miner-specific).
         ("perf", 70, "dataset", 60, 85),
-        ("perf", 70, "memory", 60, 82),
-        ("perf", 70, "name", 70, 85),
+        ("perf", 40, "memory", 60, 82),
+        ("perf", 40, "name", 70, 85),
     )
 
     # -- trust dampening -----------------------------------------------------

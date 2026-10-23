@@ -261,7 +261,9 @@ def _scan_linux(pid: int, budget_bytes: int, max_region_read: int,
         return result
     try:
         for start, end, perms, _path in regions:
-            if "r" not in perms or result.bytes_scanned >= budget_bytes:
+            if result.bytes_scanned >= budget_bytes:
+                break  # budget spent; large_dataset flag already set from maps
+            if "r" not in perms:
                 continue
             to_read = min(end - start, max_region_read)
             try:

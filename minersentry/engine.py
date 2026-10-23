@@ -236,7 +236,7 @@ class Engine:
         """Full deep look at one PID: memory fingerprint scan + (Linux) a
         hardware cache-miss-ratio sample. Used by every deep-scan caller."""
         r = self.scan_memory(pid)
-        if self.cfg.perf_enabled:
+        if self.cfg.perf_enabled and perfcounters.available():
             ratio = perfcounters.sample_miss_ratio(pid, self.cfg.perf_interval)
             if ratio is not None:
                 self._perf_ratio[pid] = ratio

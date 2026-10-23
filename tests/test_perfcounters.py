@@ -36,6 +36,23 @@ def test_lone_perf_not_convicting():
     assert verdict != "Likely Miner"
 
 
+def test_perf_moderate_plus_memory_convicts():
+    # a MODERATE miss rate + resident miner strings convicts (the moderate band
+    # must not be dead config)
+    assert score_perf(80.0, CFG).score == CFG.perf_score_moderate
+    _s, verdict = combine(
+        [Signal("perf", CFG.perf_score_moderate, ""), Signal("memory", 100, "")], CFG)
+    assert verdict == "Likely Miner"
+
+
+def test_perf_moderate_plus_dataset_stays_clean():
+    # moderate perf + a 2 GiB region but NO miner strings must NOT convict
+    # (a busy database is memory-bound too) — that pair requires a strong rate
+    _s, verdict = combine(
+        [Signal("perf", CFG.perf_score_moderate, ""), Signal("dataset", 70, "")], CFG)
+    assert verdict != "Likely Miner"
+
+
 def test_perf_safe_when_unavailable():
     # off Linux (or without permission) everything degrades to a no-op, never raises
     if not sys.platform.startswith("linux"):

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import platform
 import struct
 import sys
 import time
@@ -30,7 +31,19 @@ _PERF_TYPE_HARDWARE = 0
 _PERF_COUNT_HW_INSTRUCTIONS = 1
 _PERF_COUNT_HW_CACHE_MISSES = 3
 _PERF_FORMAT_GROUP = 1 << 3
-__NR_perf_event_open = 298 if (sys.maxsize > 2**32) else 336  # x86-64 / x86-32
+
+# The perf_event_open syscall number is architecture-specific. Pick by machine;
+# unknown architectures get None and the signal simply degrades to a no-op.
+_SYSCALL_NR = {
+    "x86_64": 298, "amd64": 298,
+    "i386": 336, "i686": 336, "i586": 336, "x86": 336,
+    "aarch64": 241, "arm64": 241,
+    "armv7l": 364, "armv6l": 364, "armv8l": 364,
+    "ppc64le": 319, "ppc64": 319,
+    "s390x": 331,
+    "riscv64": 241,
+}
+__NR_perf_event_open = _SYSCALL_NR.get(platform.machine().lower()) if IS_LINUX else None
 
 
 def paranoid_level() -> int | None:
@@ -44,7 +57,7 @@ def paranoid_level() -> int | None:
 
 def available() -> bool:
     """True if per-process counters can plausibly be opened here."""
-    if not IS_LINUX:
+    if not IS_LINUX or __NR_perf_event_open is None:
         return False
     lvl = paranoid_level()
     # <=2 allows per-process (own) counters; root/CAP_PERFMON (<=0) allows others.
@@ -63,6 +76,7 @@ if IS_LINUX:
         ]
 
     _libc = ctypes.CDLL(None, use_errno=True)
+    _libc.syscall.restype = ctypes.c_long  # else the 64-bit return is truncated
 
     # flag bits in the attr bitfield: disabled | exclude_kernel | exclude_hv
     _ATTR_FLAGS = (1 << 0) | (1 << 5) | (1 << 6)
@@ -85,7 +99,7 @@ def sample_miss_ratio(pid: int, interval: float = 0.3) -> float | None:
     """Return cache-misses-per-1000-instructions for `pid` over `interval`
     seconds, or None if counters couldn't be read. Memory-hard miners show an
     order of magnitude more misses/instr than ordinary compute."""
-    if not IS_LINUX:
+    if not IS_LINUX or __NR_perf_event_open is None:
         return None
     PERF_EVENT_IOC_RESET = 0x2403
     PERF_EVENT_IOC_ENABLE = 0x2400
