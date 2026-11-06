@@ -28,7 +28,10 @@ _TRUSTED_DIRS_POSIX = ("/usr/bin", "/usr/sbin", "/bin", "/sbin",
 _SUSPICIOUS_DIRS_WIN = ("\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
                         "\\programdata\\", "\\windows\\fonts\\", "\\recycle",
                         "\\appdata\\roaming\\")
-_SUSPICIOUS_DIRS_POSIX = ("/tmp/", "/var/tmp/", "/dev/shm/", "/run/user/",
+_SIG_UNTRUSTED_WIN = ("\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
+                      "\\appdata\\roaming\\", "\\$recycle.bin\\", "\\windows\\fonts\\")
+_SIG_UNTRUSTED_POSIX = ("/tmp/", "/var/tmp/", "/dev/shm/")
+_SUSPICIOUS_DIRS_POSIX =("/tmp/", "/var/tmp/", "/dev/shm/", "/run/user/",
                           "/var/www/", "/.cache/")
 
 
@@ -86,6 +89,11 @@ class Config:
     }))
     suspicious_dir_hints: tuple[str, ...] = field(
         default_factory=lambda: _SUSPICIOUS_DIRS_WIN if _IS_WINDOWS else _SUSPICIOUS_DIRS_POSIX)
+    # Where a valid signature earns NO trust: user-writable drop spots no
+    # legitimate signed product runs from. Narrower than suspicious_dir_hints on
+    # purpose — Defender itself runs signed from ProgramData.
+    signature_untrusted_dirs: tuple[str, ...] = field(
+        default_factory=lambda: _SIG_UNTRUSTED_WIN if _IS_WINDOWS else _SIG_UNTRUSTED_POSIX)
     trusted_dirs: tuple[str, ...] = field(
         default_factory=lambda: _TRUSTED_DIRS_WIN if _IS_WINDOWS else _TRUSTED_DIRS_POSIX)
     name_score_known: int = 85
@@ -97,6 +105,13 @@ class Config:
     probe_score_weak: int = 60     # drop >= probe_drop_weak
     probe_drop_strong: float = 40.0
     probe_drop_weak: float = 20.0
+    # Decoys spawned together during the probe. Evasive miners watch for more
+    # than Task Manager, so the probe impersonates the common monitors at once.
+    probe_decoys_windows: tuple[str, ...] = (
+        "taskmgr.exe", "procexp64.exe", "ProcessHacker.exe", "SystemInformer.exe",
+        "perfmon.exe", "resmon.exe",
+    )
+    probe_decoys_posix: tuple[str, ...] = ("htop", "top", "nvtop", "btop")
 
     # -- GPU-compute signal (per-process compute-engine utilization) ---------
     gpu_enabled: bool = True
@@ -122,8 +137,13 @@ class Config:
     # -- hidden-compute / power-gap (system-level banner, not a per-proc score)
     power_enabled: bool = True
     power_meter_enabled: bool = False  # true package power (rare hardware)
-    unaccounted_cores_threshold: float = 1.5   # cores of unexplained CPU
+    # Cores of unexplained CPU ABOVE this machine's learned baseline. Every busy
+    # system has some (interrupts, short-lived processes, kernel work) and it
+    # scales with load, so the gap is judged against a learned ratio of busy CPU.
+    unaccounted_cores_threshold: float = 1.5
     hidden_persist_samples: int = 3            # must hold this many samples
+    hidden_calibration_samples: int = 12       # passes used to learn the baseline
+    hidden_baseline_alpha: float = 0.05        # slow EMA update while not flagged
     vm_host_names: frozenset[str] = field(default_factory=lambda: frozenset({
         "vmmem", "vmmemwsl", "vmwp", "vmcompute",
     }))
@@ -198,6 +218,18 @@ class Config:
     # a signed Defender/AV binary that legitimately carries miner strings can't
     # alarm. Behavioral signals (cpu/probe) are left at full weight.
     trusted_dampen: float = 0.2
+    # Processes miners inject into. They are signed / live in System32, but none
+    # of them has a reason to hold miner strings, so they are never dampened:
+    # otherwise an injected miner scores Clean.
+    injection_hosts: frozenset[str] = field(default_factory=lambda: frozenset({
+        "svchost", "explorer", "dllhost", "rundll32", "regsvr32", "conhost",
+        "notepad", "werfault", "wmiprvse", "msbuild", "regasm", "regsvcs",
+        "installutil", "aspnet_compiler", "vbc", "csc", "cmd", "powershell",
+        "pwsh", "wscript", "cscript", "mshta", "searchprotocolhost", "sihost",
+        "taskhostw", "runtimebroker", "winlogon", "services", "spoolsv",
+        "wuauclt", "nslookup", "attrib", "colorcpl", "calc", "mspaint",
+        "applaunch", "addinprocess", "addinprocess32", "msiexec",
+    }))
 
     # -- memory-scan budgets -------------------------------------------------
     mem_max_region_read: int = 4 * 1024 * 1024
@@ -210,6 +242,9 @@ class Config:
     # -- scan cadence / deep scan -------------------------------------------
     scan_interval: float = 2.5
     deep_limit: int = 6
+    # The GUI memory-scans its candidates on its own this often (seconds), so the
+    # memory/dataset/perf signals work without anyone clicking a button. 0 = off.
+    deep_auto_interval: float = 45.0
     # Only deep-scan processes using at least this much CPU (raw per-core: 30 ==
     # ~0.3 of a core). A CPU miner is by definition busy, so this keeps the deep
     # scan fast and skips idle processes whose resident strings are irrelevant.

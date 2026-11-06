@@ -116,7 +116,13 @@ def _reexec_unsigned():
     invalidates the embedded Authenticode signature while the copy still runs."""
     import shutil
     import subprocess
+    import glob
     import tempfile
+    # A target that was killed (not exited) never ran the finally below, so
+    # sweep leftovers from earlier runs. A copy that is still running is locked
+    # and simply survives the sweep.
+    for old in glob.glob(os.path.join(tempfile.gettempdir(), "msentry_target_*")):
+        shutil.rmtree(old, ignore_errors=True)
     d = tempfile.mkdtemp(prefix="msentry_target_")
     exe = os.path.join(d, "msentry_target.exe")
     try:

@@ -59,3 +59,23 @@ def test_perf_safe_when_unavailable():
         assert perfcounters.available() is False
         assert perfcounters.paranoid_level() is None
         assert perfcounters.sample_miss_ratio(os.getpid()) is None
+
+
+def test_group_reads_are_summed_across_threads():
+    import struct
+    from minersentry import perfcounters
+    idle_main = struct.pack("<QQQ", 2, 1_000, 1)          # main thread barely runs
+    worker = struct.pack("<QQQ", 2, 9_000_000, 1_800_000)  # hashing thread
+    r = perfcounters.ratio_from_group_reads([idle_main, worker])
+    assert abs(r - (1_800_001 * 1000.0 / 9_001_000)) < 1e-6
+    assert perfcounters.ratio_from_group_reads([]) is None
+    assert perfcounters.ratio_from_group_reads([b"short"]) is None
+    assert perfcounters.ratio_from_group_reads([struct.pack("<QQQ", 1, 5, 5)]) is None
+
+
+def test_thread_ids_main_first(monkeypatch):
+    from minersentry import perfcounters
+    monkeypatch.setattr(perfcounters.os, "listdir", lambda p: ["12", "10", "11", "x"])
+    assert perfcounters.thread_ids(11) == [11, 10, 12]
+    monkeypatch.setattr(perfcounters.os, "listdir", lambda p: (_ for _ in ()).throw(OSError()))
+    assert perfcounters.thread_ids(11) == []
