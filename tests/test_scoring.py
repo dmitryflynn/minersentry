@@ -63,9 +63,10 @@ def test_memory_hits_pass_through_score():
 
 # -- network signal --------------------------------------------------------
 # hit tuple: (ip, port, is_common_legit, persisted, known_pool)
-def test_network_strong_port():
+def test_network_transient_stratum_port_is_weak():
+    # a port number alone is weak evidence: legit services use 3333 too
     s = score_network([("1.2.3.4", 3333, False, False, False)], CFG)
-    assert s.score == CFG.net_score_strong
+    assert s.score == CFG.net_score_weak
 
 
 def test_network_ambiguous_port_is_weak():
@@ -73,9 +74,10 @@ def test_network_ambiguous_port_is_weak():
     assert s.score == CFG.net_score_weak
 
 
-def test_network_persisted_strong_gets_bump():
+def test_network_long_lived_stratum_port_is_middle():
     s = score_network([("1.2.3.4", 3333, False, True, False)], CFG)
-    assert s.score == min(100, CFG.net_score_strong + CFG.net_score_persist)
+    assert s.score == CFG.net_score_stratum_persisted
+    assert CFG.net_score_weak < s.score < 60   # below the cpu/gpu+network floors
 
 
 def test_network_known_pool_ranks_highest():
@@ -89,10 +91,26 @@ def test_known_pool_plus_minimal_cpu_convicts():
     assert verdict == "Likely Miner"
 
 
-def test_network_persisted_ambiguous_promoted():
-    weak = score_network([("1.2.3.4", 8080, True, False, False)], CFG).score
+def test_network_long_lived_business_port_stays_weak():
+    # a long-lived connection on a common business port (8080) is just a server
     persisted = score_network([("1.2.3.4", 8080, True, True, False)], CFG).score
-    assert persisted > weak
+    assert persisted == CFG.net_score_weak
+
+
+def test_throttled_miner_with_strings_and_unlisted_pool_convicts():
+    # cpu-capped miner (cpu 0) holding miner protocol strings, talking to a pool
+    # that is NOT on the known-pool list over a long-lived stratum connection
+    net = score_network([("1.2.3.4", 3333, False, True, False)], CFG)
+    _s, verdict = combine([sig("cpu", 0), sig("memory", 100), net], CFG)
+    assert verdict == "Likely Miner"
+
+
+def test_compute_load_plus_stratum_port_alone_does_not_convict():
+    # a legit CPU or GPU job with a long-lived connection on 3333 and no miner
+    # strings must stay below Likely Miner
+    net = score_network([("1.2.3.4", 3333, False, True, False)], CFG)
+    assert combine([sig("cpu", 92), net], CFG)[1] != "Likely Miner"
+    assert combine([sig("gpu", 80), net], CFG)[1] != "Likely Miner"
 
 
 # -- gpu signal -------------------------------------------------------------

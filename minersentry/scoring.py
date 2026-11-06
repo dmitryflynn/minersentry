@@ -90,7 +90,10 @@ def score_memory(mem_scanned: bool, mem_score: int, labels: list[str],
 def score_network(hits: list[tuple[str, int, bool, bool, bool]], cfg: Config) -> Signal:
     """hits: list of (remote_ip, remote_port, is_common_legit_port, persisted,
     known_pool). Port numbers and connection duration alone are weak evidence;
-    normal GPU workloads also use these ports for business services."""
+    normal GPU workloads also use these ports for business services. A known
+    pool IP ranks highest. A long-lived connection to a stratum-typical port gets
+    a middle score, low enough that it can't convict next to CPU or GPU load but
+    high enough to corroborate resident miner strings."""
     if not hits:
         return Signal("network", 0, "no pool-like connections")
     known = [h for h in hits if h[4]]
@@ -98,6 +101,11 @@ def score_network(hits: list[tuple[str, int, bool, bool, bool]], cfg: Config) ->
         ip, port, _, _, _ = known[0]
         return Signal("network", cfg.net_score_known_pool,
                       f"connected to a KNOWN mining pool at {ip}:{port}")
+    stratum_long = [h for h in hits if h[3] and not h[2]]
+    if stratum_long:
+        ip, port, _, _, _ = stratum_long[0]
+        return Signal("network", cfg.net_score_stratum_persisted,
+                      f"long-lived connection to {ip}:{port} (stratum-typical port)")
     ip, port, _, persisted, _ = hits[0]
     return Signal("network", min(30, cfg.net_score_weak),
                   f"connection to {ip}:{port} (port-only evidence; protocol unknown)"
