@@ -79,13 +79,20 @@ class MemScanResult:
     regions_scanned: int = 0
     hits: list[MemHit] = field(default_factory=list)
     large_page_dataset: bool = False  # a committed region >= ~2 GiB (RandomX)
+    regions_failed: int = 0
+    coverage_status: str = "not_scanned"
 
     @property
     def score(self) -> int:
         s = sum(h.weight for h in self.hits)
         if self.large_page_dataset:
             s += 30
-        return min(100, s)
+        # Large mappings, algorithm names and crypto constants also occur in ML.
+        has_miner_string = any(
+            h.where == "string" and h.label not in {
+                "RandomX algorithm name", "RandomX variant tag", "CryptoNight algorithm name"
+            } for h in self.hits)
+        return min(100 if has_miner_string else 30, s)
 
 
 if IS_WINDOWS:
@@ -189,20 +196,26 @@ def _scan_windows(pid: int, budget_bytes: int, max_region_read: int,
                 result.large_page_dataset = True
 
             if committed and readable and not guarded:
-                to_read = min(region_size, max_region_read)
-                if _k32.ReadProcessMemory(handle, ctypes.c_void_p(base),
-                                          buf, to_read, ctypes.byref(read)):
-                    n = read.value
-                    if n:
-                        _search_chunk(buf.raw[:n], result, seen)
-                        result.bytes_scanned += n
-                        result.regions_scanned += 1
+                to_read = min(region_size, max_region_read, budget_bytes - result.bytes_scanned)
+                read.value = 0
+                ok = _k32.ReadProcessMemory(handle, ctypes.c_void_p(base),
+                                            buf, to_read, ctypes.byref(read))
+                n = min(read.value, to_read)
+                if not ok or n < to_read:
+                    result.regions_failed += 1
+                if n:
+                    _search_chunk(buf.raw[:n], result, seen)
+                    result.bytes_scanned += n
+                    result.regions_scanned += 1
 
             next_addr = base + region_size
             if next_addr <= addr:
                 break
             addr = next_addr
         result.scanned = True
+        result.coverage_status = "partial" if result.regions_failed else "bounded"
+        if result.regions_failed:
+            result.error = f"memory read failed or short in {result.regions_failed} region(s)"
     finally:
         _k32.CloseHandle(handle)
     return result
@@ -262,6 +275,7 @@ def _scan_linux(pid: int, budget_bytes: int, max_region_read: int,
         mem = open(f"/proc/{pid}/mem", "rb", buffering=0)
     except (PermissionError, OSError) as e:
         result.scanned = True  # maps-based large_dataset flag still valid
+        result.coverage_status = "partial"
         result.error = f"mem read unavailable: {e}"
         return result
     try:
@@ -270,17 +284,23 @@ def _scan_linux(pid: int, budget_bytes: int, max_region_read: int,
                 break  # budget spent; large_dataset flag already set from maps
             if "r" not in perms:
                 continue
-            to_read = min(end - start, max_region_read)
+            to_read = min(end - start, max_region_read, budget_bytes - result.bytes_scanned)
             try:
                 mem.seek(start)
                 data = mem.read(to_read)
             except (OSError, ValueError, OverflowError):
+                result.regions_failed += 1
                 continue
+            if len(data) < to_read:
+                result.regions_failed += 1
             if data:
                 _search_chunk(data, result, seen)
                 result.bytes_scanned += len(data)
                 result.regions_scanned += 1
         result.scanned = True
+        result.coverage_status = "partial" if result.regions_failed else "bounded"
+        if result.regions_failed:
+            result.error = f"memory read failed or short in {result.regions_failed} region(s)"
     finally:
         mem.close()
     return result

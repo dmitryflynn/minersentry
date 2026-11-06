@@ -14,17 +14,22 @@ def _engine():
     return Engine(cfg=Config())
 
 
-def test_trusted_process_signals_dampened():
-    # a trusted-signed process with a miner-like name must have its name/memory
-    # signals dampened (the feature that was dead while the WinVerifyTrust GUID
-    # was wrong). An identical untrusted process is not dampened.
+def test_trusted_process_memory_signals_dampened():
+    # Signed scanners may legitimately contain miner strings; keep memory trust
+    # dampening while the cloud policy treats explicit miner names separately.
     e = _engine()
-    trusted = ProcInfo(321); trusted.name = "xmrig.exe"; trusted.trusted = True
-    untrusted = ProcInfo(322); untrusted.name = "xmrig.exe"; untrusted.trusted = False
-    t_name = next(s for s in e._build_signals(trusted, [], time.time()) if s.name == "name")
-    u_name = next(s for s in e._build_signals(untrusted, [], time.time()) if s.name == "name")
-    assert u_name.score >= 85
-    assert t_name.score < u_name.score
+    from minersentry.memscan import MemHit, MemScanResult
+    trusted = ProcInfo(321); trusted.name = "scanner.exe"; trusted.trusted = True
+    untrusted = ProcInfo(322); untrusted.name = "scanner.exe"; untrusted.trusted = False
+    result = MemScanResult(pid=321, scanned=True, hits=[
+        MemHit("XMRig miner identifier", 45, "string"),
+        MemHit("stratum pool URL scheme", 40, "string"),
+    ])
+    trusted.mem_result = untrusted.mem_result = result
+    t_mem = next(s for s in e._build_signals(trusted, [], time.time()) if s.name == "memory")
+    u_mem = next(s for s in e._build_signals(untrusted, [], time.time()) if s.name == "memory")
+    assert u_mem.score >= 85
+    assert t_mem.score < u_mem.score
 
 
 def test_deep_targets_include_pool_connected_low_cpu():

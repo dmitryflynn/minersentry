@@ -8,3 +8,8 @@ dist/
 .pytest_cache/
 bench/results.*
 bench/fp_results.*
+
+# Local environment and scan output
+.venv/
+miner-test.json
+.DS_Store

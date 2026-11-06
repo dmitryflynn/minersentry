@@ -60,23 +60,26 @@ class Config:
     }))
     net_score_strong: int = 70
     net_score_weak: int = 30
+    # A long-lived connection to a stratum-typical port (not a common business
+    # port). Kept below 60 on purpose: too weak to convict alongside CPU or GPU
+    # load (legit services use these ports too), but enough to convict alongside
+    # resident miner protocol strings, which are miner-specific on their own.
+    net_score_stratum_persisted: int = 50
     net_score_known_pool: int = 90    # connected to a resolved known-pool IP
     pool_intel_enabled: bool = True
     pool_refresh_seconds: float = 900.0
 
     # -- name/path signal ----------------------------------------------------
-    # Exact stem matches (the whole process name, .exe stripped). Generic tokens
-    # like "miner" live here ONLY — matched exactly, never as a substring, so
-    # legit apps such as examiner.exe / DataMiner.exe are not flagged.
+    # Known brand basenames, with delimiter/numeric suffix variants. Generic
+    # "miner" is not an identity: normal desktop indexers use that word too.
     known_miner_names: frozenset[str] = field(default_factory=lambda: frozenset({
         "xmrig", "xmr-stak", "nbminer", "phoenixminer", "t-rex", "trex",
         "lolminer", "ethminer", "cgminer", "bfgminer", "ccminer", "cpuminer",
         "minerd", "nanominer", "gminer", "teamredminer", "srbminer",
-        "xmrig-cuda", "wildrig", "miner", "winring0",
+        "xmrig-cuda", "wildrig",
     }))
-    # Distinctive identifiers matched as a SUBSTRING too, to catch renamed
-    # variants (e.g. "xmrig-notls.exe"). Only tokens unlikely to appear inside an
-    # unrelated program name belong here — never bare "miner".
+    # Legacy config key retained for compatibility. Entries are now brand
+    # aliases with the same basename/suffix boundaries, not arbitrary substrings.
     known_miner_substrings: frozenset[str] = field(default_factory=lambda: frozenset({
         "xmrig", "xmr-stak", "nbminer", "phoenixminer", "lolminer", "cgminer",
         "bfgminer", "ccminer", "cpuminer", "nanominer", "teamredminer",
@@ -152,12 +155,14 @@ class Config:
         ("cpu", 55, "network", 60, 85),
         ("cpu", 50, "name", 70, 85),
         ("cpu", 40, "probe", 60, 88),
-        ("memory", 60, "network", 60, 80),
+        # Miner protocol strings in memory + a long-lived stratum-port connection:
+        # catches a throttled miner whose pool isn't on the known-pool list.
+        ("memory", 60, "network", 50, 80),
         # GPU-miner pairs: compute saturation + a corroborating artifact/behavior
         ("gpu", 60, "memory", 60, 82),
         ("gpu", 60, "name", 70, 85),
         ("gpu", 55, "network", 60, 85),
-        ("gpu", 60, "cpu", 45, 80),
+        # CPU + GPU saturation also occurs in normal CUDA/ML workloads.
         # RandomX ~2 GiB dataset + resident miner strings is diagnostic even at
         # low CPU — this is what catches a heavily-throttled stealth miner.
         ("dataset", 60, "memory", 60, 82),

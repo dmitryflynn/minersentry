@@ -9,6 +9,8 @@ that gathers inputs from psutil and calls into here.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ntpath
+import re
 
 from .config import Config
 
@@ -30,14 +32,19 @@ def name_stem(name: str) -> str:
 def is_miner_name(name: str, cfg: Config) -> bool:
     """True if the process name matches a known miner.
 
-    Exact stem match against the full name list, plus a substring match against
-    only the *distinctive* identifiers — so a renamed `xmrig-notls.exe` is caught
-    while an unrelated `examiner.exe` / `DataMiner.exe` is not.
+    Check basenames and known brands with delimiter/numeric suffixes. A generic
+    `miner` token is not a brand: tracker-miner-fs-3 is a desktop indexer.
+    The legacy substring list is treated as brand aliases, not unbounded text.
     """
-    stem = name_stem(name)
-    if stem in cfg.known_miner_names:
+    stem = name_stem(ntpath.basename(name or ""))
+    brands = cfg.known_miner_names | cfg.known_miner_substrings
+    if stem in brands:
         return True
-    return any(k in stem for k in cfg.known_miner_substrings)
+    if any(stem.startswith(k) and re.fullmatch(
+               r"(?:[-_.][a-z0-9]+|\d+)(?:[-_.][a-z0-9]+)*", stem[len(k):])
+           for k in brands if k):
+        return True
+    return False
 
 
 def score_cpu(recent: list[float], ncpu: int, cfg: Config) -> Signal:
@@ -74,15 +81,19 @@ def score_memory(mem_scanned: bool, mem_score: int, labels: list[str],
     if not mem_scanned:
         return Signal("memory", 0, f"memory not scanned ({error or 'not scanned'})")
     if not labels:
+        if error:
+            return Signal("memory", 0, f"incomplete ({bytes_scanned // (1024*1024)} MiB scanned; {error})")
         return Signal("memory", 0, f"clean ({bytes_scanned // (1024*1024)} MiB scanned)")
     return Signal("memory", mem_score, "; ".join(labels[:5]))
 
 
 def score_network(hits: list[tuple[str, int, bool, bool, bool]], cfg: Config) -> Signal:
     """hits: list of (remote_ip, remote_port, is_common_legit_port, persisted,
-    known_pool). A connection to a resolved known-pool IP ranks highest; failing
-    that, a stratum-typical port, with a bump when the connection has persisted
-    across many scans (a transient hit is far weaker)."""
+    known_pool). Port numbers and connection duration alone are weak evidence;
+    normal GPU workloads also use these ports for business services. A known
+    pool IP ranks highest. A long-lived connection to a stratum-typical port gets
+    a middle score, low enough that it can't convict next to CPU or GPU load but
+    high enough to corroborate resident miner strings."""
     if not hits:
         return Signal("network", 0, "no pool-like connections")
     known = [h for h in hits if h[4]]
@@ -90,19 +101,15 @@ def score_network(hits: list[tuple[str, int, bool, bool, bool]], cfg: Config) ->
         ip, port, _, _, _ = known[0]
         return Signal("network", cfg.net_score_known_pool,
                       f"connected to a KNOWN mining pool at {ip}:{port}")
-    strong = [h for h in hits if not h[2]]
-    if strong:
-        ip, port, _, persisted, _ = strong[0]
-        score = cfg.net_score_strong + (cfg.net_score_persist if persisted else 0)
-        note = " (long-lived)" if persisted else ""
-        return Signal("network", min(100, score),
-                      f"established to {ip}:{port} (stratum-typical port){note}")
+    stratum_long = [h for h in hits if h[3] and not h[2]]
+    if stratum_long:
+        ip, port, _, _, _ = stratum_long[0]
+        return Signal("network", cfg.net_score_stratum_persisted,
+                      f"long-lived connection to {ip}:{port} (stratum-typical port)")
     ip, port, _, persisted, _ = hits[0]
-    if persisted:
-        return Signal("network", cfg.net_score_strong,
-                      f"long-lived connection to {ip}:{port} (ambiguous port, persisted)")
-    return Signal("network", cfg.net_score_weak,
-                  f"connection to {ip}:{port} (ambiguous port)")
+    return Signal("network", min(30, cfg.net_score_weak),
+                  f"connection to {ip}:{port} (port-only evidence; protocol unknown)"
+                  + (" (long-lived)" if persisted else ""))
 
 
 def score_gpu(recent_util: list[float], has_window: bool, allowlisted: bool,
@@ -146,9 +153,9 @@ def score_name(name: str, exe: str, cfg: Config) -> Signal:
     exe_l = (exe or "").lower()
     score = 0
     bits: list[str] = []
-    if is_miner_name(name, cfg):
+    if is_miner_name(name, cfg) or is_miner_name(exe, cfg):
         score = max(score, cfg.name_score_known)
-        bits.append("known miner name")
+        bits.append("known miner process/executable name")
     if exe_l:
         for hint in cfg.suspicious_dir_hints:
             if hint in exe_l:
@@ -211,15 +218,15 @@ def combine(signals: list[Signal], cfg: Config) -> tuple[int, str]:
     blended = sum(w * by.get(key, 0) for key, w in cfg.weights.items())
 
     # Corroboration: a lone signal isn't enough unless it is standalone hard
-    # evidence (strong memory / known miner name / confirmed evasion).
+    # evidence (strong memory / confirmed evasion). A name needs corroboration.
     present = sum(1 for s in signals if s.score >= cfg.corrob_nonzero_score)
     corroborated = present >= cfg.corrob_min_signals
     hard_evidence = (by.get("memory", 0) >= cfg.hard_memory
-                     or by.get("name", 0) >= cfg.hard_name
                      or by.get("probe", 0) >= cfg.hard_probe)
 
     score = int(round(blended))
-    if not corroborated and not hard_evidence:
+    miner_artifact = hard_evidence or by.get("network", 0) >= cfg.net_score_strong
+    if (not corroborated and not hard_evidence) or not miner_artifact:
         score = min(score, cfg.suspicious_cap)
 
     # Conviction pairs: a behavioral signal + a corroborating one is diagnostic.

@@ -50,8 +50,8 @@ which this project never runs on your host.
 ## The signals
 
 Each process gets a set of independent sub-scores (0–100), combined into one
-verdict. A process only reaches **Likely Miner** when several signals agree —
-that corroboration requirement is what keeps false positives down.
+verdict. Behavioral convictions require corroboration. A miner-like name alone
+does not trigger a mining alert; see the cloud VM policy below.
 
 | Signal | What it measures |
 |---|---|
@@ -184,6 +184,96 @@ scanner correctly won't flag them, so the table measures MinerSentry's
 *behavioral* coverage (including its sensitivity floor on heavily CPU-capped
 miners), not a signature head-to-head — a real comparison needs live malware in
 an isolated VM, which the harness never runs itself.
+
+## Ubuntu / Linux NVIDIA GPU collection
+
+Linux NVIDIA sampling is available in this fork with:
+
+```bash
+python -m minersentry.cli --duration 60 --gpu --json
+```
+
+The GUI uses the same collector. The VM needs an NVIDIA driver and
+`nvidia-smi` on PATH. No CUDA Toolkit or PyTorch dependency is added.
+Check collection separately with `nvidia-smi pmon -s u -c 5`.
+
+The collector parses per-process SM activity from `nvidia-smi pmon -s u -c 1`.
+Only compute-only (`C`) rows are scored; graphics (`G`) and mixed (`C+G`) rows
+are excluded. A PID using multiple GPUs receives the maximum utilization,
+not the sum. SM activity is a Linux compute proxy, not the same metric as
+Windows PDH compute-engine utilization. Thresholds need workload validation.
+Linux window ownership is not collected, so Windows window-based dampening
+is unavailable. High GPU activity alone must not establish mining. CPU + GPU saturation
+also occurs in normal CUDA workloads, so the default GPU/CPU-only conviction
+pair is removed in this fork; miner-specific corroboration is still required.
+
+Unsupported `-` values are not converted to zero. Missing utilization resets
+that PID's GPU history to prevent stale high-load evidence. Driver/command
+failures and compute rows with no usable SM measurements emit a warning to
+stderr; they must not be interpreted as a successful clean bill of health.
+GPU-busy processes enter memory-scan candidates even when CPU use is low.
+GPU percentage is SM activity; pmon `mem` is memory activity, not VRAM usage.
+
+Initial scope: Linux NVIDIA full-GPU passthrough. MIG, AMD, mixed graphics /
+compute, real-miner detection accuracy, and native Windows hardware regression
+remain to be validated. The upstream PID-based engine cache remains unchanged;
+rapid PID reuse between scans can still affect cached process evidence.
+No API reporting, scheduled service or process termination is enabled by this change.
+
+## Cloud VM detection policy in this fork
+
+### Optional NVIDIA GPU-only scan
+
+```bash
+python -m minersentry.cli --duration 45 --gpu-only --json
+```
+
+`--gpu-only` implies GPU sampling and restricts both process inspection and
+memory/perf probes to PIDs returned by NVIDIA's compute-process query. It includes
+zero-utilization processes still holding a compute context; pure graphics and
+CPU-only processes are excluded. Scope is refreshed each pass, and `--pid` cannot
+override it. GPU load alone still does not establish mining.
+
+This mode requires a working `nvidia-smi` on Windows or Linux. A failed, missing,
+timed-out or unsupported process query exits nonzero instead of reporting a clean
+empty scan. A successful empty query is valid. Per-process SM utilization may be
+unavailable even when compute PIDs are readable; sampling warnings still apply.
+System-wide hidden-CPU accounting is disabled because the process list is partial.
+The default all-process mode and `--gpu` alone retain their existing behavior.
+CPU mining and miners that release their compute context are outside this mode.
+
+The separately deployed `minersentry_report.py` must also be updated to accept
+and forward `--gpu-only`. Keep its existing SQLite state file. For example:
+
+```bash
+python minersentry_report.py --gpu-only             # preview
+python minersentry_report.py --gpu-only --send      # report new alerts
+```
+
+Known miner names are supporting evidence, not standalone alerts. An idle process
+named `xmrig` stays Clean unless other evidence justifies a higher verdict;
+sustained CPU or GPU activity plus a known miner name can still trigger Likely
+Miner through the existing conviction pairs. Other corroborated rules (including
+memory/dataset or pool evidence) remain active even at low CPU/GPU load.
+
+Name matching includes known brands, delimiter/numeric suffix variants such as
+`xmrig-notls`, `gminer64` and `nbminer_v42`, and the executable basename when
+the visible name is disguised. Generic `miner`, `miner-cuda12`, `cuda-miner`
+and `tracker-miner-fs-3` do not establish a miner identity. Neither do arbitrary
+embedded brand strings such as `notxmrig` or `xmrighelper`. The legacy config
+key `known_miner_substrings` is retained but now uses the same brand boundaries.
+Remove generic `miner` entries from custom name/alias lists if present; config
+overrides replace the defaults. WinRing0 remains excluded. A signed executable
+does not erase a known brand signal, but that signal still needs corroboration.
+Names are not proof of hashing; fully renamed miners need other evidence.
+No process is terminated or reported to an API by this policy.
+
+CPU/GPU activity, a large mapping and generic cryptographic constants / algorithm
+names alone are weak evidence. Their combination is capped below Suspicious.
+Memory scoring caps these generic cues below the hard-memory threshold; real
+miner/protocol string hits retain their scoring, as do corroborated mining rules.
+This reduces the risk of ML workloads being convicted merely for using resources.
+It does not exempt Python, PyTorch, training directories or allowlisted users.
 
 ## False positives
 

@@ -54,8 +54,12 @@ class ProcInfo:
 
 
 class Engine:
-    def __init__(self, cfg: Config | None = None, audit: AuditLog | None = None) -> None:
+    def __init__(self, cfg: Config | None = None, audit: AuditLog | None = None,
+                 gpu_only: bool = False) -> None:
         self.cfg = cfg or Config.load()
+        self.gpu_only = gpu_only
+        self.gpu_scope: set[int] = set()
+        self._gpu_processes: dict[int, psutil.Process] = {}
         self._ncpu = psutil.cpu_count(logical=True) or 1
         self._cpu_hist: dict[int, deque[tuple[float, float]]] = defaultdict(
             lambda: deque(maxlen=self.cfg.cpu_history_len))
@@ -63,8 +67,8 @@ class Engine:
         self._warm: set[int] = set()
         self._self_pid = os.getpid()
         self._mem_cache: dict[int, memscan.MemScanResult] = {}  # from deep scans
-        # Static per-PID metadata cache (name/exe/username/trusted don't change
-        # for a PID's lifetime; recomputing exe()/username()/Authenticode every
+        # Per-PID metadata cache (refresh the process name on every pass).
+        # Recomputing exe()/username()/Authenticode every
         # pass for ~300 processes made each pass multi-second).
         self._meta: dict[int, tuple[str, str, str, bool]] = {}
         self._last_verdict: dict[int, str] = {}
@@ -96,7 +100,7 @@ class Engine:
         self._perf_ratio: dict[int, float] = {}
         self.audit = audit or AuditLog()
         self.last_scan_errors = 0  # memory OpenProcess failures last deep pass
-        for p in psutil.process_iter():  # prime per-process cpu_percent baselines
+        for p in (() if gpu_only else psutil.process_iter()):  # prime CPU baselines
             try:
                 p.cpu_percent(None)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -105,6 +109,28 @@ class Engine:
         # first pass's system_cpu_pct / hidden-compute gap isn't a bogus 0
 
     # -- input gathering ----------------------------------------------------
+    def set_gpu_scope(self, pids: set[int]) -> None:
+        self.gpu_scope = {pid for pid in pids if pid > 0}
+        for pid in set(self._gpu_processes) - self.gpu_scope:
+            self._gpu_processes.pop(pid, None)
+
+    def _processes(self):
+        attrs = ["pid", "name", "cpu_percent", "memory_info"]
+        if not self.gpu_only:
+            yield from psutil.process_iter(attrs)
+            return
+        for pid in sorted(self.gpu_scope):
+            try:
+                p = self._gpu_processes.get(pid)
+                if p is None or not p.is_running():
+                    p = psutil.Process(pid)
+                    self._gpu_processes[pid] = p
+                # Reuse Process objects so cpu_percent keeps its baseline.
+                p.info = p.as_dict(attrs=attrs)
+                yield p
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
     def _pool_hits(self, pid: int, raddrs: list[tuple[str, int]],
                    now: float) -> list[tuple[str, int, bool, bool]]:
         hits = []
@@ -165,7 +191,7 @@ class Engine:
             if mem_sig.score:
                 mem_sig = Signal("memory", int(mem_sig.score * cfg.trusted_dampen),
                                  mem_sig.detail + " (trusted-signed: dampened)")
-            if name_sig.score:
+            if name_sig.score and not (is_miner_name(info.name, cfg) or is_miner_name(info.exe, cfg)):
                 name_sig = Signal("name", int(name_sig.score * cfg.trusted_dampen),
                                   name_sig.detail + " (trusted-signed: dampened)")
 
@@ -208,9 +234,13 @@ class Engine:
         iterates them live; the result is capped so it can't grow without bound."""
         limit = limit or self.cfg.deep_limit
         targets = self.top_cpu_pids(limit)
+        if self.gpu_only:
+            targets = [pid for pid in targets if pid in self.gpu_scope]
         seen = set(targets)
 
         def _add(pid: int) -> None:
+            if self.gpu_only and pid not in self.gpu_scope:
+                return
             if pid > 4 and pid != self._self_pid and pid not in seen:
                 seen.add(pid)
                 targets.append(pid)
@@ -218,10 +248,18 @@ class Engine:
         for pid in (force or ()):                      # explicit --pid targets
             _add(pid)
         protected = len(targets)  # busy + forced targets are never truncated
+        if self.gpu_only:
+            for pid in sorted(self.gpu_scope):  # include idle compute contexts
+                _add(pid)
+        with self._gpu_lock:
+            gpu_busy = [pid for pid, history in self._gpu_hist.items()
+                        if history and history[-1] >= self.cfg.gpu_mean_moderate]
+        for pid in gpu_busy:                          # GPU-only work, any CPU
+            _add(pid)
         for pid, _ip, _port in list(self._conn_seen):  # pool-connected, any CPU
             _add(pid)
         for pid, meta in list(self._meta.items()):     # miner-like name, any CPU
-            if is_miner_name(meta[0], self.cfg):
+            if is_miner_name(meta[0], self.cfg) or is_miner_name(meta[1], self.cfg):
                 _add(pid)
         for pid in list(self._big_mem_pids):            # ~2 GiB dataset, any CPU
             _add(pid)
@@ -231,6 +269,8 @@ class Engine:
 
     def scan_memory(self, pid: int) -> memscan.MemScanResult:
         """Memory-scan one PID and cache the result (used by the deep worker)."""
+        if self.gpu_only and pid not in self.gpu_scope:
+            raise ValueError(f"PID {pid} is outside the GPU-only scan scope")
         r = memscan.scan_process(
             pid, budget_bytes=self.cfg.mem_max_bytes_per_proc,
             max_region_read=self.cfg.mem_max_region_read,
@@ -261,7 +301,7 @@ class Engine:
         # process costs a single proc_info syscall this pass (reading them
         # separately multiplied it). memory_info lets us spot a RandomX-dataset-
         # sized private allocation cheaply, regardless of CPU.
-        for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_info"]):
+        for p in self._processes():
             if p.pid == 0:
                 continue
             raw = p.info.get("cpu_percent")
@@ -295,6 +335,8 @@ class Engine:
         conn_map: dict[int, list[tuple[str, int]]] = defaultdict(list)
         try:
             for c in psutil.net_connections(kind="tcp"):
+                if self.gpu_only and c.pid not in self.gpu_scope:
+                    continue
                 if c.pid and c.status == psutil.CONN_ESTABLISHED and c.raddr:
                     conn_map[c.pid].append((c.raddr.ip, c.raddr.port))
         except (psutil.AccessDenied, OSError):
@@ -339,6 +381,10 @@ class Engine:
                 trusted = trust.is_trusted(exe, self.cfg.trusted_dirs)
                 meta = (name, exe, username, trusted)
                 self._meta[p.pid] = meta
+            live_name = p.info.get("name")
+            if live_name and live_name != meta[0]:
+                meta = (live_name, *meta[1:])
+                self._meta[p.pid] = meta
             info.name, info.exe, info.username, info.trusted = meta
             if os.path.basename(info.exe).lower() == "minersentry.exe":
                 continue  # never flag ourselves
@@ -361,7 +407,11 @@ class Engine:
 
         # Hidden-compute report (system-level). Require the unaccounted gap to
         # hold for several samples before flagging, to reject sampling skew.
-        if self.cfg.power_enabled:
+        if self.gpu_only:
+            # The scope omits CPU-only work; it cannot explain system-wide CPU.
+            self.hidden_report = power.HiddenComputeReport(
+                note="GPU-only mode: system-wide hidden-compute accounting disabled")
+        elif self.cfg.power_enabled:
             busy = self.system_cpu_pct * self._ncpu  # raw per-core sum
             unaccounted_cores = max(0.0, busy - attributed_raw) / 100.0
             if unaccounted_cores >= self.cfg.unaccounted_cores_threshold:
@@ -440,6 +490,10 @@ class Engine:
         """Push a GPU-compute snapshot (from a background sampler). Appends each
         PID's compute % to its short history; records window/compute-context sets."""
         with self._gpu_lock:
+            # Retire stale evidence when a PID disappears or telemetry fails.
+            # Missing data is not proof of idleness; reset instead of adding zero.
+            for pid in set(self._gpu_hist) - set(util):
+                self._gpu_hist.pop(pid, None)
             for pid, pct in util.items():
                 self._gpu_hist[pid].append(pct)
             if window_pids is not None:
