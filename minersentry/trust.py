@@ -18,7 +18,7 @@ import sys
 from ctypes import wintypes
 
 IS_WINDOWS = sys.platform == "win32"
-_cache: dict[str, bool] = {}
+_cache: dict[tuple, bool] = {}
 
 # WinVerifyTrust constants
 _WTD_UI_NONE = 2
@@ -88,29 +88,57 @@ if IS_WINDOWS:
         return rc == 0  # ERROR_SUCCESS -> validly signed
 
 
-def is_trusted(exe: str, trusted_dirs: tuple[str, ...]) -> bool:
+def _under(path: str, dirs: tuple[str, ...]) -> bool:
+    r"""True if `path` sits inside one of `dirs`, matching whole path components.
+
+    A bare prefix test let C:\Program Files2\x.exe count as being under
+    C:\Program Files, and any user can create new folders in the root of C:\.
+    Separator and case handling follow the path's own style (a path containing a
+    backslash or drive colon is treated as Windows), so it is testable anywhere.
+    """
+    win = "\\" in path or (len(path) > 1 and path[1] == ":")
+    if win:
+        p, sep = path.lower().replace("/", "\\"), "\\"
+    else:
+        p, sep = path, "/"
+    for d in dirs:
+        d = (d.lower().replace("/", "\\") if win else d).rstrip("\\/")
+        if d and (p == d or p.startswith(d + sep)):
+            return True
+    return False
+
+
+def is_trusted(exe: str, trusted_dirs: tuple[str, ...],
+               untrusted_hints: tuple[str, ...] = ()) -> bool:
     """Return True if `exe` is trusted enough to dampen its memory/name signals.
 
-    A process is trusted if it is EITHER validly embedded-signed (WinVerifyTrust)
-    OR lives under a standard trusted system directory. The directory signal is
-    needed because Windows/AV binaries — exactly the processes this dampening
-    protects — are usually *catalog*-signed (.cat files), which a file-only
-    WinVerifyTrust can't see, so they'd otherwise read as unsigned. Writing into
-    System32 / Program Files already requires admin (full compromise), and the
-    behavioral signals (cpu/gpu/probe) are never dampened, so this is a safe
-    trade. Non-signed binaries outside those dirs stay untrusted.
+    Trusted means EITHER validly embedded-signed (WinVerifyTrust) OR inside a
+    standard system directory. The directory route is needed because Windows/AV
+    binaries are usually catalog-signed, which a file-only WinVerifyTrust can't
+    see. Writing into System32 / Program Files needs admin, and the behavioral
+    signals (cpu/gpu/probe) are never dampened.
+
+    A signature does NOT earn trust for a binary running from a user-writable
+    drop location (`untrusted_hints`: Temp, AppData, ProgramData, /tmp ...).
+    Code-signing certificates are cheap and miners ship signed; a signed binary
+    in Temp gets no benefit of the doubt.
     """
     if not exe:
         return False
     key = exe.lower()
-    if key in _cache:
-        return _cache[key]
-    embedded_signed = False
-    if IS_WINDOWS and os.path.exists(exe):
-        try:
-            embedded_signed = _winverifytrust(exe) is True
-        except Exception:  # noqa: BLE001 - trust check must never crash a scan
-            embedded_signed = False
-    result = embedded_signed or key.startswith(trusted_dirs)
-    _cache[key] = result
+    ck = (key, trusted_dirs, untrusted_hints)
+    if ck in _cache:
+        return _cache[ck]
+    if _under(exe, trusted_dirs):
+        result = True
+    elif any(h in key for h in untrusted_hints):
+        result = False
+    else:
+        result = False
+        if IS_WINDOWS and os.path.exists(exe):
+            try:
+                result = _winverifytrust(exe) is True
+            except Exception:  # noqa: BLE001 - trust check must never crash a scan
+                result = False
+    _cache[ck] = result
     return result

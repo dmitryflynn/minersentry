@@ -138,10 +138,22 @@ MAX_BYTES_PER_PROC = 192 * 1024 * 1024     # stop a process after 192 MiB
 LARGE_DATASET_BYTES = 2 * 1024 * 1024 * 1024 - (64 * 1024 * 1024)  # ~2 GiB
 
 
+def _wide(marker: bytes) -> bytes:
+    """UTF-16LE form of an ASCII marker (how .NET / Win32 W-APIs hold strings)."""
+    return marker.decode("ascii").encode("utf-16-le")
+
+
+_WIDE_MARKERS = {m: _wide(m) for m in STRING_MARKERS}
+
+
 def _search_chunk(chunk: bytes, result: MemScanResult, seen: set[str]) -> None:
+    # bytes.lower() only touches ASCII letters, so the zero bytes of a UTF-16LE
+    # string survive and one lowered copy serves both encodings.
     lowered = chunk.lower()
     for marker, (label, weight) in STRING_MARKERS.items():
-        if marker in lowered and label not in seen:
+        if label in seen:
+            continue
+        if marker in lowered or (_WIDE_MARKERS.get(marker) or _wide(marker)) in lowered:
             seen.add(label)
             result.hits.append(MemHit(label, weight, "string",
                                       generic=marker in GENERIC_STRING_MARKERS))
@@ -153,16 +165,24 @@ def _search_chunk(chunk: bytes, result: MemScanResult, seen: set[str]) -> None:
 
 def scan_process(pid: int, budget_bytes: int = MAX_BYTES_PER_PROC,
                  max_region_read: int = MAX_REGION_READ,
-                 large_dataset_bytes: int = LARGE_DATASET_BYTES) -> MemScanResult:
+                 large_dataset_bytes: int = LARGE_DATASET_BYTES,
+                 full_walk: bool = True) -> MemScanResult:
     """Walk readable committed memory of `pid`, looking for miner fingerprints.
 
     Dispatches to the Windows (ReadProcessMemory) or Linux (/proc) backend.
     Budgets (per-process cap, per-region read, large-dataset threshold) are
     passed in so the engine can drive them from Config; defaults match the
     module constants.
+
+    `full_walk` (Windows) keeps querying region sizes after the read budget is
+    spent, so a ~2 GiB dataset past the first 48 MiB is still noticed. Browsers
+    and Electron apps have so many reserved regions that the full walk costs
+    5-7 s each, so the engine asks for it only when the process's private bytes
+    are big enough to hold a dataset at all.
     """
     if IS_WINDOWS:
-        return _scan_windows(pid, budget_bytes, max_region_read, large_dataset_bytes)
+        return _scan_windows(pid, budget_bytes, max_region_read, large_dataset_bytes,
+                             full_walk)
     if IS_LINUX:
         return _scan_linux(pid, budget_bytes, max_region_read, large_dataset_bytes)
     r = MemScanResult(pid=pid)
@@ -171,7 +191,7 @@ def scan_process(pid: int, budget_bytes: int = MAX_BYTES_PER_PROC,
 
 
 def _scan_windows(pid: int, budget_bytes: int, max_region_read: int,
-                  large_dataset_bytes: int) -> MemScanResult:
+                  large_dataset_bytes: int, full_walk: bool = True) -> MemScanResult:
     result = MemScanResult(pid=pid)
     if pid <= 4:
         result.error = "system process"
@@ -189,7 +209,10 @@ def _scan_windows(pid: int, budget_bytes: int, max_region_read: int,
         addr = 0
         buf = ctypes.create_string_buffer(max_region_read)
         read = ctypes.c_size_t(0)
-        while result.bytes_scanned < budget_bytes:
+        # Walk EVERY region: region sizes are cheap to query, and the ~2 GiB
+        # dataset must be noticed even after the read budget is spent (it used
+        # to be missed whenever 48 MiB ran out before the walk reached it).
+        while True:
             ok = _k32.VirtualQueryEx(handle, ctypes.c_void_p(addr),
                                      ctypes.byref(mbi), ctypes.sizeof(mbi))
             if not ok:
@@ -203,7 +226,7 @@ def _scan_windows(pid: int, budget_bytes: int, max_region_read: int,
             if committed and region_size >= large_dataset_bytes:
                 result.large_page_dataset = True
 
-            if committed and readable and not guarded:
+            if committed and readable and not guarded and result.bytes_scanned < budget_bytes:
                 to_read = min(region_size, max_region_read, budget_bytes - result.bytes_scanned)
                 read.value = 0
                 ok = _k32.ReadProcessMemory(handle, ctypes.c_void_p(base),
@@ -219,6 +242,9 @@ def _scan_windows(pid: int, budget_bytes: int, max_region_read: int,
             next_addr = base + region_size
             if next_addr <= addr:
                 break
+            if result.bytes_scanned >= budget_bytes and (
+                    result.large_page_dataset or not full_walk):
+                break  # nothing left to learn from the rest of the walk
             addr = next_addr
         result.scanned = True
         result.coverage_status = "partial" if result.regions_failed else "bounded"

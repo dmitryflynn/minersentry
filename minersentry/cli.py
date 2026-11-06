@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import time
 from dataclasses import replace
 from typing import Callable
@@ -41,12 +42,24 @@ def run_session(duration: float, cfg: Config | None = None,
     interval = interval if interval is not None else e.cfg.scan_interval
     start = time.time()
     first_hit: dict[int, float] = {}
-    deep_done = False
+    deep_thread: threading.Thread | None = None
     scope_ok = False
     results: list[ProcInfo] = []
     deep_at = min(12.0, duration * 0.5)  # memory-sweep once history has warmed
-    while time.time() - start < duration:
-        elapsed = time.time() - start
+
+    def _record(elapsed: float) -> None:
+        for r in results:
+            if r.verdict != "Clean" and r.pid not in first_hit:
+                first_hit[r.pid] = round(elapsed, 1)
+        if progress:
+            progress(elapsed, results)
+
+    # Keep passing until the time is up AND the memory sweep has finished, so
+    # the final verdict has both fresh CPU history and the sweep's results.
+    while (time.time() - start < duration
+           or (deep_thread is not None and deep_thread.is_alive())):
+        t0 = time.time()
+        elapsed = t0 - start
         if gpu_only:
             # The first query must succeed (an empty scope from a broken driver
             # would read as a clean scan). After that, a transient failure keeps
@@ -62,17 +75,21 @@ def run_session(duration: float, cfg: Config | None = None,
         if gpu_sample or gpu_only:
             util, windows, ctx = gpu_mod.sample()
             e.set_gpu_util(util, windows, ctx)
-        if deep and not deep_done and elapsed >= deep_at:
-            for pid in e.deep_scan_targets(force=force_pids):
-                e.deep_probe(pid)
-            deep_done = True
+        if deep and deep_thread is None and elapsed >= deep_at:
+            # Memory sweep on its own thread (like the GUI) so CPU sampling keeps
+            # its cadence; a synchronous sweep starved the CPU window of samples.
+            targets = e.deep_scan_targets(force=force_pids)
+            deep_thread = threading.Thread(
+                target=lambda: [e.deep_probe(pid) for pid in targets], daemon=True)
+            deep_thread.start()
         results = e.scan_once(deep=False)
-        for r in results:
-            if r.verdict != "Clean" and r.pid not in first_hit:
-                first_hit[r.pid] = round(elapsed, 1)
-        if progress:
-            progress(elapsed, results)
-        time.sleep(interval)
+        _record(elapsed)
+        # Keep a steady cadence: sleep only what is left of the interval. Sleeping
+        # a full interval after a multi-second pass halved the sample rate.
+        time.sleep(max(0.0, interval - (time.time() - t0)))
+    if deep_thread is not None:
+        results = e.scan_once(deep=False)   # fold in the finished memory sweep
+        _record(time.time() - start)
     return e, results, first_hit
 
 

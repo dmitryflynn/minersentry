@@ -38,7 +38,7 @@ CPU. MinerSentry scores that behavior directly.
 |---|---|---|
 | Fresh or recompiled build (new hash) | ✗ nothing to match | ✓ work is unchanged |
 | Renamed / packed binary | ✗ | ✓ |
-| Injected into a signed process (`svchost`) | ✗ (process is signed) | ✓ memory scan of any PID |
+| Injected into a signed process (`svchost`) | ✗ (process is signed) | ✓ memory scan; injection hosts are never trust-dampened |
 | CPU-capped to 1–20% | ✗ | ✓ dataset + (Linux) cache-miss fingerprint |
 | Pauses when a monitor opens | ✗ | ✓ the evasion probe |
 | Encrypted pool traffic | ✗ (can't inspect payload) | ✓ port + connection persistence |
@@ -59,8 +59,8 @@ desktop and stays quiet on a cloud host; see [Profiles](#profiles-desktop-and-cl
 |---|---|
 | **cpu** | Sustained, steady **core saturation** (a high *floor*, not a bursty peak). Measured per-core, so a one-thread miner on a 20-core box is still caught. |
 | **gpu** | Sustained **GPU compute-engine** utilization by a headless process — catches GPU-only miners that CPU accounting can't see. Per-process compute load comes from the Windows PDH "GPU Engine" counters (vendor-neutral); a CUDA compute context (nvidia-smi) raises confidence. Windowed apps (games/creative) and an allowlist (Blender, OBS, DaVinci, ffmpeg…) are dampened. |
-| **memory** | Read-only scan of each process's committed memory for miner fingerprints: `stratum+tcp`, `xmrig`, `RandomX`, stratum login/submit JSON, pool names, and a ~2 GiB RandomX dataset. Finds miners injected into signed processes. |
-| **network** | Established TCP connections to stratum-typical pool ports, and — via bundled threat intel — connections to a **resolved known mining-pool IP on *any* port** (e.g. a pool on 443). A persisted connection scores higher than a transient one. |
+| **memory** | Read-only scan of each process's committed memory for miner fingerprints: `stratum+tcp`, `xmrig`, `RandomX`, stratum login/submit JSON, pool names, and a ~2 GiB RandomX dataset. Strings are matched as both 8-bit text and UTF-16 (how .NET miners hold them). Finds miners injected into `svchost`, `explorer`, `dllhost` and the other usual hosts, which are never trust-dampened. |
+| **network** | Established TCP connections to stratum-typical pool ports, and — via bundled threat intel — connections to a **resolved known mining-pool IP on *any* port** (e.g. a pool on 443). Only pool stratum endpoints are listed, never pool websites, and any address in a shared CDN range (Cloudflare, Fastly) is dropped, since unrelated sites share it. A persisted connection scores higher than a transient one. |
 | **name** | Known miner binary names and execution from suspicious directories (Temp, ProgramData, roaming on Windows; /tmp, /dev/shm, /var/tmp on Linux). |
 | **probe** | The **evasion probe** (see below). |
 | **perf** *(Linux)* | Per-process **cache-misses-per-instruction** via user-mode `perf_event_open`. RandomX's random reads across its ~2 GB dataset produce an order-of-magnitude higher miss rate than ordinary compute — a fingerprint of the algorithm visible even when the miner is CPU-capped. Degrades to a no-op where `perf_event_paranoid` forbids it. |
@@ -68,7 +68,10 @@ desktop and stays quiet on a cloud host; see [Profiles](#profiles-desktop-and-cl
 Alongside the per-process signals, a **hidden-compute** banner flags work the
 process list can't explain: a persistent gap between system-wide CPU and the sum
 of visible processes (a rootkit-hidden PID), or sustained load inside a VM/WSL
-host (`vmmem`/`vmwp`) you can't see into.
+host (`vmmem`/`vmwp`) you can't see into. Every busy machine has some CPU that
+no process is charged for (interrupts, short-lived processes, kernel work), and
+it grows with load. So the first dozen passes learn what is normal for this
+machine, and only a lasting excess on top of that raises the banner.
 
 The deep memory scan targets not just the busiest processes but **any process
 holding a pool connection, a miner-like name, or a RandomX-dataset-sized (~2 GiB)
@@ -97,11 +100,20 @@ ML/CUDA is a legitimate false-positive class — corroboration promotes it.
 ## The evasion probe (the novel part)
 
 A whole class of miners pauses the moment a monitoring tool opens, so you never
-see the spike. MinerSentry turns that evasion into evidence: it spawns a harmless
-decoy process whose image name is `taskmgr.exe` (a copy of the stock `ping`
-utility, which just waits), and watches which busy processes **collapse their CPU
-to near zero** while the decoy is alive. Legitimate software has no reason to
-react to Task Manager appearing; a process that goes quiet is self-incriminating.
+see the spike. MinerSentry turns that evasion into evidence: it spawns harmless
+decoys named after the tools miners watch for (`taskmgr.exe`, `procexp64.exe`,
+`ProcessHacker.exe`, `SystemInformer.exe`, `perfmon.exe`, `resmon.exe`; `htop`,
+`top`, `nvtop`, `btop` on Linux). Each is a copy of the stock `ping` or `sleep`
+utility that just waits. It then watches which busy processes **collapse their
+CPU to near zero** while the decoys are alive and come back once they're gone.
+Legitimate software has no reason to react to a process monitor appearing; a
+process that goes quiet is self-incriminating.
+
+Only the baseline looks at every process. The decoy phases re-measure just the
+processes that were busy, because walking all ~400 processes on a desktop took
+longer than the decoy lived and let an evader's recovery leak into the reading.
+Against the benign evader in `samples/` it caught 4 runs out of 4 with nothing
+else flagged. It has not been tested against real evasive malware.
 
 ## Run it
 
@@ -162,9 +174,11 @@ appears as `msentry_target.exe` when run with `--unsigned`.)
 ## Controls
 
 - **Pause/Resume monitoring** — the live scan loop (every ~2.5 s).
-- **Deep scan (memory)** — memory-fingerprint the top CPU users on the next pass.
-- **Run evasion probe** — the fake-Task-Manager test.
-- **Terminate selected** — ends the selected process (guarded by a confirmation).
+- **Deep scan (memory)** — memory-fingerprint the candidates now. This also
+  runs by itself every 45 s (`deep_auto_interval`) while monitoring is on.
+- **Run evasion probe** — the monitor-decoy test.
+- **Terminate selected** — ends the selected process after a confirmation, and
+  refuses if the PID now belongs to a different process than the row showed.
 
 ## Headless scan & benchmark
 
@@ -307,7 +321,14 @@ reaction), none of which legitimate software has.
   shows "gathering samples" until then.
 - Memory string matches alone aren't conclusive: security tools legitimately
   carry miner signatures in memory, so MinerSentry requires behavioral
-  corroboration and dampens validly-signed binaries rather than alarming.
+  corroboration and dampens trusted binaries rather than alarming. Trusted
+  means inside a system folder (matched by whole folder name, so
+  `C:\Program Files2` doesn't count) or validly signed. A signature earns
+  nothing for a binary running from Temp, Roaming, the Recycle Bin or Fonts,
+  and the usual injection hosts are never dampened at all.
+- The hidden-compute baseline is learned at startup, so CPU hidden from the
+  very start of a session is learned as normal. The VM/WSL check and every
+  per-process signal still apply.
 - Full memory coverage of protected/other-user processes requires Administrator.
 - The memory scan reads a bounded slice of each process (48 MiB by default), and
   some regions fail to read. `--json` output includes a `memory_coverage` block
@@ -321,6 +342,9 @@ reaction), none of which legitimate software has.
   (the Windows PMU path needs a kernel driver / ETW PMU session and is deferred).
   On Linux it also requires `/proc/sys/kernel/perf_event_paranoid` ≤ 2 (own
   processes) or `CAP_PERFMON`/root (other users); otherwise it degrades to off.
+  Counters are opened on every thread of the process and summed (a counter on
+  the PID alone only sees the main thread). The cache-miss thresholds have not
+  yet been validated against a real RandomX miner.
 - Remaining sensitivity floor: a miner throttled below the CPU floor with no
   pool, name, strings, or large dataset **and** on a host where `perf` is
   unavailable can still slip — the narrow residual case.

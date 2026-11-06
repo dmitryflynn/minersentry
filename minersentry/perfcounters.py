@@ -95,38 +95,82 @@ if IS_LINUX:
         return fd
 
 
+_MAX_THREADS = 128   # cap the counters opened per process (2 fds per thread)
+
+
+def thread_ids(pid: int) -> list[int]:
+    """Thread IDs of `pid` from /proc/<pid>/task (main thread first)."""
+    try:
+        tids = sorted(int(t) for t in os.listdir(f"/proc/{pid}/task") if t.isdigit())
+    except OSError:
+        return []
+    if pid in tids:
+        tids.remove(pid)
+        tids.insert(0, pid)
+    return tids[:_MAX_THREADS]
+
+
+def ratio_from_group_reads(raws: list[bytes]) -> float | None:
+    """Sum PERF_FORMAT_GROUP reads (nr, instructions, cache_misses) across
+    threads and return cache-misses per 1000 instructions. Pure."""
+    instrs = misses = 0
+    for raw in raws:
+        if len(raw) < 24:
+            continue
+        nr, i, m = struct.unpack("<QQQ", raw[:24])
+        if nr < 2:
+            continue
+        instrs += i
+        misses += m
+    if instrs == 0:
+        return None
+    return misses * 1000.0 / instrs
+
+
 def sample_miss_ratio(pid: int, interval: float = 0.3) -> float | None:
     """Return cache-misses-per-1000-instructions for `pid` over `interval`
     seconds, or None if counters couldn't be read. Memory-hard miners show an
-    order of magnitude more misses/instr than ordinary compute."""
+    order of magnitude more misses/instr than ordinary compute.
+
+    perf_event_open(pid, cpu=-1) counts ONE thread (the one whose TID is
+    `pid`), not the process; `inherit` only covers threads created later. A
+    miner hashes in worker threads while its main thread idles, so we open a
+    counter group on every thread in /proc/<pid>/task and sum them, which is
+    what `perf stat -p` does."""
     if not IS_LINUX or __NR_perf_event_open is None:
         return None
     PERF_EVENT_IOC_RESET = 0x2403
     PERF_EVENT_IOC_ENABLE = 0x2400
     PERF_EVENT_IOC_DISABLE = 0x2401
-    lead = _open(_PERF_COUNT_HW_INSTRUCTIONS, pid, -1, True)
-    if lead < 0:
-        return None
-    miss = _open(_PERF_COUNT_HW_CACHE_MISSES, pid, lead, True)
-    if miss < 0:
-        os.close(lead)
-        return None
+    import fcntl
+    groups: list[tuple[int, int]] = []
     try:
-        import fcntl
-        fcntl.ioctl(lead, PERF_EVENT_IOC_RESET, 1)   # 1 = PERF_IOC_FLAG_GROUP
-        fcntl.ioctl(lead, PERF_EVENT_IOC_ENABLE, 1)
+        for tid in thread_ids(pid):
+            lead = _open(_PERF_COUNT_HW_INSTRUCTIONS, tid, -1, True)
+            if lead < 0:
+                continue
+            miss = _open(_PERF_COUNT_HW_CACHE_MISSES, tid, lead, True)
+            if miss < 0:
+                os.close(lead)
+                continue
+            groups.append((lead, miss))
+        if not groups:
+            return None
+        for lead, _ in groups:
+            fcntl.ioctl(lead, PERF_EVENT_IOC_RESET, 1)   # 1 = PERF_IOC_FLAG_GROUP
+            fcntl.ioctl(lead, PERF_EVENT_IOC_ENABLE, 1)
         time.sleep(interval)
-        fcntl.ioctl(lead, PERF_EVENT_IOC_DISABLE, 1)
-        # read_format=GROUP: nr(u64), then value(u64) per member in open order
-        raw = os.read(lead, 8 * 3)
-        if len(raw) < 24:
-            return None
-        nr, instrs, misses = struct.unpack("<QQQ", raw[:24])
-        if nr < 2 or instrs == 0:
-            return None
-        return misses * 1000.0 / instrs
+        raws = []
+        for lead, _ in groups:
+            fcntl.ioctl(lead, PERF_EVENT_IOC_DISABLE, 1)
+            raws.append(os.read(lead, 8 * 3))
+        return ratio_from_group_reads(raws)
     except Exception:  # noqa: BLE001 - telemetry must never crash a scan
         return None
     finally:
-        os.close(miss)
-        os.close(lead)
+        for lead, miss in groups:
+            for fd in (miss, lead):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
