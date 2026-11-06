@@ -1,4 +1,4 @@
-"""Cloud VM policy: benign names stay clean; miner names need corroboration."""
+"""Cloud profile: benign names stay clean; miner names need corroboration."""
 import time
 
 import pytest
@@ -10,7 +10,7 @@ from minersentry.scoring import (
     Signal, combine, is_miner_name, score_cpu, score_gpu, score_memory, score_name,
 )
 
-CFG = Config()
+CFG = Config(profile="cloud")
 
 
 @pytest.mark.parametrize('name', sorted(CFG.known_miner_names))
@@ -115,7 +115,7 @@ def test_large_dataset_with_miner_strings_still_catches_throttled_miner():
 
 
 def test_signed_status_does_not_suppress_explicit_miner_identity():
-    engine = Engine(cfg=Config())
+    engine = Engine(cfg=Config(profile="cloud"))
     info = ProcInfo(987654)
     info.name, info.exe, info.trusted = 'worker', '/opt/nbminer_v42', True
     signals = engine._build_signals(info, [], time.time())
@@ -137,7 +137,7 @@ def test_live_name_refresh_does_not_keep_cached_benign_name(monkeypatch, tmp_pat
     from minersentry import engine as engine_module
     from minersentry.audit import AuditLog
 
-    engine = Engine(cfg=Config(), audit=AuditLog(path=str(tmp_path / 'events.jsonl')))
+    engine = Engine(cfg=Config(profile="cloud"), audit=AuditLog(path=str(tmp_path / 'events.jsonl')))
     pid = 987654
     mem = SimpleNamespace(rss=0)
     fake = SimpleNamespace(pid=pid, info={

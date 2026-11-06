@@ -13,6 +13,7 @@ import argparse
 import json
 import sys
 import time
+from dataclasses import replace
 from typing import Callable
 
 from .config import Config
@@ -41,12 +42,23 @@ def run_session(duration: float, cfg: Config | None = None,
     start = time.time()
     first_hit: dict[int, float] = {}
     deep_done = False
+    scope_ok = False
     results: list[ProcInfo] = []
     deep_at = min(12.0, duration * 0.5)  # memory-sweep once history has warmed
     while time.time() - start < duration:
         elapsed = time.time() - start
         if gpu_only:
-            e.set_gpu_scope(gpu_mod.compute_pids())
+            # The first query must succeed (an empty scope from a broken driver
+            # would read as a clean scan). After that, a transient failure keeps
+            # the last good scope instead of throwing away the whole session.
+            try:
+                e.set_gpu_scope(gpu_mod.compute_pids())
+                scope_ok = True
+            except RuntimeError as error:
+                if not scope_ok:
+                    raise
+                print(f"warning: {error}; keeping the previous GPU scope",
+                      file=sys.stderr)
         if gpu_sample or gpu_only:
             util, windows, ctx = gpu_mod.sample()
             e.set_gpu_util(util, windows, ctx)
@@ -62,6 +74,17 @@ def run_session(duration: float, cfg: Config | None = None,
             progress(elapsed, results)
         time.sleep(interval)
     return e, results, first_hit
+
+
+def _coverage(r: ProcInfo) -> dict | None:
+    """How much of the process's memory was actually read. A partial scan that
+    found nothing is not the same as a full clean one, so say which it was."""
+    m = r.mem_result
+    if m is None:
+        return None
+    return {"status": m.coverage_status, "bytes_scanned": m.bytes_scanned,
+            "regions_scanned": m.regions_scanned, "regions_failed": m.regions_failed,
+            "error": m.error}
 
 
 def summarize(e: Engine, results: list[ProcInfo], first_hit: dict[int, float],
@@ -80,6 +103,7 @@ def summarize(e: Engine, results: list[ProcInfo], first_hit: dict[int, float],
             "cpu": round(r.cpu, 1), "gpu": round(r.gpu, 1),
             "ttd_s": first_hit.get(r.pid),
             "signals": {s.name: s.score for s in r.signals if s.score > 0},
+            "memory_coverage": _coverage(r),
         })
     procs.sort(key=lambda p: p["score"], reverse=True)
     rep = e.hidden_report
@@ -106,6 +130,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--gpu-only", action="store_true",
                     help="scan only NVIDIA compute-context PIDs; implies --gpu; "
                          "fails if the NVIDIA process query is unavailable")
+    ap.add_argument("--profile", choices=("desktop", "cloud"), default=None,
+                    help="desktop (default): a known miner name alone is Suspicious; "
+                         "cloud: a name alone stays Clean until load corroborates it")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     args = ap.parse_args(argv)
 
@@ -113,7 +140,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"MinerSentry headless scan - {args.duration:.0f}s ...", file=sys.stderr)
     pid_set = set(args.pid) if args.pid else None
     try:
-        e, results, first_hit = run_session(args.duration, interval=args.interval,
+        cfg = Config.load()
+        if args.profile:
+            cfg = replace(cfg, profile=args.profile)
+        e, results, first_hit = run_session(args.duration, cfg=cfg, interval=args.interval,
                                           deep=not args.no_deep, gpu_sample=args.gpu,
                                           force_pids=pid_set, gpu_only=args.gpu_only)
     except RuntimeError as error:

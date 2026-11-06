@@ -96,7 +96,11 @@ def test_gpu_only_work_enters_deep_targets_without_mining_conviction():
     assert info.gpu == 97
     assert next(s for s in signals if s.name == 'gpu').score > 0
     assert combine(signals, engine.cfg)[1] != 'Likely Miner'
+    # one skipped telemetry row keeps the history; a sustained gap retires it
     engine.set_gpu_util({}, set(), set())
+    assert list(engine._gpu_hist[22066]) == [97] * engine.cfg.gpu_min_samples
+    for _ in range(engine.cfg.gpu_miss_tolerance):
+        engine.set_gpu_util({}, set(), set())
     assert 22066 not in engine._gpu_hist
     assert 22066 not in engine.deep_scan_targets()
 
@@ -104,6 +108,18 @@ def test_gpu_only_work_enters_deep_targets_without_mining_conviction():
 def test_valid_zero_retires_high_load_and_preserves_other_processes():
     engine = Engine(cfg=Config())
     engine.set_gpu_util({22066: 97, 8888: 80})
-    engine.set_gpu_util({22066: 0})
-    assert list(engine._gpu_hist[22066]) == [97, 0]
+    for _ in range(engine.cfg.gpu_miss_tolerance + 1):
+        engine.set_gpu_util({22066: 0})
+    assert list(engine._gpu_hist[22066])[:2] == [97, 0]
     assert 8888 not in engine._gpu_hist
+
+
+def test_gap_never_appends_zero_and_a_reading_resets_the_miss_count():
+    engine = Engine(cfg=Config())
+    engine.set_gpu_util({22066: 97})
+    for _ in range(engine.cfg.gpu_miss_tolerance):
+        engine.set_gpu_util({})
+    engine.set_gpu_util({22066: 95})          # back before the limit
+    for _ in range(engine.cfg.gpu_miss_tolerance):
+        engine.set_gpu_util({})               # a fresh gap of the same length
+    assert list(engine._gpu_hist[22066]) == [97, 95]

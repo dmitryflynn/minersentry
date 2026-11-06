@@ -172,4 +172,4 @@ def test_default_mode_still_uses_all_processes(monkeypatch, tmp_path):
     monkeypatch.setattr(engine_module.psutil, 'process_iter', lambda *args: calls.append(args) or iter(()))
     e = Engine(cfg=Config(), audit=AuditLog(path=str(tmp_path / 'audit.jsonl')))
     list(e._processes())
-    assert calls == [(), (['pid', 'name', 'cpu_percent', 'memory_info'],)]
+    assert calls == [(), (['pid', 'name', 'cpu_percent', 'memory_info', 'create_time'],)]

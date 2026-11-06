@@ -71,13 +71,19 @@ class Engine:
         # Recomputing exe()/username()/Authenticode every
         # pass for ~300 processes made each pass multi-second).
         self._meta: dict[int, tuple[str, str, str, bool]] = {}
+        # PID -> process start time. Every per-PID cache above and below is
+        # keyed by PID alone, and Windows recycles PIDs quickly; when the start
+        # time changes the PID belongs to a new process and all of its cached
+        # evidence (including the "trusted" flag) is dropped.
+        self._ctime: dict[int, float] = {}
         self._last_verdict: dict[int, str] = {}
         # GPU snapshot (set by a background sampler, read each pass).
         self._gpu_hist: dict[int, deque[float]] = defaultdict(
             lambda: deque(maxlen=self.cfg.gpu_history_len))
         self._gpu_windows: set[int] = set()
         self._gpu_ctx: set[int] = set()
-        # _gpu_hist/_gpu_windows/_gpu_ctx are written by a background GPU sampler
+        self._gpu_misses: dict[int, int] = {}  # consecutive telemetry gaps
+        # _gpu_hist/_gpu_windows/_gpu_ctx/_gpu_misses are written by a background GPU sampler
         # thread and read by the scan thread, so every access is lock-guarded.
         self._gpu_lock = threading.Lock()
         self.system_cpu_pct = 0.0  # single-owner system CPU reading (0-100)
@@ -114,8 +120,31 @@ class Engine:
         for pid in set(self._gpu_processes) - self.gpu_scope:
             self._gpu_processes.pop(pid, None)
 
+    def _forget_pid(self, pid: int) -> None:
+        """Drop everything cached for a PID (it exited or was reused)."""
+        self._cpu_hist.pop(pid, None)
+        self._probe_drops.pop(pid, None)
+        self._mem_cache.pop(pid, None)
+        self._last_verdict.pop(pid, None)
+        self._meta.pop(pid, None)
+        self._perf_ratio.pop(pid, None)
+        self._warm.discard(pid)
+        for key in [k for k in self._conn_seen if k[0] == pid]:
+            self._conn_seen.pop(key, None)
+        with self._gpu_lock:
+            self._gpu_hist.pop(pid, None)
+            self._gpu_misses.pop(pid, None)
+
+    def _check_reuse(self, pid: int, ctime: float | None) -> None:
+        if ctime is None:
+            return
+        prev = self._ctime.get(pid)
+        if prev is not None and abs(prev - ctime) > 0.01:
+            self._forget_pid(pid)
+        self._ctime[pid] = ctime
+
     def _processes(self):
-        attrs = ["pid", "name", "cpu_percent", "memory_info"]
+        attrs = ["pid", "name", "cpu_percent", "memory_info", "create_time"]
         if not self.gpu_only:
             yield from psutil.process_iter(attrs)
             return
@@ -307,6 +336,7 @@ class Engine:
             raw = p.info.get("cpu_percent")
             if raw is None:
                 continue
+            self._check_reuse(p.pid, p.info.get("create_time"))
             procs.append((p, raw))
             mi = p.info.get("memory_info")
             if mi is not None and p.pid != self._self_pid:
@@ -431,6 +461,8 @@ class Engine:
             self._last_verdict.pop(dead, None)
         for dead in set(self._meta) - live_pids:
             self._meta.pop(dead, None)
+        for dead in set(self._ctime) - live_pids:
+            self._ctime.pop(dead, None)
         for dead in set(self._perf_ratio) - live_pids:
             self._perf_ratio.pop(dead, None)
         self._warm &= live_pids
@@ -439,6 +471,7 @@ class Engine:
         with self._gpu_lock:
             for dead in set(self._gpu_hist) - live_pids:
                 self._gpu_hist.pop(dead, None)
+                self._gpu_misses.pop(dead, None)
         # Drop first-seen timestamps for connections that have CLOSED, so a
         # process that later re-opens the same ip:port starts its persistence
         # clock fresh instead of inheriting a stale (already-"persisted") entry.
@@ -490,12 +523,20 @@ class Engine:
         """Push a GPU-compute snapshot (from a background sampler). Appends each
         PID's compute % to its short history; records window/compute-context sets."""
         with self._gpu_lock:
-            # Retire stale evidence when a PID disappears or telemetry fails.
-            # Missing data is not proof of idleness; reset instead of adding zero.
+            # Missing data is not proof of idleness, so a gap never appends a
+            # zero. A PID absent for more than gpu_miss_tolerance consecutive
+            # samples has its history retired; shorter gaps (a skipped pmon or
+            # typeperf row) keep it, so flapping telemetry can still mature.
             for pid in set(self._gpu_hist) - set(util):
-                self._gpu_hist.pop(pid, None)
+                misses = self._gpu_misses.get(pid, 0) + 1
+                if misses > self.cfg.gpu_miss_tolerance:
+                    self._gpu_hist.pop(pid, None)
+                    self._gpu_misses.pop(pid, None)
+                else:
+                    self._gpu_misses[pid] = misses
             for pid, pct in util.items():
                 self._gpu_hist[pid].append(pct)
+                self._gpu_misses.pop(pid, None)
             if window_pids is not None:
                 self._gpu_windows = set(window_pids)
             if ctx_pids is not None:
