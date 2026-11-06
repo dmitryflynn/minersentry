@@ -84,7 +84,10 @@ def score_memory(mem_scanned: bool, mem_score: int, labels: list[str],
         if error:
             return Signal("memory", 0, f"incomplete ({bytes_scanned // (1024*1024)} MiB scanned; {error})")
         return Signal("memory", 0, f"clean ({bytes_scanned // (1024*1024)} MiB scanned)")
-    return Signal("memory", mem_score, "; ".join(labels[:5]))
+    detail = "; ".join(labels[:5])
+    if error:
+        detail += f" (partial scan: {error})"
+    return Signal("memory", mem_score, detail)
 
 
 def score_network(hits: list[tuple[str, int, bool, bool, bool]], cfg: Config) -> Signal:
@@ -225,7 +228,10 @@ def combine(signals: list[Signal], cfg: Config) -> tuple[int, str]:
                      or by.get("probe", 0) >= cfg.hard_probe)
 
     score = int(round(blended))
-    miner_artifact = hard_evidence or by.get("network", 0) >= cfg.net_score_strong
+    # The blend may only pass the cap with a miner-specific artifact: hard
+    # memory/probe evidence or a connection to a known pool. Everything else
+    # (load, port numbers, big mappings) has to go through a conviction pair.
+    miner_artifact = hard_evidence or by.get("network", 0) >= cfg.net_score_known_pool
     if (not corroborated and not hard_evidence) or not miner_artifact:
         score = min(score, cfg.suspicious_cap)
 
@@ -233,6 +239,10 @@ def combine(signals: list[Signal], cfg: Config) -> tuple[int, str]:
     for a, ma, b, mb, floor in cfg.conviction_rules:
         if by.get(a, 0) >= ma and by.get(b, 0) >= mb:
             score = max(score, floor)
+
+    # Desktop profile: a known miner binary name is worth surfacing even idle.
+    if cfg.profile == "desktop" and by.get("name", 0) >= cfg.hard_name:
+        score = max(score, cfg.desktop_name_floor)
 
     score = max(0, min(100, score))
     verdict = "Clean"

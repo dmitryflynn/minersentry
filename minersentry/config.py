@@ -58,7 +58,6 @@ class Config:
     common_legit_ports: frozenset[int] = field(default_factory=lambda: frozenset({
         8080, 8008, 1111, 2222,
     }))
-    net_score_strong: int = 70
     net_score_weak: int = 30
     # A long-lived connection to a stratum-typical port (not a common business
     # port). Kept below 60 on purpose: too weak to convict alongside CPU or GPU
@@ -110,6 +109,10 @@ class Config:
     gpu_score_moderate: int = 40
     gpu_window_dampen: float = 0.35    # process owns a visible window (games/UI)
     gpu_ctx_bonus: int = 10            # holds a CUDA/compute context (nvidia-smi)
+    # Consecutive samples a PID may be missing from GPU telemetry before its
+    # history is dropped. pmon/typeperf skip rows now and then; resetting on the
+    # first gap meant a flapping process never collected enough samples.
+    gpu_miss_tolerance: int = 2
     gpu_allowlist: frozenset[str] = field(default_factory=lambda: frozenset({
         "blender", "obs64", "obs", "davinci", "resolve", "handbrake",
         "handbrakecli", "ffmpeg", "premiere", "afterfx", "topaz", "boinc",
@@ -128,7 +131,14 @@ class Config:
 
     # -- network-connection persistence --------------------------------------
     net_persist_seconds: float = 30.0  # ESTABLISHED to a pool port for this long
-    net_score_persist: int = 15        # bump added to a persisted connection
+
+    # -- deployment profile --------------------------------------------------
+    # "desktop" (default): a known miner binary name on its own is Suspicious,
+    # because on a personal machine an idle or paused xmrig is still worth a look.
+    # "cloud": a name alone stays Clean (shared GPU/ML hosts run lots of oddly
+    # named jobs and alerts are expensive); it still convicts with CPU/GPU load.
+    profile: str = "desktop"
+    desktop_name_floor: int = 50   # score given to a lone known name on desktop
 
     # -- blending / verdict --------------------------------------------------
     weights: dict[str, float] = field(default_factory=lambda: {
@@ -257,4 +267,6 @@ class Config:
             except (TypeError, ValueError):
                 continue
             overrides[k] = v
+        if overrides.get("profile", "desktop") not in ("desktop", "cloud"):
+            overrides.pop("profile")  # typo in config.json -> keep the default
         return replace(cfg, **overrides) if overrides else cfg

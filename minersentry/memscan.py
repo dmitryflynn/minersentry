@@ -42,6 +42,11 @@ STRING_MARKERS = {
     b"ethminer": ("ethminer identifier", 35),
 }
 
+# Markers that also show up in crypto libraries, benchmarks and ML stacks. They
+# are scored, but on their own they can't lift the memory score past the
+# generic cap (see MemScanResult.score); only protocol/brand strings can.
+GENERIC_STRING_MARKERS = frozenset({b"randomx", b"rx/0", b"cryptonight"})
+
 # Binary constants. Keccak/SHA-3 round constant[0] and Blake2b IV word[0] are
 # used by RandomX / CryptoNight pipelines; finding them in a non-crypto app is
 # a weak-but-real signal, so each is scored low and only matters in aggregate.
@@ -59,6 +64,10 @@ PAGE_READABLE = 0x02 | 0x04 | 0x20 | 0x40  # RO, RW, EXEC_READ, EXEC_RW
 PAGE_GUARD = 0x100
 PAGE_NOACCESS = 0x01
 
+# Ceiling for a memory score built only from generic cues (big mapping,
+# algorithm names, crypto constants). Kept below scoring's hard_memory (40).
+GENERIC_SCORE_CAP = 30
+
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
 
@@ -68,6 +77,7 @@ class MemHit:
     label: str
     weight: int
     where: str  # "string" or "binary"
+    generic: bool = False  # weak cue (algorithm name / crypto constant)
 
 
 @dataclass
@@ -88,11 +98,8 @@ class MemScanResult:
         if self.large_page_dataset:
             s += 30
         # Large mappings, algorithm names and crypto constants also occur in ML.
-        has_miner_string = any(
-            h.where == "string" and h.label not in {
-                "RandomX algorithm name", "RandomX variant tag", "CryptoNight algorithm name"
-            } for h in self.hits)
-        return min(100 if has_miner_string else 30, s)
+        has_miner_string = any(h.where == "string" and not h.generic for h in self.hits)
+        return min(100 if has_miner_string else GENERIC_SCORE_CAP, s)
 
 
 if IS_WINDOWS:
@@ -136,11 +143,12 @@ def _search_chunk(chunk: bytes, result: MemScanResult, seen: set[str]) -> None:
     for marker, (label, weight) in STRING_MARKERS.items():
         if marker in lowered and label not in seen:
             seen.add(label)
-            result.hits.append(MemHit(label, weight, "string"))
+            result.hits.append(MemHit(label, weight, "string",
+                                      generic=marker in GENERIC_STRING_MARKERS))
     for marker, (label, weight) in BINARY_MARKERS.items():
         if marker in chunk and label not in seen:
             seen.add(label)
-            result.hits.append(MemHit(label, weight, "binary"))
+            result.hits.append(MemHit(label, weight, "binary", generic=True))
 
 
 def scan_process(pid: int, budget_bytes: int = MAX_BYTES_PER_PROC,
