@@ -177,7 +177,8 @@ def _spawn_decoys(names: tuple[str, ...], detach: bool = False
             time.sleep(0.4)
             if len(decoy_processes(procs, tmpdir)) >= len(paths):
                 return procs, tmpdir, None
-    return procs, tmpdir, last_err or _why_not_started(procs, src)
+    return procs, tmpdir, last_err or _why_not_started(
+        procs, src, paths[0] if paths else None, wait_args)
 
 
 def _launch_variants(tool: str) -> list[tuple[str | None, list[str]]]:
@@ -196,15 +197,29 @@ def _launch_variants(tool: str) -> list[tuple[str | None, list[str]]]:
             (None, [tool])]        # busybox style: first argument names it
 
 
-def _why_not_started(procs: list[subprocess.Popen], src: str) -> str:
+def _why_not_started(procs: list[subprocess.Popen], src: str,
+                     path: str | None = None, wait_args: list[str] | None = None) -> str:
     """Say what actually happened to the decoys, not just that they are absent.
 
     A probe that reports no evasion because its decoys never ran gives the same
-    answer as a clean machine, so the exit codes travel with the message.
+    answer as a clean machine, so the exit codes travel with the message — and,
+    when a copy is still on disk, whatever the copy itself printed.
     """
     codes = ["running" if d.poll() is None else str(d.poll()) for d in procs]
+    detail = ""
+    if path and os.path.exists(path):
+        try:
+            r = subprocess.run([path, *(wait_args or [])], capture_output=True,
+                               text=True, timeout=2)
+            msg = (r.stderr or r.stdout or "").strip().splitlines()
+            if msg:
+                detail = f"; it said: {msg[0][:160]}"
+        except subprocess.TimeoutExpired:
+            detail = "; it ran fine when started on its own"
+        except Exception as e:  # noqa: BLE001
+            detail = f"; rerun failed: {type(e).__name__}: {e}"
     return (f"decoys exited immediately (copies of {src}; exit codes: "
-            f"{', '.join(codes) or 'none launched'})")
+            f"{', '.join(codes) or 'none launched'}){detail}")
 
 
 def _decoys_under(tmpdir: str) -> list[psutil.Process]:
