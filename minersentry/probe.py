@@ -132,10 +132,20 @@ def _spawn_decoys(names: tuple[str, ...], detach: bool = True
     else:
         sources = [("/bin/sleep", [str(_DECOY_LIFETIME)]),
                    ("/usr/bin/sleep", [str(_DECOY_LIFETIME)])]
+        # On some systems /bin/sleep is a symlink into a MULTI-CALL binary
+        # (busybox, or coreutils built as one program), which picks its tool
+        # from argv[0]. A copy renamed "htop" is then an unknown tool and exits
+        # at once, leaving the probe with decoys that never ran. Both known
+        # ways of naming the tool explicitly are tried before giving up.
+        arg_variants = [[str(_DECOY_LIFETIME)],
+                        ["sleep", str(_DECOY_LIFETIME)],
+                        ["--coreutils-prog=sleep", str(_DECOY_LIFETIME)]]
     src_args = next(((s, a) for s, a in sources if os.path.exists(s)), None)
     if src_args is None:
         return [], tmpdir, "no suitable decoy binary found"
     src, args = src_args
+    if sys.platform == "win32":
+        arg_variants = [args]
     procs: list[subprocess.Popen] = []
     paths: list[str] = []
     last_err = None
@@ -166,25 +176,27 @@ def _spawn_decoys(names: tuple[str, ...], detach: bool = True
     # the probe nor any caller should measure before the decoys exist.
     if _wait_for_decoys(procs, tmpdir, len(paths)):
         return procs, tmpdir, None
-    if procs:                      # direct launch already failed; nothing else to try
-        return procs, tmpdir, last_err or _why_not_started(procs, src)
-    # The detached launch did not come up. Relaunch the copies directly so the
-    # probe still has its decoys, accepting the parent-process tell.
-    for p in _decoys_under(tmpdir):
-        try:
-            p.kill()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-    for path in paths:
-        try:
-            procs.append(subprocess.Popen(
-                [path, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL, creationflags=creation))
-        except Exception as e:  # noqa: BLE001
-            last_err = f"{type(e).__name__}: {e}"
-    if not _wait_for_decoys(procs, tmpdir, len(paths)):
-        return procs, tmpdir, last_err or _why_not_started(procs, src)
-    return procs, tmpdir, None
+    # Either the detached hand-off did not come up, or the copies exited at
+    # once. Relaunch directly, trying each way of telling a multi-call binary
+    # which tool it is. Having decoys matters more than hiding their parent.
+    for variant in arg_variants:
+        for p in decoy_processes(procs, tmpdir):
+            try:
+                p.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        procs = []
+        for path in paths:
+            try:
+                procs.append(subprocess.Popen(
+                    [path, *variant], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                    creationflags=creation))
+            except Exception as e:  # noqa: BLE001
+                last_err = f"{type(e).__name__}: {e}"
+        if _wait_for_decoys(procs, tmpdir, len(paths), timeout=3.0):
+            return procs, tmpdir, None
+    return procs, tmpdir, last_err or _why_not_started(procs, src)
 
 
 def _why_not_started(procs: list[subprocess.Popen], src: str) -> str:
