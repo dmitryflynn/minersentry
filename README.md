@@ -117,13 +117,18 @@ CPU to near zero** while the decoys are alive and come back once they're gone.
 Legitimate software has no reason to react to a process monitor appearing; a
 process that goes quiet is self-incriminating.
 
-Three things that gave the decoys away are gone: the folder no longer carries a
-fixed `msentry_` prefix, the decoys are started through the shell so MinerSentry
-is not their parent process, and each one is accompanied by a real off-screen
+Two things that gave the decoys away are gone: the folder no longer carries a
+fixed `msentry_` prefix, and each decoy is accompanied by a real off-screen
 window with the matching title (`Task Manager`, `Process Explorer`, …), because
 plenty of evasive miners look for the window rather than the process. Those
 windows pump their messages — a window whose thread doesn't will hang any
 process that enumerates window titles, including the miner and real monitors.
+
+MinerSentry is still the decoys' parent process, which a determined miner could
+check. Launching them through the shell hides that, but then they can only be
+found again by resolving their executable path, which some systems refuse —
+leaving decoys that cannot be confirmed or stopped. Being certain the decoys
+ran is worth more than hiding their parentage, so they are launched directly.
 
 Only the baseline looks at every process. The decoy phases re-measure just the
 processes that were busy, because walking all ~400 processes on a desktop took

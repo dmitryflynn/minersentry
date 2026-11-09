@@ -103,50 +103,41 @@ def _wait_for_decoys(procs: list[subprocess.Popen], tmpdir: str, want: int,
         time.sleep(0.05)
 
 
-def _spawn_decoys(names: tuple[str, ...], detach: bool = True
+def _spawn_decoys(names: tuple[str, ...], detach: bool = False
                   ) -> tuple[list[subprocess.Popen], str | None, str | None]:
     """Spawn one harmless waiting process per decoy name, all at once.
 
-    Each is a copy of a stock utility (ping on Windows, sleep on Linux) saved
-    under the name of a monitoring tool, so Process.name() reports e.g.
-    "taskmgr.exe" or "ProcessHacker.exe" to a miner checking the process list.
-    Nothing real is touched, and no Python interpreter is needed. The decoys
-    are told to wait far longer than the probe needs; the caller kills them.
+    Each is a copy of a stock utility (ping on Windows, sleep elsewhere) saved
+    under the name of a monitoring tool, so the process list reports e.g.
+    "taskmgr.exe" or "ProcessHacker.exe" to a miner reading it. Nothing real is
+    touched and no Python interpreter is needed.
 
-    Two tells are removed here. The folder no longer carries a fixed
-    "msentry_" prefix (a miner could simply ignore any process running from a
-    path containing it), and on Windows each decoy is started through
-    `cmd /c start` so its parent is not MinerSentry's own interpreter — the
-    decoys are re-parented as the launcher exits, as a real monitor would be.
+    The folder name is random: a fixed "msentry_" prefix let a miner ignore any
+    process running from a path containing it.
 
-    Detaching is a nicety, not a requirement: if the shell hand-off has not
-    produced the decoys in time (a loaded or slow machine), they are relaunched
-    directly. Having decoys at all matters more than hiding their parentage.
+    Each decoy is launched directly, so we hold a handle to it and can prove it
+    started and stop it again on any platform. Detaching through the shell
+    (`detach=True`) hides that MinerSentry is the parent, but then the decoys
+    can only be found by resolving their executable path, which some systems
+    refuse — leaving decoys that cannot be confirmed or killed. Being certain
+    of the decoys matters more than hiding their parentage, so detaching is off
+    by default and the parent tell is documented instead.
     """
     tmpdir = tempfile.mkdtemp(prefix=secrets.token_hex(4) + "-")
     creation = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
     if sys.platform == "win32":
         sysroot = os.environ.get("SystemRoot", r"C:\Windows")
-        sources = [(os.path.join(sysroot, "System32", "PING.EXE"),
-                    ["-n", str(_DECOY_LIFETIME), "127.0.0.1"])]
+        sources = [os.path.join(sysroot, "System32", "PING.EXE")]
+        wait_args = ["-n", str(_DECOY_LIFETIME), "127.0.0.1"]
+        tool = "ping"
     else:
-        sources = [("/bin/sleep", [str(_DECOY_LIFETIME)]),
-                   ("/usr/bin/sleep", [str(_DECOY_LIFETIME)])]
-        # On some systems /bin/sleep is a symlink into a MULTI-CALL binary
-        # (busybox, or coreutils built as one program), which picks its tool
-        # from argv[0]. A copy renamed "htop" is then an unknown tool and exits
-        # at once, leaving the probe with decoys that never ran. Both known
-        # ways of naming the tool explicitly are tried before giving up.
-        arg_variants = [[str(_DECOY_LIFETIME)],
-                        ["sleep", str(_DECOY_LIFETIME)],
-                        ["--coreutils-prog=sleep", str(_DECOY_LIFETIME)]]
-    src_args = next(((s, a) for s, a in sources if os.path.exists(s)), None)
-    if src_args is None:
+        sources = ["/bin/sleep", "/usr/bin/sleep"]
+        wait_args = [str(_DECOY_LIFETIME)]
+        tool = "sleep"
+    src = next((c for c in sources if os.path.exists(c)), None)
+    if src is None:
         return [], tmpdir, "no suitable decoy binary found"
-    src, args = src_args
-    if sys.platform == "win32":
-        arg_variants = [args]
-    procs: list[subprocess.Popen] = []
+
     paths: list[str] = []
     last_err = None
     for name in names:
@@ -156,30 +147,13 @@ def _spawn_decoys(names: tuple[str, ...], detach: bool = True
             os.makedirs(os.path.dirname(path), exist_ok=True)
             shutil.copy2(src, path)
             paths.append(path)
-            if detach and sys.platform == "win32":
-                # `start` hands the decoy to the shell, which exits immediately,
-                # so the decoy's parent is not our interpreter.
-                subprocess.Popen(
-                    ["cmd", "/c", "start", "", "/b", path, *args],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL, creationflags=creation)
-            else:
-                procs.append(subprocess.Popen(
-                    [path, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL, creationflags=creation))
         except Exception as e:  # noqa: BLE001 - probe must never crash the app
             last_err = f"{type(e).__name__}: {e}"
     if not paths:
-        return [], tmpdir, last_err or "could not start any decoy"
-    # Wait until the decoys really are in the process list. The shell hand-off
-    # on Windows and plain fork/exec elsewhere each take a moment, and neither
-    # the probe nor any caller should measure before the decoys exist.
-    if _wait_for_decoys(procs, tmpdir, len(paths)):
-        return procs, tmpdir, None
-    # Either the detached hand-off did not come up, or the copies exited at
-    # once. Relaunch directly, trying each way of telling a multi-call binary
-    # which tool it is. Having decoys matters more than hiding their parent.
-    for variant in arg_variants:
+        return [], tmpdir, last_err or "could not copy a decoy"
+
+    procs: list[subprocess.Popen] = []
+    for argv0, extra in _launch_variants(tool):
         for p in decoy_processes(procs, tmpdir):
             try:
                 p.kill()
@@ -187,33 +161,48 @@ def _spawn_decoys(names: tuple[str, ...], detach: bool = True
                 pass
         procs = []
         for path in paths:
+            # argv[0] is passed separately: see _launch_variants.
+            argv = [argv0 or path, *extra, *wait_args]
             try:
                 procs.append(subprocess.Popen(
-                    [path, *variant], stdout=subprocess.DEVNULL,
+                    argv, executable=path, stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
                     creationflags=creation))
             except Exception as e:  # noqa: BLE001
                 last_err = f"{type(e).__name__}: {e}"
-        if _wait_for_decoys(procs, tmpdir, len(paths), timeout=3.0):
+        if _wait_for_decoys(procs, tmpdir, len(paths), timeout=4.0):
             # Being visible is not enough: a wrong argument list dies a moment
-            # later ("invalid time interval"), which would otherwise look like
-            # a working decoy for exactly as long as it takes to check.
+            # later, which would otherwise look like a working decoy for
+            # exactly as long as it takes to check.
             time.sleep(0.4)
             if len(decoy_processes(procs, tmpdir)) >= len(paths):
                 return procs, tmpdir, None
     return procs, tmpdir, last_err or _why_not_started(procs, src)
 
 
+def _launch_variants(tool: str) -> list[tuple[str | None, list[str]]]:
+    """(argv[0], extra args) to try, in order.
+
+    On some systems /bin/sleep is a symlink into a MULTI-CALL binary (busybox,
+    or coreutils built as one program) that picks its tool from argv[0]. A copy
+    renamed "htop" is an unknown tool there and exits at once. Passing argv[0]
+    as the tool name while EXECUTING the renamed file keeps the decoy's name in
+    the process list and still tells the binary what to be.
+    """
+    if sys.platform == "win32":
+        return [(None, [])]
+    return [(None, []),            # a normal single-purpose binary
+            (tool, []),            # multi-call: argv[0] names the tool
+            (None, [tool])]        # busybox style: first argument names it
+
+
 def _why_not_started(procs: list[subprocess.Popen], src: str) -> str:
     """Say what actually happened to the decoys, not just that they are absent.
 
-    A probe that silently reports no evasion when its decoys never ran is
-    worse than one that says why, so the exit codes travel with the message.
+    A probe that reports no evasion because its decoys never ran gives the same
+    answer as a clean machine, so the exit codes travel with the message.
     """
-    codes = []
-    for d in procs:
-        rc = d.poll()
-        codes.append("running" if rc is None else str(rc))
+    codes = ["running" if d.poll() is None else str(d.poll()) for d in procs]
     return (f"decoys exited immediately (copies of {src}; exit codes: "
             f"{', '.join(codes) or 'none launched'})")
 

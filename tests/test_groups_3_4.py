@@ -188,39 +188,19 @@ def test_markers_are_found_deep_inside_a_region():
 
 
 # == group 4: decoy realism ================================================
-def test_decoy_folder_has_no_greppable_prefix_and_no_parent_link():
+def test_decoy_folder_has_no_greppable_prefix():
     names = ("taskmgr.exe",) if sys.platform == "win32" else ("htop",)
     procs, tmpdir, err = probe._spawn_decoys(names)
-    if err and "no suitable decoy" in err:
-        pytest.skip(err)
     try:
-        assert err is None
+        assert err is None, err
         assert "msentry" not in os.path.basename(tmpdir).lower()
         live = probe.decoy_processes(procs, tmpdir)
         assert {p.name() for p in live} == set(names)
-        if sys.platform == "win32":
-            # The detached launch leaves them orphaned; on a slow machine the
-            # direct fallback runs instead and we are legitimately the parent.
-            ours = {os.getpid()}
-            detached = True
-            for p in live:
-                try:
-                    par = p.parent()
-                except Exception:  # noqa: BLE001
-                    par = None
-                if par is not None and par.pid in ours:
-                    detached = False
-            if detached:
-                for p in live:
-                    try:
-                        name = p.parent().name().lower() if p.parent() else ""
-                    except Exception:  # noqa: BLE001
-                        name = ""
-                    assert name != "python.exe"
     finally:
         probe._stop_decoys(procs, tmpdir)
         probe._cleanup(tmpdir)
     assert probe.decoy_processes(procs, tmpdir) == []
+    assert not os.path.exists(tmpdir)
 
 
 def test_every_windows_decoy_has_a_window_title():
