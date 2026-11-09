@@ -68,6 +68,16 @@ def _sample_cpu(procs: dict[int, psutil.Process], interval: float) -> dict[int, 
     return out
 
 
+def _wait_for_decoys(tmpdir: str, want: int, timeout: float = 8.0) -> bool:
+    """Wait until `want` decoys from `tmpdir` are in the process list."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if len(_decoys_under(tmpdir)) >= want:
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def _spawn_decoys(names: tuple[str, ...], detach: bool = True
                   ) -> tuple[list[subprocess.Popen], str | None, str | None]:
     """Spawn one harmless waiting process per decoy name, all at once.
@@ -83,6 +93,10 @@ def _spawn_decoys(names: tuple[str, ...], detach: bool = True
     path containing it), and on Windows each decoy is started through
     `cmd /c start` so its parent is not MinerSentry's own interpreter — the
     decoys are re-parented as the launcher exits, as a real monitor would be.
+
+    Detaching is a nicety, not a requirement: if the shell hand-off has not
+    produced the decoys in time (a loaded or slow machine), they are relaunched
+    directly. Having decoys at all matters more than hiding their parentage.
     """
     tmpdir = tempfile.mkdtemp(prefix=secrets.token_hex(4) + "-")
     creation = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
@@ -125,11 +139,26 @@ def _spawn_decoys(names: tuple[str, ...], detach: bool = True
     # Wait until the decoys really are in the process list. The shell hand-off
     # on Windows and plain fork/exec elsewhere each take a moment, and neither
     # the probe nor any caller should measure before the decoys exist.
-    deadline = time.time() + 2.0
-    while time.time() < deadline:
-        if len(_decoys_under(tmpdir)) >= len(paths):
-            break
-        time.sleep(0.05)
+    if _wait_for_decoys(tmpdir, len(paths)):
+        return procs, tmpdir, None
+    if procs:                      # direct launch already failed; nothing else to try
+        return procs, tmpdir, last_err or "decoys did not start"
+    # The detached launch did not come up. Relaunch the copies directly so the
+    # probe still has its decoys, accepting the parent-process tell.
+    for p in _decoys_under(tmpdir):
+        try:
+            p.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    for path in paths:
+        try:
+            procs.append(subprocess.Popen(
+                [path, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, creationflags=creation))
+        except Exception as e:  # noqa: BLE001
+            last_err = f"{type(e).__name__}: {e}"
+    if not _wait_for_decoys(tmpdir, len(paths)) and not procs:
+        return [], tmpdir, last_err or "could not start any decoy"
     return procs, tmpdir, None
 
 
