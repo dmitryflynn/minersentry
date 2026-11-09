@@ -167,7 +167,7 @@ def _spawn_decoys(names: tuple[str, ...], detach: bool = True
     if _wait_for_decoys(procs, tmpdir, len(paths)):
         return procs, tmpdir, None
     if procs:                      # direct launch already failed; nothing else to try
-        return procs, tmpdir, last_err or "decoys did not start"
+        return procs, tmpdir, last_err or _why_not_started(procs, src)
     # The detached launch did not come up. Relaunch the copies directly so the
     # probe still has its decoys, accepting the parent-process tell.
     for p in _decoys_under(tmpdir):
@@ -182,9 +182,23 @@ def _spawn_decoys(names: tuple[str, ...], detach: bool = True
                 stdin=subprocess.DEVNULL, creationflags=creation))
         except Exception as e:  # noqa: BLE001
             last_err = f"{type(e).__name__}: {e}"
-    if not _wait_for_decoys(procs, tmpdir, len(paths)) and not procs:
-        return [], tmpdir, last_err or "could not start any decoy"
+    if not _wait_for_decoys(procs, tmpdir, len(paths)):
+        return procs, tmpdir, last_err or _why_not_started(procs, src)
     return procs, tmpdir, None
+
+
+def _why_not_started(procs: list[subprocess.Popen], src: str) -> str:
+    """Say what actually happened to the decoys, not just that they are absent.
+
+    A probe that silently reports no evasion when its decoys never ran is
+    worse than one that says why, so the exit codes travel with the message.
+    """
+    codes = []
+    for d in procs:
+        rc = d.poll()
+        codes.append("running" if rc is None else str(rc))
+    return (f"decoys exited immediately (copies of {src}; exit codes: "
+            f"{', '.join(codes) or 'none launched'})")
 
 
 def _decoys_under(tmpdir: str) -> list[psutil.Process]:
