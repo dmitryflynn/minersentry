@@ -156,14 +156,14 @@ def test_decoys_carry_monitor_names_and_are_cleaned_up():
         pytest.skip(err)
     try:
         assert err is None
-        live = probe._decoys_under(tmpdir)
+        live = probe.decoy_processes(procs, tmpdir)
         seen = {p.name() for p in live}
         assert seen == set(names), seen
         assert "msentry" not in os.path.basename(tmpdir).lower()  # no greppable prefix
     finally:
         probe._stop_decoys(procs, tmpdir)
         probe._cleanup(tmpdir)
-    assert probe._decoys_under(tmpdir) == []
+    assert probe.decoy_processes(procs, tmpdir) == []
     assert not os.path.exists(tmpdir)
 
 

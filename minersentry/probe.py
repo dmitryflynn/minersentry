@@ -68,14 +68,39 @@ def _sample_cpu(procs: dict[int, psutil.Process], interval: float) -> dict[int, 
     return out
 
 
-def _wait_for_decoys(tmpdir: str, want: int, timeout: float = 8.0) -> bool:
-    """Wait until `want` decoys from `tmpdir` are in the process list."""
+def decoy_processes(procs: list[subprocess.Popen], tmpdir: str | None
+                    ) -> list[psutil.Process]:
+    """Live decoys, found by handle where we have one and by path otherwise.
+
+    A directly launched decoy is already proven alive by its own handle. Only a
+    DETACHED decoy has to be found by the folder it runs from, and resolving a
+    process's executable path is not something every platform will do for us.
+    """
+    out: list[psutil.Process] = []
+    seen: set[int] = set()
+    for d in procs:
+        if d.poll() is None:
+            try:
+                out.append(psutil.Process(d.pid))
+                seen.add(d.pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    if tmpdir:
+        for p in _decoys_under(tmpdir):
+            if p.pid not in seen:
+                out.append(p)
+    return out
+
+
+def _wait_for_decoys(procs: list[subprocess.Popen], tmpdir: str, want: int,
+                     timeout: float = 8.0) -> bool:
     deadline = time.time() + timeout
-    while time.time() < deadline:
-        if len(_decoys_under(tmpdir)) >= want:
+    while True:
+        if len(decoy_processes(procs, tmpdir)) >= want:
             return True
+        if time.time() >= deadline:
+            return False
         time.sleep(0.05)
-    return False
 
 
 def _spawn_decoys(names: tuple[str, ...], detach: bool = True
@@ -139,7 +164,7 @@ def _spawn_decoys(names: tuple[str, ...], detach: bool = True
     # Wait until the decoys really are in the process list. The shell hand-off
     # on Windows and plain fork/exec elsewhere each take a moment, and neither
     # the probe nor any caller should measure before the decoys exist.
-    if _wait_for_decoys(tmpdir, len(paths)):
+    if _wait_for_decoys(procs, tmpdir, len(paths)):
         return procs, tmpdir, None
     if procs:                      # direct launch already failed; nothing else to try
         return procs, tmpdir, last_err or "decoys did not start"
@@ -157,7 +182,7 @@ def _spawn_decoys(names: tuple[str, ...], detach: bool = True
                 stdin=subprocess.DEVNULL, creationflags=creation))
         except Exception as e:  # noqa: BLE001
             last_err = f"{type(e).__name__}: {e}"
-    if not _wait_for_decoys(tmpdir, len(paths)) and not procs:
+    if not _wait_for_decoys(procs, tmpdir, len(paths)) and not procs:
         return [], tmpdir, last_err or "could not start any decoy"
     return procs, tmpdir, None
 
@@ -193,7 +218,7 @@ def _stop_decoys(procs: list[subprocess.Popen], tmpdir: str | None = None) -> No
             except Exception:  # noqa: BLE001
                 pass
     if tmpdir:                  # detached decoys have no Popen handle
-        live = _decoys_under(tmpdir)
+        live = decoy_processes([], tmpdir)
         for p in live:
             try:
                 p.terminate()

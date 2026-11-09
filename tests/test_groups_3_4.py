@@ -196,7 +196,7 @@ def test_decoy_folder_has_no_greppable_prefix_and_no_parent_link():
     try:
         assert err is None
         assert "msentry" not in os.path.basename(tmpdir).lower()
-        live = probe._decoys_under(tmpdir)
+        live = probe.decoy_processes(procs, tmpdir)
         assert {p.name() for p in live} == set(names)
         if sys.platform == "win32":
             # The detached launch leaves them orphaned; on a slow machine the
@@ -220,7 +220,7 @@ def test_decoy_folder_has_no_greppable_prefix_and_no_parent_link():
     finally:
         probe._stop_decoys(procs, tmpdir)
         probe._cleanup(tmpdir)
-    assert probe._decoys_under(tmpdir) == []
+    assert probe.decoy_processes(procs, tmpdir) == []
 
 
 def test_every_windows_decoy_has_a_window_title():
