@@ -124,6 +124,12 @@ plenty of evasive miners look for the window rather than the process. Those
 windows pump their messages — a window whose thread doesn't will hang any
 process that enumerates window titles, including the miner and real monitors.
 
+On systems where `sleep` is a multi-call binary (busybox, or coreutils built as
+one program) a renamed copy refuses to run — it reports `unknown program
+'htop'` — so there the decoy carries the monitor name in its command line while
+its process name stays the real tool's. Partial, and better than a probe whose
+decoys never started.
+
 MinerSentry is still the decoys' parent process, which a determined miner could
 check. Launching them through the shell hides that, but then they can only be
 found again by resolving their executable path, which some systems refuse —

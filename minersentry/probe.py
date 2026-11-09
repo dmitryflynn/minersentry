@@ -92,6 +92,28 @@ def decoy_processes(procs: list[subprocess.Popen], tmpdir: str | None
     return out
 
 
+def decoy_label(p: psutil.Process) -> str:
+    """The monitor name a decoy presents: its process name, or its argv[0].
+
+    Where a waiting binary cannot be renamed (see `_launch_variants`), the
+    decoy name lives in the command line while the process name stays the real
+    tool's, so both places have to be consulted to identify our own decoys.
+    """
+    try:
+        name = p.name()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return ""
+    try:
+        argv = p.cmdline() or []
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        argv = []
+    if argv:
+        first = os.path.basename(argv[0])
+        if first and first != name:
+            return first
+    return name
+
+
 def _wait_for_decoys(procs: list[subprocess.Popen], tmpdir: str, want: int,
                      timeout: float = 8.0) -> bool:
     deadline = time.time() + timeout
@@ -153,19 +175,21 @@ def _spawn_decoys(names: tuple[str, ...], detach: bool = False
         return [], tmpdir, last_err or "could not copy a decoy"
 
     procs: list[subprocess.Popen] = []
-    for argv0, extra in _launch_variants(tool):
+    for argv0, extra, use_copy in _launch_variants(tool, names):
         for p in decoy_processes(procs, tmpdir):
             try:
                 p.kill()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
         procs = []
-        for path in paths:
-            # argv[0] is passed separately: see _launch_variants.
-            argv = [argv0 or path, *extra, *wait_args]
+        for path, name in zip(paths, names):
+            # argv[0] is passed separately from the file being executed: see
+            # _launch_variants for why each combination is worth trying.
+            image = path if use_copy else src
+            argv = [argv0 or (path if use_copy else name), *extra, *wait_args]
             try:
                 procs.append(subprocess.Popen(
-                    argv, executable=path, stdout=subprocess.DEVNULL,
+                    argv, executable=image, stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
                     creationflags=creation))
             except Exception as e:  # noqa: BLE001
@@ -181,20 +205,27 @@ def _spawn_decoys(names: tuple[str, ...], detach: bool = False
         procs, src, paths[0] if paths else None, wait_args)
 
 
-def _launch_variants(tool: str) -> list[tuple[str | None, list[str]]]:
-    """(argv[0], extra args) to try, in order.
+def _launch_variants(tool: str, names: tuple[str, ...]
+                     ) -> list[tuple[str | None, list[str], bool]]:
+    """(argv[0], extra args, use the renamed copy?) to try, in order.
 
     On some systems /bin/sleep is a symlink into a MULTI-CALL binary (busybox,
-    or coreutils built as one program) that picks its tool from argv[0]. A copy
-    renamed "htop" is an unknown tool there and exits at once. Passing argv[0]
-    as the tool name while EXECUTING the renamed file keeps the decoy's name in
-    the process list and still tells the binary what to be.
+    or coreutils built as one program) that picks its tool from its own name. A
+    copy renamed "htop" is an unknown tool there and exits at once — observed
+    on a CI runner as `coreutils: unknown program 'htop'`.
+
+    So the renamed copy is tried first, then the ways of naming the tool
+    explicitly, and finally the original binary with argv[0] set to the decoy
+    name. That last one always runs, at the cost of showing the monitor name
+    only in the command line: the process name stays the real tool's. Partial,
+    and better than a probe whose decoys never started.
     """
     if sys.platform == "win32":
-        return [(None, [])]
-    return [(None, []),            # a normal single-purpose binary
-            (tool, []),            # multi-call: argv[0] names the tool
-            (None, [tool])]        # busybox style: first argument names it
+        return [(None, [], True)]
+    return [(None, [], True),       # a normal single-purpose binary, renamed
+            (tool, [], True),       # multi-call: argv[0] names the tool
+            (None, [tool], True),   # busybox style: first argument names it
+            (None, [], False)]      # last resort: real binary, decoy argv[0]
 
 
 def _why_not_started(procs: list[subprocess.Popen], src: str,

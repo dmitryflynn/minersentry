@@ -195,7 +195,8 @@ def test_decoy_folder_has_no_greppable_prefix():
         assert err is None, err
         assert "msentry" not in os.path.basename(tmpdir).lower()
         live = probe.decoy_processes(procs, tmpdir)
-        assert {p.name() for p in live} == set(names)
+        # the name may be the image name or argv[0]; see probe.decoy_label
+        assert {probe.decoy_label(p) for p in live} == set(names)
     finally:
         probe._stop_decoys(procs, tmpdir)
         probe._cleanup(tmpdir)

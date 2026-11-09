@@ -157,7 +157,7 @@ def test_decoys_carry_monitor_names_and_are_cleaned_up():
     try:
         assert err is None
         live = probe.decoy_processes(procs, tmpdir)
-        seen = {p.name() for p in live}
+        seen = {probe.decoy_label(p) for p in live}
         assert seen == set(names), seen
         assert "msentry" not in os.path.basename(tmpdir).lower()  # no greppable prefix
     finally:
