@@ -111,27 +111,32 @@ def _swarm_procs(exe, n, raw):
     return out
 
 
+# What counts as a system directory differs per platform, so the paths these
+# tests use have to follow the platform they run on.
+WINDOWS = sys.platform == "win32"
+TRUSTED_EXE = r"C:\Program Files\Browser\renderer.exe" if WINDOWS else "/usr/bin/renderer"
+UNTRUSTED_EXE = (r"C:\Users\x\AppData\Local\Temp\w\worker.exe" if WINDOWS
+                 else "/home/x/.cache/w/worker")
+
+
 def test_swarm_map_groups_untrusted_binaries_only():
     e = _engine()
-    untrusted = r"C:\Users\x\AppData\Local\Temp\w\worker.exe"
-    procs = _swarm_procs(untrusted, 5, 30.0)
+    procs = _swarm_procs(UNTRUSTED_EXE, 5, 30.0)
     for p, _raw in procs:
-        e._meta[p.pid] = ("worker.exe", untrusted, "", None)
+        e._meta[p.pid] = ("worker.exe", UNTRUSTED_EXE, "", None)
     m = e._swarm_map(procs)
     assert m[7700] == (5, 1.5)
 
-    trusted_exe = r"C:\Program Files\Browser\renderer.exe"
     for p, _raw in procs:
-        e._meta[p.pid] = ("renderer.exe", trusted_exe, "", None)
+        e._meta[p.pid] = ("renderer.exe", TRUSTED_EXE, "", None)
     assert e._swarm_map(procs) == {}          # a browser's renderers are not a swarm
 
 
 def test_swarm_map_ignores_idle_siblings():
     e = _engine()
-    exe = r"D:\tools\w.exe"
-    procs = _swarm_procs(exe, 6, 1.0)         # below swarm_min_each
+    procs = _swarm_procs(UNTRUSTED_EXE, 6, 1.0)   # below swarm_min_each
     for p, _raw in procs:
-        e._meta[p.pid] = ("w.exe", exe, "", None)
+        e._meta[p.pid] = ("w.exe", UNTRUSTED_EXE, "", None)
     assert e._swarm_map(procs) == {}
 
 
@@ -146,8 +151,8 @@ def test_untrusted_binaries_are_scanned_at_a_lower_cpu_floor():
     e = _engine()
     low = e.cfg.deep_cpu_floor_untrusted + 1
     assert low < e.cfg.deep_cpu_floor
-    e._meta[8810] = ("w.exe", r"C:\Users\x\Downloads\w.exe", "", None)   # untrusted
-    e._meta[8811] = ("svc.exe", r"C:\Windows\System32\svc.exe", "", None)  # trusted
+    e._meta[8810] = ("w.exe", UNTRUSTED_EXE, "", None)
+    e._meta[8811] = ("svc.exe", TRUSTED_EXE, "", None)
     for pid in (8810, 8811):
         _busy(e, pid, raw=low, n=4)
     targets = e.top_cpu_pids()

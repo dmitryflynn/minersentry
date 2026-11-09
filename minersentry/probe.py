@@ -122,14 +122,14 @@ def _spawn_decoys(names: tuple[str, ...], detach: bool = True
             last_err = f"{type(e).__name__}: {e}"
     if not paths:
         return [], tmpdir, last_err or "could not start any decoy"
-    if detach and sys.platform == "win32":
-        # The shell needs a moment to hand off, and the probe must not start
-        # measuring before the decoys are actually in the process list.
-        deadline = time.time() + 2.0
-        while time.time() < deadline:
-            if len(_decoys_under(tmpdir)) >= len(paths):
-                break
-            time.sleep(0.05)
+    # Wait until the decoys really are in the process list. The shell hand-off
+    # on Windows and plain fork/exec elsewhere each take a moment, and neither
+    # the probe nor any caller should measure before the decoys exist.
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        if len(_decoys_under(tmpdir)) >= len(paths):
+            break
+        time.sleep(0.05)
     return procs, tmpdir, None
 
 
