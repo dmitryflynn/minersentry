@@ -142,7 +142,8 @@ def test_live_name_refresh_does_not_keep_cached_benign_name(monkeypatch, tmp_pat
     mem = SimpleNamespace(rss=0)
     fake = SimpleNamespace(pid=pid, info={
         'pid': pid, 'name': 'worker', 'cpu_percent': 0, 'memory_info': mem,
-    }, oneshot=nullcontext, memory_info=lambda: mem, num_threads=lambda: 1)
+    }, oneshot=nullcontext, memory_info=lambda: mem, num_threads=lambda: 1,
+        cmdline=lambda: ['worker'])
     engine._meta[pid] = ('worker', '/usr/bin/python', '', False)
     monkeypatch.setattr(engine_module.psutil, 'process_iter', lambda *a, **kw: iter([fake]))
     monkeypatch.setattr(engine_module.psutil, 'net_connections', lambda **kw: [])

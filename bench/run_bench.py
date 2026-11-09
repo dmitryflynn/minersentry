@@ -127,7 +127,10 @@ def run_profile(label: str, args: list[str], duration: float) -> dict:
 
 
 def main() -> int:
-    duration = float(os.environ.get("BENCH_DURATION", "22"))
+    # Longer than Config.net_persist_seconds (30 s), or the "long-lived pool
+    # connection" score can never mature and the stealth-pool profile is
+    # measured against a signal that had no chance to fire.
+    duration = float(os.environ.get("BENCH_DURATION", "45"))
     print(f"MinerSentry benchmark — {len(PROFILES)} profiles x {duration:.0f}s each "
           f"(~{len(PROFILES) * (duration + 3):.0f}s total)…")
     env = _detector_presence()

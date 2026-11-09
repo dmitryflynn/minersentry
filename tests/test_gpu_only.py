@@ -140,7 +140,7 @@ def test_scoped_high_gpu_compute_still_needs_miner_evidence(scoped_engine, name,
 
 
 def test_cli_query_failure_returns_nonzero_without_clean_json(monkeypatch, capsys):
-    monkeypatch.setattr(cli.Config, 'load', lambda: Config(pool_intel_enabled=False))
+    monkeypatch.setattr(cli.Config, 'load', lambda *a, **k: Config(pool_intel_enabled=False))
     def fail(): raise RuntimeError('driver unavailable')
     monkeypatch.setattr(gpu, 'compute_pids', fail)
     assert cli.main(['--gpu-only', '--json']) == 1
