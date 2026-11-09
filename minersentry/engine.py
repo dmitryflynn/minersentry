@@ -10,6 +10,7 @@ holds false positives down.
 
 from __future__ import annotations
 
+import ntpath
 import os
 import threading
 import time
@@ -230,7 +231,7 @@ class Engine:
         # behavioral signals (cpu/probe) untouched. Injection hosts (svchost,
         # explorer, ...) are never dampened: they have no business holding miner
         # strings, and they are exactly where an injected miner lives.
-        injection_host = name_stem(os.path.basename(info.exe or info.name)) in cfg.injection_hosts
+        injection_host = name_stem(ntpath.basename(info.exe or info.name)) in cfg.injection_hosts
         if (cfg.trusted_dampen < 1.0 and (mem_sig.score or name_sig.score)
                 and not injection_host and self._trusted(info)):
             if mem_sig.score:
