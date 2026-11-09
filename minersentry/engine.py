@@ -10,6 +10,7 @@ holds false positives down.
 
 from __future__ import annotations
 
+import ntpath
 import os
 import threading
 import time
@@ -29,7 +30,7 @@ from .scoring import (
 class ProcInfo:
     __slots__ = ("pid", "name", "exe", "username", "cpu", "cpu_mean", "cpu_min",
                  "mem_mb", "threads", "signals", "verdict", "score", "mem_result",
-                 "trusted", "gpu")
+                 "trusted", "gpu", "ctime")
 
     def __init__(self, pid: int, cpu: float = 0.0) -> None:
         self.pid = pid
@@ -46,7 +47,10 @@ class ProcInfo:
         self.verdict = "Clean"
         self.score = 0
         self.mem_result: memscan.MemScanResult | None = None
-        self.trusted = False
+        # None = not checked yet. Trust is resolved lazily (WinVerifyTrust is the
+        # slowest call in a pass) and only when a score would be dampened.
+        self.trusted: bool | None = False
+        self.ctime: float | None = None   # process start time (PID-reuse guard)
 
     @property
     def signal_summary(self) -> str:
@@ -94,6 +98,8 @@ class Engine:
         self._pool_ips: set[str] = set()
         # Hidden-compute tracking.
         self._gap_streak = 0
+        self._gap_ratios: list[float] = []      # calibration samples (gap / busy)
+        self._gap_baseline: float | None = None  # learned normal unexplained share
         self.hidden_report = power.HiddenComputeReport()
         # Deep-scan target list, recomputed on the scan thread each pass and read
         # as a stable snapshot by the GUI's background deep thread (so that thread
@@ -113,6 +119,10 @@ class Engine:
                 pass
         psutil.cpu_percent(None)  # prime the system-wide baseline too, so the
         # first pass's system_cpu_pct / hidden-compute gap isn't a bogus 0
+        try:
+            psutil.cpu_times_percent(None)  # same, for interrupt/DPC time
+        except Exception:  # noqa: BLE001
+            pass
 
     # -- input gathering ----------------------------------------------------
     def set_gpu_scope(self, pids: set[int]) -> None:
@@ -206,8 +216,11 @@ class Engine:
             has_ctx = info.pid in self._gpu_ctx
         if gpu_recent:
             info.gpu = gpu_recent[-1]
-        gpu_sig = score_gpu(gpu_recent, has_window,
-                            name_stem(info.name) in cfg.gpu_allowlist, has_ctx, cfg)
+        # The allowlist goes by name, which a miner controls, so it only applies
+        # to a trusted executable (a GPU miner renamed ffmpeg.exe gets no pass).
+        allowlisted = (name_stem(info.name) in cfg.gpu_allowlist and bool(gpu_recent)
+                       and self._trusted(info))
+        gpu_sig = score_gpu(gpu_recent, has_window, allowlisted, has_ctx, cfg)
 
         scanned, mscore, labels, err, nbytes = self._mem_labels(info.mem_result)
         mem_sig = score_memory(scanned, mscore, labels, err, nbytes)
@@ -215,8 +228,12 @@ class Engine:
 
         # Trust dampening: a validly-signed OS/AV binary legitimately carrying
         # miner strings must not alarm, so cut its memory/name scores. Leave the
-        # behavioral signals (cpu/probe) untouched.
-        if info.trusted and cfg.trusted_dampen < 1.0:
+        # behavioral signals (cpu/probe) untouched. Injection hosts (svchost,
+        # explorer, ...) are never dampened: they have no business holding miner
+        # strings, and they are exactly where an injected miner lives.
+        injection_host = name_stem(ntpath.basename(info.exe or info.name)) in cfg.injection_hosts
+        if (cfg.trusted_dampen < 1.0 and (mem_sig.score or name_sig.score)
+                and not injection_host and self._trusted(info)):
             if mem_sig.score:
                 mem_sig = Signal("memory", int(mem_sig.score * cfg.trusted_dampen),
                                  mem_sig.detail + " (trusted-signed: dampened)")
@@ -233,6 +250,16 @@ class Engine:
             score_dataset(large_dataset, cfg),
             score_perf(self._perf_ratio.get(info.pid), cfg),
         ]
+
+    def _trusted(self, info: ProcInfo) -> bool:
+        """Resolve (and cache) the trust flag on first need."""
+        if info.trusted is None:
+            info.trusted = trust.is_trusted(info.exe, self.cfg.trusted_dirs,
+                                            self.cfg.signature_untrusted_dirs)
+            meta = self._meta.get(info.pid)
+            if meta is not None and meta[1] == info.exe:
+                self._meta[info.pid] = (*meta[:3], info.trusted)
+        return bool(info.trusted)
 
     # -- deep (memory) scanning: driven async by the GUI, or sync by CLI -----
     def top_cpu_pids(self, limit: int | None = None) -> list[int]:
@@ -294,26 +321,63 @@ class Engine:
             _add(pid)
         # Cap only the auto-discovered additions so the list can't grow without
         # bound, while always keeping the busy and explicitly-forced targets.
-        return targets[:max(protected, max(1, limit) * 3)]
+        capped = targets[:max(protected, max(1, limit) * 3)]
+        # Scan the most suspicious first. Results land in the cache as each scan
+        # finishes, so a pool-connected or miner-named process shouldn't wait
+        # behind a queue of busy browsers (each takes ~1 s to scan).
+        forced = set(force or ())
+        pool = {pid for pid, _ip, _port in list(self._conn_seen)}
+        named = {pid for pid, meta in list(self._meta.items())
+                 if is_miner_name(meta[0], self.cfg) or is_miner_name(meta[1], self.cfg)}
+        big = set(self._big_mem_pids)
+        gpu = set(gpu_busy)
+        # busy AND running from an odd place (Temp, ProgramData, very short name)
+        odd = {pid for pid, meta in list(self._meta.items())
+               if score_name(meta[0], meta[1], self.cfg).score > 0}
+
+        def rank(pid: int) -> int:
+            for i, group in enumerate((forced, pool, named, big, gpu, odd)):
+                if pid in group:
+                    return i
+            return 6
+        return sorted(capped, key=rank)
 
     def scan_memory(self, pid: int) -> memscan.MemScanResult:
         """Memory-scan one PID and cache the result (used by the deep worker)."""
         if self.gpu_only and pid not in self.gpu_scope:
             raise ValueError(f"PID {pid} is outside the GPU-only scan scope")
+        ctime = self._live_ctime(pid)
         r = memscan.scan_process(
             pid, budget_bytes=self.cfg.mem_max_bytes_per_proc,
             max_region_read=self.cfg.mem_max_region_read,
-            large_dataset_bytes=self.cfg.mem_large_dataset_bytes)
-        self._mem_cache[pid] = r
+            large_dataset_bytes=self.cfg.mem_large_dataset_bytes,
+            full_walk=pid in self._big_mem_pids)
+        # Deep scans run on a background thread and take seconds. Only keep the
+        # result if the PID still belongs to the process we scanned.
+        if self._same_process(pid, ctime):
+            self._mem_cache[pid] = r
         return r
+
+    def _live_ctime(self, pid: int) -> float | None:
+        try:
+            return psutil.Process(pid).create_time()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+            return self._ctime.get(pid)
+
+    def _same_process(self, pid: int, ctime: float | None) -> bool:
+        if ctime is None:
+            return True
+        now = self._live_ctime(pid)
+        return now is not None and abs(now - ctime) <= 0.01
 
     def deep_probe(self, pid: int) -> memscan.MemScanResult:
         """Full deep look at one PID: memory fingerprint scan + (Linux) a
         hardware cache-miss-ratio sample. Used by every deep-scan caller."""
         r = self.scan_memory(pid)
         if self.cfg.perf_enabled and perfcounters.available():
+            ctime = self._live_ctime(pid)
             ratio = perfcounters.sample_miss_ratio(pid, self.cfg.perf_interval)
-            if ratio is not None:
+            if ratio is not None and self._same_process(pid, ctime):
                 self._perf_ratio[pid] = ratio
         return r
 
@@ -408,14 +472,14 @@ class Engine:
                     username = p.username() or ""
                 except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
                     username = ""
-                trusted = trust.is_trusted(exe, self.cfg.trusted_dirs)
-                meta = (name, exe, username, trusted)
+                meta = (name, exe, username, None)  # trust resolved lazily
                 self._meta[p.pid] = meta
             live_name = p.info.get("name")
             if live_name and live_name != meta[0]:
                 meta = (live_name, *meta[1:])
                 self._meta[p.pid] = meta
             info.name, info.exe, info.username, info.trusted = meta
+            info.ctime = self._ctime.get(p.pid)
             if os.path.basename(info.exe).lower() == "minersentry.exe":
                 continue  # never flag ourselves
 
@@ -443,14 +507,16 @@ class Engine:
                 note="GPU-only mode: system-wide hidden-compute accounting disabled")
         elif self.cfg.power_enabled:
             busy = self.system_cpu_pct * self._ncpu  # raw per-core sum
-            unaccounted_cores = max(0.0, busy - attributed_raw) / 100.0
-            if unaccounted_cores >= self.cfg.unaccounted_cores_threshold:
+            explained = attributed_raw + self._irq_raw()
+            excess = self._gap_excess(busy, max(0.0, busy - explained))
+            if excess >= self.cfg.unaccounted_cores_threshold * 100.0:
                 self._gap_streak += 1
             else:
                 self._gap_streak = 0
             persisted_gap = self._gap_streak >= self.cfg.hidden_persist_samples
+            # Hand compute_report the excess over baseline as the unexplained gap.
             self.hidden_report = power.compute_report(
-                busy, attributed_raw, vm_loads, persisted_gap, self.cfg)
+                busy, busy - excess, vm_loads, persisted_gap, self.cfg)
             if self.hidden_report.flagged:
                 self.audit.event("hidden-compute: " + self.hidden_report.note)
 
@@ -484,6 +550,40 @@ class Engine:
 
         results.sort(key=lambda i: (i.score, i.cpu), reverse=True)
         return results
+
+    def _irq_raw(self) -> float:
+        """Interrupt + DPC (Windows) / irq + softirq (Linux) time, raw per-core.
+        The OS never charges this to a process, so it is always 'unexplained'."""
+        try:
+            t = psutil.cpu_times_percent(None)
+        except Exception:  # noqa: BLE001
+            return 0.0
+        pct = sum(getattr(t, f, 0.0) or 0.0 for f in ("interrupt", "dpc", "irq", "softirq"))
+        return pct * self._ncpu
+
+    def _gap_excess(self, busy: float, gap: float) -> float:
+        """Unexplained CPU above this machine's normal share (raw per-core).
+
+        Every busy machine has some CPU no process accounts for, and it grows
+        with load. The first `hidden_calibration_samples` passes learn the
+        normal gap/busy ratio (median, so a spike can't skew it) and never flag;
+        after that the ratio adapts slowly, but only while nothing is flagged,
+        so a hidden miner that appears later can't teach itself into the
+        baseline. Known limit: one already running at startup is learned as
+        normal (the VM/WSL check and the per-process signals still apply)."""
+        cfg = self.cfg
+        ratio = gap / busy if busy > 0 else 0.0
+        if self._gap_baseline is None:
+            self._gap_ratios.append(ratio)
+            if len(self._gap_ratios) >= cfg.hidden_calibration_samples:
+                vals = sorted(self._gap_ratios)
+                self._gap_baseline = vals[len(vals) // 2]
+            return 0.0
+        excess = max(0.0, gap - self._gap_baseline * busy)
+        if excess < cfg.unaccounted_cores_threshold * 100.0 and self._gap_streak == 0:
+            a = cfg.hidden_baseline_alpha
+            self._gap_baseline = (1 - a) * self._gap_baseline + a * ratio
+        return excess
 
     def _note_transition(self, info: ProcInfo) -> None:
         prev = self._last_verdict.get(info.pid, "Clean")

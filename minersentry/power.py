@@ -46,8 +46,8 @@ def compute_report(system_busy_raw: float, attributed_raw: float,
     flagged = False
     if persisted_gap and unaccounted_cores >= cfg.unaccounted_cores_threshold:
         flagged = True
-        notes.append(f"{unaccounted_cores:.1f} cores of CPU not attributable to any "
-                     f"visible process (possible hidden/rootkit compute)")
+        notes.append(f"{unaccounted_cores:.1f} cores of CPU above this machine's normal "
+                     f"unattributed level (possible hidden/rootkit compute)")
     if vm_cores:
         flagged = True
         for name, cores in sorted(vm_cores.items(), key=lambda x: -x[1]):

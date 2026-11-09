@@ -52,7 +52,8 @@ def test_reused_pid_does_not_inherit_trust_or_history(monkeypatch, tmp_path):
     procs[:] = [_fake_proc(pid, "worker.exe", r"C:\Users\x\AppData\Local\Temp\worker.exe", 200.0)]
     r = e.scan_once()[0]
     assert r.exe.endswith("worker.exe")
-    assert r.trusted is False
+    assert r.trusted is not True          # unresolved (None) or False, never inherited
+    assert e._meta[pid][3] is not True
     assert (pid, "1.2.3.4", 3333) not in e._conn_seen
     assert pid not in e._probe_drops
     assert not any(c == 95.0 for _t, c in e._cpu_hist.get(pid, ()))

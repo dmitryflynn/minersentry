@@ -1,7 +1,7 @@
 """MinerSentry desktop GUI (tkinter).
 
-Live process table scored by the behavioral engine, with on-demand deep
-(memory) scanning, the evasion probe, and a guarded terminate action.
+Live process table scored by the behavioral engine, with periodic background
+deep (memory) scanning, the evasion probe, and a guarded terminate action.
 """
 
 from __future__ import annotations
@@ -75,6 +75,7 @@ class MinerSentryApp:
         self.stop_flag = threading.Event()
         self.scan_interval = self.engine.cfg.scan_interval
         self.deep_running = False  # a background deep-scan thread is active
+        self.probe_running = False
         self.elevated = _is_elevated()
         self._gpu_stop = threading.Event()
 
@@ -82,6 +83,11 @@ class MinerSentryApp:
         self._poll_queue()
         # Kick off an immediate first scan so the table isn't empty.
         self.start_monitor()
+        # Memory-scan candidates on a timer. Without this the memory, dataset and
+        # perf signals (the ones that catch a throttled miner) only ever fired
+        # if someone clicked "Deep scan".
+        if self.engine.cfg.deep_auto_interval > 0:
+            self.root.after(int(self.engine.cfg.deep_auto_interval * 1000), self._auto_deep)
         # Background GPU-compute sampler (independent of the pause toggle).
         if self.engine.cfg.gpu_enabled:
             threading.Thread(target=self._gpu_loop, daemon=True).start()
@@ -242,32 +248,39 @@ class MinerSentryApp:
             self.start_monitor()
             self._set_status("Monitoring resumed.")
 
-    def request_deep(self) -> None:
+    def request_deep(self, auto: bool = False) -> None:
         # Deep (memory) scanning runs on its OWN thread so the live monitor loop
         # keeps sampling CPU at its normal cadence and the table never freezes.
         if self.deep_running:
-            self._set_status("Deep scan already running…")
+            if not auto:
+                self._set_status("Deep scan already running…")
             return
         self.deep_running = True
-        self._set_status("Deep memory scan started (busy processes), in background…")
-        threading.Thread(target=self._deep_thread, daemon=True).start()
-        if not self.monitoring:
+        if not auto:
+            self._set_status("Deep memory scan started (busy processes), in background…")
+        threading.Thread(target=self._deep_thread, args=(auto,), daemon=True).start()
+        if not auto and not self.monitoring:
             self.start_monitor()
 
-    def _deep_thread(self) -> None:
+    def _auto_deep(self) -> None:
+        if self.monitoring:
+            self.request_deep(auto=True)
+        self.root.after(int(self.engine.cfg.deep_auto_interval * 1000), self._auto_deep)
+
+    def _deep_thread(self, auto: bool = False) -> None:
         try:
             # Read the snapshot the scan thread computed; don't walk the engine's
             # live dicts from this thread.
             pids = list(self.engine._deep_targets)
             if not pids:
-                self.q.put(("deepdone", 0, 0))
+                self.q.put(("deepdone", 0, 0, auto))
                 return
             errors = 0
             for pid in pids:
                 r = self.engine.deep_probe(pid)
                 if r.error and "OpenProcess" in (r.error or ""):
                     errors += 1
-            self.q.put(("deepdone", len(pids), errors))
+            self.q.put(("deepdone", len(pids), errors, auto))
         except Exception as e:  # noqa: BLE001
             self.q.put(("error", f"deep scan failed: {type(e).__name__}: {e}"))
         finally:
@@ -281,23 +294,32 @@ class MinerSentryApp:
                 self.q.put(("results", results, False, time.time() - t0))
             except Exception as e:  # noqa: BLE001
                 self.q.put(("error", f"{type(e).__name__}: {e}"))
-            # Sleep in small slices so pause is responsive.
-            waited = 0.0
+            # Sleep what is left of the interval (a pass can take seconds), in
+            # small slices so pause is responsive.
+            waited = time.time() - t0
             while waited < self.scan_interval and not self.stop_flag.is_set():
                 time.sleep(0.1)
                 waited += 0.1
 
     # -- probe --------------------------------------------------------------
     def run_probe(self) -> None:
-        self._set_status("Running evasion probe (launching Task Manager decoy)…")
+        if self.probe_running:  # two probes at once would measure each other
+            self._set_status("Evasion probe already running…")
+            return
+        self.probe_running = True
+        self._set_status("Running evasion probe (launching monitor decoys)…")
         threading.Thread(target=self._probe_thread, daemon=True).start()
 
     def _probe_thread(self) -> None:
+        cfg = self.engine.cfg
+        decoys = cfg.probe_decoys_windows if sys.platform == "win32" else cfg.probe_decoys_posix
         try:
-            drops, msg = probe_mod.run_probe()
+            drops, msg = probe_mod.run_probe(decoys=decoys)
             self.q.put(("probe", drops, msg))
         except Exception as e:  # noqa: BLE001
             self.q.put(("probe", {}, f"probe failed: {type(e).__name__}: {e}"))
+        finally:
+            self.probe_running = False
 
     # -- queue pump ---------------------------------------------------------
     def _poll_queue(self) -> None:
@@ -326,12 +348,13 @@ class MinerSentryApp:
                             "\n  ".join(names) +
                             "\n\nThese are now scored on the 'probe' signal.")
                 elif kind == "deepdone":
-                    _, n, errors = item
+                    _, n, errors, auto = item
                     note = f"Deep memory scan complete: {n} process(es) scanned"
                     if errors:
                         note += f", {errors} inaccessible (run as admin for full coverage)"
-                    self._set_status(note)
-                    self._add_event(note)
+                    if not auto:  # the timed sweep runs quietly
+                        self._set_status(note)
+                        self._add_event(note)
                 elif kind == "event":
                     self._add_event(item[1])
                 elif kind == "error":
@@ -442,6 +465,13 @@ class MinerSentryApp:
             return
         try:
             p = psutil.Process(pid)
+            # The row can be a few seconds old. If the PID now belongs to a
+            # different process (it exited and Windows reused the number), stop.
+            if r is None or r.ctime is None or abs(p.create_time() - r.ctime) > 0.01:
+                messagebox.showwarning(
+                    "Process changed",
+                    f"PID {pid} no longer belongs to {name}; nothing was terminated.")
+                return
             p.terminate()
             try:
                 p.wait(timeout=3)
