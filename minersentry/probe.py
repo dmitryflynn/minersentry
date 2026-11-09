@@ -195,7 +195,12 @@ def _spawn_decoys(names: tuple[str, ...], detach: bool = True
             except Exception as e:  # noqa: BLE001
                 last_err = f"{type(e).__name__}: {e}"
         if _wait_for_decoys(procs, tmpdir, len(paths), timeout=3.0):
-            return procs, tmpdir, None
+            # Being visible is not enough: a wrong argument list dies a moment
+            # later ("invalid time interval"), which would otherwise look like
+            # a working decoy for exactly as long as it takes to check.
+            time.sleep(0.4)
+            if len(decoy_processes(procs, tmpdir)) >= len(paths):
+                return procs, tmpdir, None
     return procs, tmpdir, last_err or _why_not_started(procs, src)
 
 
@@ -400,11 +405,24 @@ def classify_drops(before: dict[int, float], during: dict[int, float],
     return out
 
 
-def _cleanup(tmpdir: str | None) -> None:
+def _cleanup(tmpdir: str | None, timeout: float = 5.0) -> None:
+    """Remove the decoy folder, retrying while the image is still locked.
+
+    Windows keeps a running executable's file locked, and a decoy that has
+    just been asked to exit may hold it for a moment longer, so a single
+    attempt silently leaves the folder behind.
+    """
     if not tmpdir:
         return
-    import shutil
-    try:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-    except Exception:  # noqa: BLE001
-        pass
+    deadline = time.time() + timeout
+    while True:
+        try:
+            shutil.rmtree(tmpdir)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if time.time() >= deadline:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                return
+            time.sleep(0.1)
