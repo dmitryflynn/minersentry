@@ -38,6 +38,7 @@ Issues = "https://github.com/dmitryflynn/minersentry/issues"
 [project.scripts]
 minersentry = "minersentry.gui:main"
 minersentry-scan = "minersentry.cli:main"
+minersentry-service = "minersentry.service:main"
 
 [tool.setuptools]
 packages = ["minersentry"]

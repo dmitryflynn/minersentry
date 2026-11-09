@@ -69,6 +69,7 @@ class MinerSentryApp:
         self.audit = AuditLog(on_event=lambda line: self.q.put(("event", line)))
         self.engine = Engine(audit=self.audit)
         self.engine.start_pool_intel()
+        self.engine.start_connection_ages()
         self.monitoring = False
         self.rows: dict[int, ProcInfo] = {}
         self.worker: threading.Thread | None = None

@@ -152,6 +152,21 @@ class Config:
 
     # -- network-connection persistence --------------------------------------
     net_persist_seconds: float = 30.0  # ESTABLISHED to a pool port for this long
+    # Reconnecting faster than net_persist_seconds used to reset the clock, so a
+    # miner that cycles its connection never looked long-lived. Repeatedly
+    # returning to the SAME endpoint counts instead: it is miner-like in itself.
+    net_reconnects_persist: int = 3
+    # Ask Windows how old each connection actually is (Get-NetTCPConnection),
+    # so a 20-second scan can still tell an hours-old pool connection from a
+    # fresh one. Best effort, on a background thread; Linux exposes no age.
+    net_use_connection_age: bool = True
+    net_age_refresh_seconds: float = 120.0
+
+    # -- background monitoring / alerts --------------------------------------
+    # A command run on each new detection (it receives title and body as two
+    # arguments). Empty means use the platform's own notification.
+    notify_command: str = ""
+    notify_min_verdict: str = "Likely Miner"   # or "Suspicious"
 
     # -- deployment profile --------------------------------------------------
     # "desktop" (default): a known miner binary name on its own is Suspicious,
@@ -186,6 +201,10 @@ class Config:
     # so an idle process merely carrying strings can't trip one.
     conviction_rules: tuple[tuple[str, int, str, int, int], ...] = (
         ("cpu", 60, "memory", 60, 82),
+        # Resident miner PROTOCOL strings are miner-specific on their own, so
+        # they convict next to merely moderate load. A miner throttled to a
+        # third of a core used to sit at Clean with xmrig/stratum in memory.
+        ("cpu", 35, "memory", 60, 82),
         ("cpu", 55, "network", 60, 85),
         ("cpu", 50, "name", 70, 85),
         ("cpu", 40, "probe", 60, 88),
@@ -194,6 +213,7 @@ class Config:
         ("memory", 60, "network", 50, 80),
         # GPU-miner pairs: compute saturation + a corroborating artifact/behavior
         ("gpu", 60, "memory", 60, 82),
+        ("gpu", 40, "memory", 60, 82),
         ("gpu", 60, "name", 70, 85),
         ("gpu", 55, "network", 60, 85),
         # CPU + GPU saturation also occurs in normal CUDA/ML workloads.
@@ -219,6 +239,13 @@ class Config:
         ("cmdline", 40, "dataset", 60, 88),
         ("cmdline", 40, "perf", 40, 88),
         ("cmdline", 40, "probe", 60, 90),
+        # A swarm of one binary + anything miner-specific about it.
+        ("swarm", 40, "memory", 60, 85),
+        ("swarm", 40, "cmdline", 40, 85),
+        ("swarm", 40, "name", 70, 85),
+        ("swarm", 40, "network", 50, 85),
+        ("swarm", 40, "dataset", 60, 85),
+        ("swarm", 40, "probe", 60, 88),
         # A connection to a RESOLVED known-pool IP (network >= 88) is near
         # conclusive — legit software has no reason to talk to supportxmr — so a
         # minimal behavioral corroborator convicts.
@@ -246,8 +273,37 @@ class Config:
         "applaunch", "addinprocess", "addinprocess32", "msiexec",
     }))
 
+    # Interpreters and script hosts. A miner written in JS/Python/Java runs
+    # under a validly signed interpreter, so trust dampening used to reduce its
+    # resident miner strings to nothing (a full-core miner scored Clean 29).
+    # The interpreter binary is trusted; the SCRIPT it runs is not, so these are
+    # never dampened. Browsers/Electron apps are deliberately absent: they are
+    # a large, legitimate population and the generic memory cap already covers
+    # the strings they can pick up from a web page.
+    interpreter_hosts: frozenset[str] = field(default_factory=lambda: frozenset({
+        "python", "python3", "pythonw", "py", "node", "nodejs", "deno", "bun",
+        "java", "javaw", "dotnet", "mono", "ruby", "perl", "php", "lua",
+        "pwsh", "powershell", "wscript", "cscript", "mshta", "tclsh", "Rscript",
+    }))
+
+    # -- process-swarm signal (many small workers of one binary) -------------
+    # The split-the-work evasion: 20 processes of the same unsigned binary at a
+    # quarter core each stay under every per-process floor while mining several
+    # cores. Judged per executable, not per PID.
+    swarm_enabled: bool = True
+    swarm_min_procs: int = 4         # at least this many processes of one exe
+    swarm_min_cores: float = 1.0     # together using at least this many cores
+    swarm_min_each: float = 5.0      # ignore idle siblings (raw per-core)
+    swarm_score: int = 45
+
     # -- memory-scan budgets -------------------------------------------------
     mem_max_region_read: int = 4 * 1024 * 1024
+    # Chunks per region, spread across it. Reading only the first slice of each
+    # region let a miner bury its strings deeper into one big allocation.
+    mem_region_samples: int = 4
+    # A process at or below this size is scanned COMPLETELY rather than sampled
+    # (a miner's own footprint is small; its 2 GiB dataset is judged by size).
+    mem_full_scan_max_bytes: int = 128 * 1024 * 1024
     # Miner strings live early in the heap/data; the ~2 GiB RandomX dataset is
     # detected from region *size* (VirtualQueryEx) without reading it. So a
     # modest per-process read budget keeps deep scans fast without missing hits.
@@ -264,6 +320,10 @@ class Config:
     # ~0.3 of a core). A CPU miner is by definition busy, so this keeps the deep
     # scan fast and skips idle processes whose resident strings are irrelevant.
     deep_cpu_floor: float = 30.0
+    # Floor for a binary that is NOT in a system directory. A CPU-capped miner
+    # deliberately sits under the normal floor, and an unsigned process using a
+    # tenth of a core is cheap to memory-scan and the likelier suspect.
+    deep_cpu_floor_untrusted: float = 8.0
     # A process holding a private allocation this large is a RandomX-dataset-sized
     # working set (~2 GiB). It is memory-scanned regardless of CPU, so a heavily
     # throttled stealth miner can't hide under the CPU floor.
@@ -272,7 +332,10 @@ class Config:
 
     # -- command-line signal -------------------------------------------------
     cmdline_enabled: bool = True
-    cmdline_generic_cap: int = 30   # ceiling when only generic flags matched
+    # Ceiling when only generic flags matched. Deliberately below
+    # corrob_nonzero_score (25): ordinary flags shouldn't even count as a
+    # corroborating signal, let alone convict.
+    cmdline_generic_cap: int = 24
 
     # -- hardware perf-counter signal (Linux, user-mode perf_event_open) ------
     perf_enabled: bool = True

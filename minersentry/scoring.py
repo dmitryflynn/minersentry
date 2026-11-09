@@ -209,6 +209,21 @@ def score_perf(miss_ratio: float | None, cfg: Config) -> Signal:
     return Signal("perf", 0, detail)
 
 
+def score_swarm(nprocs: int, cores: float, cfg: Config) -> Signal:
+    """Score many processes of ONE executable sharing a large aggregate load.
+
+    Per-process floors are easy to duck by splitting the work: twenty workers at
+    a quarter core each trip nothing while mining five cores. Load is summed per
+    executable instead. Like cpu/gpu this is work, not proof — build farms and
+    test runners look the same — so it stays out of the weighted blend and
+    convicts only next to something miner-specific.
+    """
+    if not cfg.swarm_enabled or nprocs < cfg.swarm_min_procs or cores < cfg.swarm_min_cores:
+        return Signal("swarm", 0, "no process swarm")
+    return Signal("swarm", cfg.swarm_score,
+                  f"{nprocs} processes of this binary using {cores:.1f} cores together")
+
+
 def score_cmdline(score: int, labels: list[str], cfg: Config) -> Signal:
     """Score mining indicators found in a process's arguments.
 

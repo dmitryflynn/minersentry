@@ -39,6 +39,7 @@ def run_session(duration: float, cfg: Config | None = None,
     """
     e = Engine(cfg=cfg or Config.load(), gpu_only=gpu_only)
     e.start_pool_intel()
+    e.start_connection_ages()
     interval = interval if interval is not None else e.cfg.scan_interval
     start = time.time()
     first_hit: dict[int, float] = {}

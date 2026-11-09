@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+import subprocess
+import sys
 
 # Stratum endpoints of well-known pools (Monero-heavy, since RandomX CPU mining
 # is the common cryptojacking case, plus a few multi-coin pools). minexmr shut
@@ -79,6 +81,59 @@ def is_shared_hosting_ip(ip: str) -> bool:
     if getattr(addr, "ipv4_mapped", None):
         addr = addr.ipv4_mapped
     return any(addr.version == n.version and addr in n for n in _SHARED)
+
+
+def parse_connection_ages(csv_text: str, now: float) -> dict[tuple[int, str, int], float]:
+    """Parse `Get-NetTCPConnection` CSV into {(pid, remote_ip, port): first_seen}.
+
+    Windows records when each TCP connection was created; psutil does not expose
+    it. Without it, "long-lived" can only mean "we watched it for 30 seconds",
+    which a short scan never reaches. Pure, so it is unit-tested against real
+    captured output.
+    """
+    out: dict[tuple[int, str, int], float] = {}
+    rows = csv_text.splitlines()
+    header: list[str] | None = None
+    for line in rows:
+        parts = [c.strip().strip('"') for c in line.split(",")]
+        if header is None:
+            if "OwningProcess" in parts and "CreationTime" in parts:
+                header = parts
+            continue
+        if len(parts) != len(header):
+            continue
+        row = dict(zip(header, parts))
+        try:
+            pid = int(row["OwningProcess"])
+            port = int(row["RemotePort"])
+            age = float(row["AgeSeconds"])
+        except (KeyError, ValueError):
+            continue
+        ip = row.get("RemoteAddress", "")
+        if pid <= 0 or not ip or not 0 < port < 65536 or age < 0:
+            continue
+        out[(pid, ip, port)] = now - age
+    return out
+
+
+def sample_connection_ages(now: float, timeout: float = 20.0
+                           ) -> dict[tuple[int, str, int], float]:
+    """Established TCP connections with their creation times (Windows only)."""
+    if sys.platform != "win32":
+        return {}
+    script = ("Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue | "
+              "Select-Object OwningProcess,RemoteAddress,RemotePort,CreationTime,"
+              "@{n='AgeSeconds';e={[int]((Get-Date) - $_.CreationTime).TotalSeconds}} | "
+              "ConvertTo-Csv -NoTypeInformation")
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                           capture_output=True, text=True, timeout=timeout,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:  # noqa: BLE001 - telemetry must never break a scan
+        return {}
+    if r.returncode != 0:
+        return {}
+    return parse_connection_ages(r.stdout or "", now)
 
 
 def is_pool_hostname(hostname: str) -> bool:
