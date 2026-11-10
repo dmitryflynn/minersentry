@@ -400,12 +400,14 @@ def task_name_from_path(path: str, tasks_root: str) -> str:
     file name instead would miss a task in a folder - or, worse, match a
     DIFFERENT task with the same leaf name at the root and delete that one.
     """
+    # ntpath, not os.path: these are Windows paths, and on Linux os.path sees
+    # the whole thing as one file name and hands the entire path back.
     try:
-        relative = os.path.relpath(path, tasks_root)
+        relative = ntpath.relpath(path, tasks_root)
     except ValueError:
-        return "\\" + os.path.basename(path)
+        return "\\" + ntpath.basename(path)
     if relative.startswith(".."):
-        return "\\" + os.path.basename(path)
+        return "\\" + ntpath.basename(path)
     return "\\" + relative.replace("/", "\\")
 
 
