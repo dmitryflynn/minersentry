@@ -44,7 +44,7 @@ W_HIDDEN_LAUNCHER = 20
 # because the usual autostart lists do not show them.
 W_RARE_LOCATION = 35
 RARE_KINDS = {"ifeo-debugger", "appinit-dll", "winlogon", "wmi-consumer",
-              "hidden-task", "com-hijack"}
+              "hidden-task", "com-hijack", "ld-preload", "ssh-forced-command"}
 
 
 @dataclass
@@ -154,6 +154,8 @@ def score_entry(entry: PersistEntry, cfg: Config,
             "wmi-consumer": "WMI event subscription (fileless persistence)",
             "hidden-task": "scheduled task hidden from the task list",
             "com-hijack": "COM server hijack under HKCU",
+            "ld-preload": "loaded into every process that starts (ld.so.preload)",
+            "ssh-forced-command": "runs on every login with that SSH key",
         }.get(entry.kind, entry.kind))
 
     low = (entry.command or "").lower()
@@ -333,7 +335,7 @@ def _collect_windows(cfg: Config) -> list[PersistEntry]:
     visible = {os.path.basename(t.location).lower() for t in tasks}
     visible |= {t.name.lower() for t in tasks}
     for extra in (lambda: _collect_task_files(visible), _collect_service_dlls,
-                  _collect_hijacks, _collect_wmi):
+                  _collect_hijacks, _collect_wmi, _collect_bits):
         try:
             out += extra()
         except Exception:  # noqa: BLE001 - one unreadable area must not stop the scan
@@ -544,6 +546,39 @@ def parse_wmi_consumers(text: str) -> list[PersistEntry]:
     return out
 
 
+def parse_bits_jobs(text: str) -> list[PersistEntry]:
+    """Parse `name<TAB>command` lines from the BITS job query. Pure.
+
+    A BITS job survives reboots and runs under the service, which is why it is
+    used both to fetch the payload and to re-run it.
+    """
+    out: list[PersistEntry] = []
+    for line in text.splitlines():
+        parts = line.rstrip("\r").split("\t")
+        if len(parts) < 2 or not parts[1].strip():
+            continue
+        out.append(PersistEntry(kind="bits-job", location="BITS",
+                                name=parts[0].strip() or "(unnamed)",
+                                command=parts[1].strip(),
+                                exe=command_exe(parts[1].strip())))
+    return out
+
+
+def _collect_bits() -> list[PersistEntry]:
+    script = ("Get-BitsTransfer -AllUsers -ErrorAction SilentlyContinue | "
+              "ForEach-Object { \"$($_.DisplayName)`t$($_.NotifyCmdLine)\" }")
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                            "-Command", script], capture_output=True, text=True,
+                           timeout=60,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:  # noqa: BLE001
+        return []
+    if r.returncode != 0:
+        return []
+    return parse_bits_jobs(r.stdout or "")
+
+
 def _collect_wmi() -> list[PersistEntry]:
     """WMI event-subscription persistence: no file on disk, survives reboots."""
     script = (
@@ -608,10 +643,33 @@ def _collect_posix(cfg: Config) -> list[PersistEntry]:
                  "/lib/systemd/system",
                  os.path.expanduser("~/.config/systemd/user")]
     for d in unit_dirs:
-        for path in sorted(glob.glob(os.path.join(d, "*.service"))):
+        # .timer units start a service on a schedule, which is cron by another
+        # name and was not being read at all.
+        for pattern in ("*.service", "*.timer"):
+            for path in sorted(glob.glob(os.path.join(d, pattern))):
+                text = _read(path)
+                if text:
+                    out += parse_systemd_unit(text, path)
+    for d in (os.path.expanduser("~/.config/autostart"), "/etc/xdg/autostart"):
+        for path in sorted(glob.glob(os.path.join(d, "*.desktop"))):
             text = _read(path)
             if text:
-                out += parse_systemd_unit(text, path)
+                out += parse_desktop_entry(text, path)
+    for path in ("/etc/ld.so.preload",):
+        # a library listed here is loaded into EVERY process that starts
+        text = _read(path)
+        for line in text.splitlines():
+            lib = line.strip()
+            if lib and not lib.startswith("#"):
+                out.append(PersistEntry(kind="ld-preload", location=path,
+                                        name=os.path.basename(lib),
+                                        command=lib, exe=lib))
+    for pattern in (os.path.expanduser("~/.ssh/authorized_keys"),
+                    "/root/.ssh/authorized_keys", "/home/*/.ssh/authorized_keys"):
+        for path in sorted(glob.glob(pattern)):
+            text = _read(path)
+            if text:
+                out += parse_authorized_keys(text, path)
     for rc in ("~/.bashrc", "~/.bash_profile", "~/.profile", "~/.zshrc",
                "/etc/rc.local", "/etc/profile"):
         path = os.path.expanduser(rc)
@@ -629,6 +687,51 @@ def _collect_posix(cfg: Config) -> list[PersistEntry]:
                 out.append(PersistEntry(kind="shell-profile", location=path,
                                         name=os.path.basename(path), command=s,
                                         exe=command_exe(s)))
+    return out
+
+
+def parse_desktop_entry(text: str, path: str) -> list[PersistEntry]:
+    """Parse an XDG autostart .desktop file into an entry. Pure.
+
+    ~/.config/autostart runs at login on every desktop Linux, needs no
+    privileges to write, and is not covered by cron or systemd.
+    """
+    exec_line = ""
+    hidden = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.lower().startswith("exec="):
+            exec_line = line.split("=", 1)[1].strip()
+        elif line.lower().replace(" ", "") in ("hidden=true", "x-gnome-autostart-enabled=false"):
+            hidden = True
+    if not exec_line or hidden:
+        return []
+    return [PersistEntry(kind="xdg-autostart", location=path,
+                         name=os.path.basename(path), command=exec_line,
+                         exe=command_exe(exec_line))]
+
+
+def parse_authorized_keys(text: str, path: str) -> list[PersistEntry]:
+    """SSH keys that force a command when used. Pure.
+
+    `command="..."` in authorized_keys runs on every login with that key, which
+    is persistence that survives a package reinstall and looks like nothing.
+    """
+    out: list[PersistEntry] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "command=" not in line:
+            continue
+        start = line.index("command=") + len("command=")
+        if start < len(line) and line[start] == '"':
+            end = line.find('"', start + 1)
+            command = line[start + 1:end] if end > start else ""
+        else:
+            command = line[start:].split()[0]
+        if command:
+            out.append(PersistEntry(kind="ssh-forced-command", location=path,
+                                    name=os.path.basename(path), command=command,
+                                    exe=command_exe(command)))
     return out
 
 

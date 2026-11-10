@@ -21,6 +21,7 @@ from .config import Config
 from .engine import Engine, ProcInfo
 from . import gpu as gpu_mod
 from . import persistence as persist_mod
+from . import tamper as tamper_mod
 
 
 def run_session(duration: float, cfg: Config | None = None,
@@ -161,13 +162,32 @@ def _print_autostart(found: list[dict]) -> None:
         print(f"       in {f['location']}")
 
 
+def _print_tamper(found: list[dict]) -> None:
+    """Weakened defences: exclusions, disabled protection, hosts redirects."""
+    real = [f for f in found if f["score"] > 0]
+    if not real:
+        notes = [f for f in found if f["score"] == 0]
+        print("\nDefences: nothing tampered with." if not notes
+              else "\nDefences: " + notes[0]["detail"])
+        return
+    print(f"\nDefences: {len(real)} finding(s)")
+    for f in real:
+        print(f"  {f['score']:>3}  {f['kind']:<20} {f['detail'][:60]}")
+        for label in f["labels"][:2]:
+            print(f"       - {label}")
+
+
 def _report_autostart(cfg: Config, as_json: bool) -> int:
-    found = persist_mod.summarize(persist_mod.scan(cfg))
+    entries = persist_mod.scan(cfg)
+    flagged = tuple(e.exe for e in entries if e.exe)
+    tampering = tamper_mod.summarize(tamper_mod.scan(cfg, flagged_paths=flagged))
+    found = persist_mod.summarize(entries)
     if as_json:
-        print(json.dumps({"autostart": found,
+        print(json.dumps({"autostart": found, "defences": tampering,
                           "config_warnings": list(cfg.load_warnings)}, indent=2))
     else:
         _print_autostart(found)
+        _print_tamper(tampering)
     return 0
 
 
@@ -264,7 +284,10 @@ def main(argv: list[str] | None = None) -> int:
         report_pids = e.gpu_scope if pid_set is None else pid_set & e.gpu_scope
     summary = summarize(e, results, first_hit, watch=args.watch, pids=report_pids)
     if args.autostart:
-        summary["autostart"] = persist_mod.summarize(persist_mod.scan(cfg))
+        entries = persist_mod.scan(cfg)
+        summary["autostart"] = persist_mod.summarize(entries)
+        summary["defences"] = tamper_mod.summarize(tamper_mod.scan(
+            cfg, flagged_paths=tuple(e.exe for e in entries if e.exe)))
 
     if args.json:
         print(json.dumps(summary, indent=2))
@@ -281,6 +304,7 @@ def main(argv: list[str] | None = None) -> int:
               f"{summary['suspicious']} suspicious{gpu_note}")
         if args.autostart:
             _print_autostart(summary["autostart"])
+            _print_tamper(summary["defences"])
     return 0
 
 

@@ -168,6 +168,28 @@ class Config:
     notify_command: str = ""
     notify_min_verdict: str = "Likely Miner"   # or "Suspicious"
 
+    # -- concealment ("stealth") signal --------------------------------------
+    # Signs that a process is hiding what it is. Each reason is weighted and
+    # summed. The weights come from a survey of this machine: 72 of 166
+    # processes have private executable memory (every JIT does), so that alone
+    # means nothing — miner STRINGS inside it do. Only two processes ran from a
+    # missing image, and both were kernel pseudo-processes with no real path.
+    stealth_enabled: bool = True
+    stealth_injected_strings: int = 55   # miner markers in unbacked executable memory
+    stealth_deleted_image: int = 35      # the binary is gone from disk
+    stealth_memfd_image: int = 35        # Linux: never on disk at all
+    stealth_kernel_masquerade: int = 30  # Linux: pretending to be a kernel thread
+    stealth_parent_anomaly: int = 25     # e.g. svchost.exe not started by services.exe
+    hard_stealth: int = 50               # at/above this it counts as a miner artifact
+    # Processes with exactly one legitimate parent, as "child:parent". Measured:
+    # all 87 svchost instances here came from services.exe, while conhost, cmd
+    # and runtimebroker have many honest parents and so are deliberately absent.
+    expected_parents: tuple[str, ...] = (
+        "svchost.exe:services.exe", "services.exe:wininit.exe",
+        "lsass.exe:wininit.exe", "spoolsv.exe:services.exe",
+        "smss.exe:system", "csrss.exe:smss.exe", "wininit.exe:smss.exe",
+    )
+
     # -- autostart (persistence) scanning -----------------------------------
     # Every other signal judges a RUNNING process; a miner that is merely
     # installed in a Run key / task / service / cron line is invisible until it
@@ -251,6 +273,13 @@ class Config:
         ("cmdline", 40, "dataset", 60, 88),
         ("cmdline", 40, "perf", 40, 88),
         ("cmdline", 40, "probe", 60, 90),
+        # Concealment + the actual work, or + something miner-specific.
+        ("stealth", 50, "cpu", 35, 85),
+        ("stealth", 50, "gpu", 40, 85),
+        ("stealth", 50, "memory", 60, 88),
+        ("stealth", 50, "cmdline", 40, 88),
+        ("stealth", 50, "network", 50, 85),
+        ("stealth", 50, "dataset", 60, 85),
         # A swarm of one binary + anything miner-specific about it.
         ("swarm", 40, "memory", 60, 85),
         ("swarm", 40, "cmdline", 40, 85),

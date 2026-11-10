@@ -60,7 +60,9 @@ BINARY_MARKERS = {
 PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_VM_READ = 0x0010
 MEM_COMMIT = 0x1000
+MEM_PRIVATE = 0x20000                      # not backed by a mapped file
 PAGE_READABLE = 0x02 | 0x04 | 0x20 | 0x40  # RO, RW, EXEC_READ, EXEC_RW
+PAGE_EXECUTABLE = 0x10 | 0x20 | 0x40 | 0x80  # EXECUTE, _READ, _READWRITE, _WRITECOPY
 PAGE_GUARD = 0x100
 PAGE_NOACCESS = 0x01
 
@@ -80,6 +82,11 @@ class MemHit:
     weight: int
     where: str  # "string" or "binary"
     generic: bool = False  # weak cue (algorithm name / crypto constant)
+    # Found inside private, executable memory: code that is not backed by any
+    # file on disk. Ordinary software fills that description constantly (every
+    # JIT does), so it means nothing on its own — but MINER STRINGS sitting in
+    # it do, because a JIT's pages do not contain stratum protocol text.
+    injected: bool = False
 
 
 @dataclass
@@ -91,6 +98,7 @@ class MemScanResult:
     regions_scanned: int = 0
     hits: list[MemHit] = field(default_factory=list)
     large_page_dataset: bool = False  # a committed region >= ~2 GiB (RandomX)
+    injected_hits: int = 0            # markers found in private executable memory
     regions_failed: int = 0
     coverage_status: str = "not_scanned"
 
@@ -147,7 +155,8 @@ def _wide(marker: bytes) -> bytes:
 
 _WIDE_MARKERS = {m: _wide(m) for m in STRING_MARKERS}
 
-def _search_chunk(chunk: bytes, result: MemScanResult, seen: set[str]) -> None:
+def _search_chunk(chunk: bytes, result: MemScanResult, seen: set[str],
+                  injected: bool = False) -> None:
     """Look for every marker in one chunk.
 
     Deliberately plain `in` tests: each is C-level two-way search, and a single
@@ -163,11 +172,15 @@ def _search_chunk(chunk: bytes, result: MemScanResult, seen: set[str]) -> None:
         if marker in lowered or (_WIDE_MARKERS.get(marker) or _wide(marker)) in lowered:
             seen.add(label)
             result.hits.append(MemHit(label, weight, "string",
-                                      generic=marker in GENERIC_STRING_MARKERS))
+                                      generic=marker in GENERIC_STRING_MARKERS,
+                                      injected=injected))
+            if injected and marker not in GENERIC_STRING_MARKERS:
+                result.injected_hits += 1
     for marker, (label, weight) in BINARY_MARKERS.items():
         if marker in chunk and label not in seen:
             seen.add(label)
-            result.hits.append(MemHit(label, weight, "binary", generic=True))
+            result.hits.append(MemHit(label, weight, "binary", generic=True,
+                                      injected=injected))
 
 
 def budget_for(private_bytes: int, cfg_budget: int, cfg_region: int,
@@ -278,6 +291,8 @@ def _scan_windows(pid: int, budget_bytes: int, max_region_read: int,
             base = mbi.BaseAddress or 0
             committed = mbi.State == MEM_COMMIT
             readable = bool(mbi.Protect & PAGE_READABLE)
+            unbacked_code = (mbi.Type == MEM_PRIVATE
+                             and bool(mbi.Protect & PAGE_EXECUTABLE))
             guarded = bool(mbi.Protect & PAGE_GUARD) or mbi.Protect == PAGE_NOACCESS
 
             if committed and region_size >= large_dataset_bytes:
@@ -296,7 +311,7 @@ def _scan_windows(pid: int, budget_bytes: int, max_region_read: int,
                     if not ok or n < to_read:
                         result.regions_failed += 1
                     if n:
-                        _search_chunk(buf.raw[:n], result, seen)
+                        _search_chunk(buf.raw[:n], result, seen, unbacked_code)
                         result.bytes_scanned += n
                         result.regions_scanned += 1
 
@@ -374,11 +389,13 @@ def _scan_linux(pid: int, budget_bytes: int, max_region_read: int,
         result.error = f"mem read unavailable: {e}"
         return result
     try:
-        for start, end, perms, _path in regions:
+        for start, end, perms, _path in regions:  # noqa: B007 - path used below
             if result.bytes_scanned >= budget_bytes:
                 break  # budget spent; large_dataset flag already set from maps
             if "r" not in perms:
                 continue
+            # anonymous (no pathname) and executable: code with no file behind it
+            unbacked_code = "x" in perms and not _path
             for off, want in sample_offsets(end - start, max_region_read, region_samples):
                 left = budget_bytes - result.bytes_scanned
                 if left <= 0:
@@ -393,7 +410,7 @@ def _scan_linux(pid: int, budget_bytes: int, max_region_read: int,
                 if len(data) < to_read:
                     result.regions_failed += 1
                 if data:
-                    _search_chunk(data, result, seen)
+                    _search_chunk(data, result, seen, unbacked_code)
                     result.bytes_scanned += len(data)
                     result.regions_scanned += 1
         result.scanned = True

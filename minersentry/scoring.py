@@ -224,6 +224,23 @@ def score_swarm(nprocs: int, cores: float, cfg: Config) -> Signal:
                   f"{nprocs} processes of this binary using {cores:.1f} cores together")
 
 
+def score_stealth(reasons: list[tuple[str, int]], cfg: Config) -> Signal:
+    """Score the signs that a process is hiding what it is.
+
+    Concealment is not mining, so this stays out of the weighted blend and
+    convicts only beside the work or a miner-specific artifact. The weights are
+    deliberately uneven: miner strings sitting in unbacked executable memory
+    are close to conclusive (a JIT's pages do not contain stratum protocol
+    text), while a missing binary or an odd parent is corroboration.
+    """
+    if not cfg.stealth_enabled or not reasons:
+        return Signal("stealth", 0, "nothing concealed")
+    total = min(100, sum(weight for _label, weight in reasons))
+    detail = "; ".join(label for label, _weight in
+                       sorted(reasons, key=lambda r: -r[1])[:3])
+    return Signal("stealth", total, detail)
+
+
 def score_cmdline(score: int, labels: list[str], cfg: Config) -> Signal:
     """Score mining indicators found in a process's arguments.
 
@@ -264,7 +281,8 @@ def combine(signals: list[Signal], cfg: Config) -> tuple[int, str]:
     # (load, port numbers, big mappings) has to go through a conviction pair.
     miner_artifact = (hard_evidence
                       or by.get("network", 0) >= cfg.net_score_known_pool
-                      or by.get("cmdline", 0) >= cfg.hard_cmdline)
+                      or by.get("cmdline", 0) >= cfg.hard_cmdline
+                      or by.get("stealth", 0) >= cfg.hard_stealth)
     if (not corroborated and not hard_evidence) or not miner_artifact:
         score = min(score, cfg.suspicious_cap)
 
