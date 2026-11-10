@@ -64,6 +64,8 @@ def test_ordinary_autostart_entries_are_not_reported(command):
 def test_a_signed_binary_is_not_charged_for_its_directory():
     """Defender runs signed from ProgramData; charging it for that put its own
     scheduled tasks one point under the reporting threshold."""
+    if sys.platform != "win32":
+        pytest.skip("the drop-location hints are per platform")
     cmd = r'"C:\ProgramData\Microsoft\Windows Defender\Platform\MpCmdRun.exe" -t 4'
     exists = lambda p: p.endswith("MpCmdRun.exe")   # noqa: E731 - test stub
     signed = persistence.score_entry(entry(command=cmd), CFG,
