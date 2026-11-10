@@ -21,7 +21,15 @@ from __future__ import annotations
 import ctypes
 import sys
 import threading
-from ctypes import wintypes
+
+# ctypes.wintypes cannot even be imported on Linux, and ctypes.WINFUNCTYPE does
+# not exist there, so every Windows-only construct is built lazily. service.py
+# imports this module unconditionally; a module-level WINFUNCTYPE took the
+# whole service down on Linux.
+if sys.platform == "win32":
+    from ctypes import wintypes
+else:                                       # pragma: no cover - import guard
+    wintypes = None
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -197,10 +205,14 @@ def _safely(fn) -> None:
         pass
 
 
-_WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_longlong, wintypes.HWND, wintypes.UINT,
-                              wintypes.WPARAM, wintypes.LPARAM)
 _KEEP: list = []          # window procs must outlive the window
 _LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+
+
+def _wndproc_type():
+    """The WNDPROC signature, built on demand (Windows only)."""
+    return ctypes.WINFUNCTYPE(_LRESULT, wintypes.HWND, wintypes.UINT,
+                              wintypes.WPARAM, wintypes.LPARAM)
 
 
 def _configure(user32) -> None:
@@ -226,7 +238,7 @@ def _configure(user32) -> None:
 def _message_window(user32, handler) -> int:
     """A hidden window to receive tray messages."""
     class WNDCLASS(ctypes.Structure):
-        _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", _WNDPROC),
+        _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", _wndproc_type()),
                     ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
                     ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
                     ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
@@ -252,7 +264,7 @@ def _message_window(user32, handler) -> int:
         ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
 
-    wndproc = _WNDPROC(proc)
+    wndproc = _wndproc_type()(proc)
     cls = WNDCLASS()
     cls.lpfnWndProc = wndproc
     cls.lpszClassName = f"MinerSentryTray{id(wndproc)}"

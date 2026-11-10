@@ -85,7 +85,10 @@ def decoy_processes(procs: list[subprocess.Popen], tmpdir: str | None
                 seen.add(d.pid)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
-    if tmpdir:
+    # Only fall back to the folder walk when no handle answered. Doing it
+    # unconditionally meant every caller - including a 50 ms wait loop - paid
+    # for a full process enumeration with an exe lookup per process.
+    if tmpdir and not out:
         for p in _decoys_under(tmpdir):
             if p.pid not in seen:
                 out.append(p)
