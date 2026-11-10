@@ -35,10 +35,20 @@ _CREATE_NO_WINDOW = 0x08000000
 
 
 # -- pure parsers -----------------------------------------------------------
-def parse_gpu_engine_counters(csv_text: str) -> dict[int, float]:
+def parse_gpu_engine_counters(csv_text: str,
+                              engine_types: tuple[str, ...] = ("Compute",)
+                              ) -> dict[int, float]:
     """Parse `typeperf "\\GPU Engine(*)\\Utilization Percentage"` PDH-CSV output
-    into {pid: summed compute-engine utilization %}. Non-Compute engines
-    (3D/VideoDecode/Copy/…) are ignored."""
+    into {pid: summed utilization %} for the named engine types.
+
+    `engine_types` is not fixed to Compute because on this hardware there IS no
+    Compute instance: an NVIDIA WDDM driver reports OpenCL/CUDA work under the
+    **3D** engine, so filtering on Compute alone meant the GPU signal could
+    never read anything (confirmed with real OpenCL load: 567 instances, engine
+    types 3D / Copy / VideoDecode / …, not one Compute). The caller decides
+    which types to trust and pairs the 3D fallback with compute-context
+    membership, so a game is not mistaken for a miner.
+    """
     rows = list(csv.reader(io.StringIO(csv_text)))
     header = data = None
     for r in rows:
@@ -51,8 +61,9 @@ def parse_gpu_engine_counters(csv_text: str) -> dict[int, float]:
     if not header or not data:
         return {}
     out: dict[int, float] = {}
+    wanted = tuple(f"engtype_{t}" for t in engine_types)
     for name, val in zip(header[1:], data[1:]):
-        if "engtype_Compute" not in name:
+        if not any(w in name for w in wanted):
             continue
         m = _PID_RE.search(name)
         if not m:
@@ -119,10 +130,27 @@ def _run(args: list[str], timeout: float) -> str:
         return ""
 
 
-def _sample_pdh_compute() -> dict[int, float]:
-    out = _run(["typeperf", r"\GPU Engine(*)\Utilization Percentage", "-sc", "1"],
-               timeout=8.0)
-    return parse_gpu_engine_counters(out)
+def _sample_pdh(compute_ctx: set[int]) -> dict[int, float]:
+    """Per-process GPU utilization from the PDH GPU Engine counters.
+
+    Two samples, not one: a utilization counter is a RATE, and PDH's first
+    sample is always 0.000000 — with `-sc 1` every value read zero, which on
+    its own was enough to keep the GPU signal silent everywhere.
+
+    Compute-engine instances are authoritative. Where the driver publishes none
+    (NVIDIA under WDDM), 3D-engine load is used instead, but only for processes
+    that hold a GPU compute context — a game drives the same engine and must
+    not be scored as compute.
+    """
+    out = _run(["typeperf", r"\GPU Engine(*)\Utilization Percentage", "-sc", "2"],
+               timeout=20.0)
+    util = parse_gpu_engine_counters(out, ("Compute",))
+    if compute_ctx:
+        graphics = parse_gpu_engine_counters(out, ("3D",))
+        for pid in compute_ctx:
+            if pid not in util and graphics.get(pid):
+                util[pid] = graphics[pid]
+    return util
 
 
 def _sample_nvidia_ctx() -> set[int]:
@@ -130,6 +158,22 @@ def _sample_nvidia_ctx() -> set[int]:
                 "--format=csv,noheader"], timeout=6.0)
     return parse_nvidia_compute_apps(out)
 
+
+
+def pmon_is_usable(text: str) -> bool:
+    """True if `nvidia-smi pmon` actually ran and produced its table.
+
+    An idle GPU gives a valid header and no compute rows, which is an ANSWER
+    ("nothing is computing"), not a failure. Treating it as a failure sent
+    every sample on to `typeperf`, costing seconds for a counter set that
+    reports nothing for NVIDIA anyway.
+    """
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            fields = line.split()
+            if all(key in fields for key in ("gpu", "pid", "type", "sm")):
+                return True
+    return False
 
 
 def parse_nvidia_pmon(text: str) -> dict[int, float]:
@@ -189,6 +233,28 @@ def _sample_linux_nvidia() -> tuple[dict[int, float], set[int], set[int]]:
     return util, set(), _sample_nvidia_ctx()
 
 
+def _sample_windows(compute_ctx: set[int]) -> dict[int, float]:
+    """Per-process GPU utilization on Windows.
+
+    `nvidia-smi pmon` first, PDH second. That is the reverse of what this file
+    used to say, and the reason is measurement: with a real OpenCL job holding
+    the GPU at 99% (nvidia-smi agreeing), the PDH GPU Engine counters reported
+    one non-zero instance on the whole machine — System/Copy at 0.01% — while
+    pmon reported the job at `sm 98%`. PDH stays as the vendor-neutral fallback
+    for Intel and AMD, where nvidia-smi does not exist.
+    """
+    util: dict[int, float] = {}
+    text = _run(["nvidia-smi", "pmon", "-s", "u", "-c", "1"], timeout=20.0)
+    if pmon_is_usable(text):
+        # pmon answered, so skip PDH entirely: `typeperf -sc 2` costs a couple
+        # of seconds every sample and reports nothing useful for NVIDIA. An
+        # empty map here means "nothing is computing", which is an answer.
+        return parse_nvidia_pmon(text)
+    for pid, value in _sample_pdh(compute_ctx).items():
+        util.setdefault(pid, value)
+    return util
+
+
 def window_owner_pids() -> set[int]:
     """PIDs owning at least one visible top-level window (miners are headless)."""
     if not IS_WINDOWS:
@@ -223,4 +289,5 @@ def sample() -> tuple[dict[int, float], set[int], set[int]]:
         return _sample_linux_nvidia()
     if not IS_WINDOWS:
         return {}, set(), set()
-    return _sample_pdh_compute(), window_owner_pids(), _sample_nvidia_ctx()
+    ctx = _sample_nvidia_ctx()
+    return _sample_windows(ctx), window_owner_pids(), ctx

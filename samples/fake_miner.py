@@ -162,6 +162,24 @@ def _memory_hard(evade: bool, cap: float, dataset: bytearray):
             time.sleep(busy * (1.0 - cap) / cap)
 
 
+def _gpu_load():
+    """Keep the GPU's compute engine busy, in this same process.
+
+    In-process (not a child) on purpose: the engine then sees ONE process with
+    GPU load, CPU load and resident miner strings, which is what a GPU miner
+    looks like. Benign — it hashes nothing and sends nothing anywhere.
+    """
+    try:
+        import gpu_load
+    except ImportError as e:
+        print(f"[fake_miner] --gpu unavailable: {e}", flush=True)
+        return
+    try:
+        gpu_load.run(seconds=24 * 3600)
+    except Exception as e:  # noqa: BLE001
+        print(f"[fake_miner] --gpu could not drive the GPU: {e}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Benign MinerSentry test target (NOT a miner).")
     ap.add_argument("--evade", action="store_true",
@@ -175,6 +193,10 @@ def main():
     ap.add_argument("--dataset", type=int, default=0, metavar="MB",
                     help="allocate an MB RAM dataset and do memory-hard hashing over it "
                          "(use ~2048 to exercise the RandomX ~2 GiB dataset signal)")
+    ap.add_argument("--gpu", action="store_true",
+                    help="also drive REAL GPU compute (OpenCL via the graphics "
+                         "driver; computes nothing of value and mines nothing) so "
+                         "the gpu signal can be exercised")
     ap.add_argument("--unsigned", action="store_true",
                     help="run under a signature-stripped interpreter copy so the target "
                          "is UNTRUSTED like a real miner (else signed python is dampened)")
@@ -201,6 +223,8 @@ def main():
         threading.Thread(target=_evasion_watch, daemon=True).start()
     if args.net:
         threading.Thread(target=_net_pool_sim, args=(args.net_port,), daemon=True).start()
+    if args.gpu:
+        threading.Thread(target=_gpu_load, daemon=True).start()
 
     for _ in range(max(1, args.threads)):
         if dataset is not None:

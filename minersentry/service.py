@@ -27,6 +27,8 @@ import subprocess
 import sys
 import time
 
+from . import persistence as persist_mod
+from . import tray as tray_mod
 from .audit import AuditLog
 from .config import Config
 from .engine import Engine
@@ -121,7 +123,7 @@ def should_alert(verdict: str, min_verdict: str) -> bool:
 
 
 def run(cfg: Config | None = None, once: bool = False,
-        alert: bool = True, audit: AuditLog | None = None) -> int:
+        alert: bool = True, audit: AuditLog | None = None, icon=None) -> int:
     """Monitor until stopped. Returns the number of alerts raised."""
     cfg = cfg or Config.load()
     log = audit or AuditLog()
@@ -134,9 +136,13 @@ def run(cfg: Config | None = None, once: bool = False,
         log.event("not elevated: memory and arguments of other users' processes "
                   "are unreadable, so those are judged on behaviour alone")
     alerted: dict[int, str] = {}
+    seen_autostart: set[str] = set()
     alerts = 0
     next_deep = 0.0
     next_gpu = 0.0
+    next_persist = 0.0
+    next_tamper = 0.0            # check on the first pass: no blind window
+    installed_at_start = status().startswith("installed")
     while True:
         now = time.time()
         if cfg.gpu_enabled and now >= next_gpu:
@@ -146,6 +152,40 @@ def run(cfg: Config | None = None, once: bool = False,
             except Exception as e:  # noqa: BLE001
                 log.event(f"gpu sampler: {type(e).__name__}: {e}")
             next_gpu = now + max(2.0, cfg.gpu_sample_interval)
+        if cfg.persistence_enabled and cfg.persistence_interval > 0 and now >= next_persist:
+            next_persist = now + cfg.persistence_interval
+            try:
+                current = set()
+                for e in persist_mod.scan(cfg):
+                    key = f"{e.kind}:{e.location}:{e.name}"
+                    current.add(key)
+                    if key in seen_autostart:
+                        continue
+                    seen_autostart.add(key)
+                    alerts += 1
+                    log.record_detection(pid=0, name=e.name, exe=e.exe, score=e.score,
+                                         verdict="Autostart", signals=[
+                                             (e.kind, e.score, "; ".join(e.labels[:3]))])
+                    if alert:
+                        notify("MinerSentry: miner-like autostart entry",
+                               f"{e.summary} (score {e.score}/100)", cfg)
+                # Forget entries that are gone, so one that is RE-CREATED
+                # alerts again. A miner that rewrites its Run key after you
+                # delete it is exactly what a watcher should keep saying.
+                seen_autostart &= current
+            except Exception as e:  # noqa: BLE001
+                log.event(f"autostart scan: {type(e).__name__}: {e}")
+        # Tamper check: if our own autostart entry disappears while we are
+        # running, something removed it. Say so instead of dying quietly.
+        if installed_at_start and cfg.tamper_check_interval > 0 and now >= next_tamper:
+            next_tamper = now + cfg.tamper_check_interval
+            if not status().startswith("installed"):
+                installed_at_start = False
+                log.event("tamper: MinerSentry's autostart entry was removed while running")
+                if alert:
+                    notify("MinerSentry: autostart entry removed",
+                           "Something deleted the scheduled task / unit that starts "
+                           "MinerSentry at boot. Reinstall with --install.", cfg)
         deep = cfg.deep_auto_interval > 0 and now >= next_deep
         if deep:
             next_deep = now + cfg.deep_auto_interval
@@ -162,9 +202,10 @@ def run(cfg: Config | None = None, once: bool = False,
             alerted[r.pid] = r.verdict
             alerts += 1
             if alert:
-                notify(f"MinerSentry: {r.verdict}",
-                       f"{r.name} (pid {r.pid}) scored {r.score}/100 — {r.signal_summary}",
-                       cfg)
+                title = f"MinerSentry: {r.verdict}"
+                body = f"{r.name} (pid {r.pid}) scored {r.score}/100 — {r.signal_summary}"
+                if not (icon and icon.notify(title, body)):
+                    notify(title, body, cfg)
         live = {r.pid for r in results}
         for pid in [p for p in alerted if p not in live]:
             alerted.pop(pid, None)
@@ -283,6 +324,7 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--uninstall", action="store_true", help="remove it (needs admin)")
     g.add_argument("--status", action="store_true", help="is it installed?")
     ap.add_argument("--no-alerts", action="store_true", help="log detections only")
+    ap.add_argument("--no-tray", action="store_true", help="run without a tray icon")
     ap.add_argument("--config", default=None, help="load tuning from this file")
     args = ap.parse_args(argv)
 
@@ -303,11 +345,44 @@ def main(argv: list[str] | None = None) -> int:
         print(f"config: {w}", file=sys.stderr)
     print(f"MinerSentry watching (elevated={is_elevated()}); "
           f"detections go to {AuditLog().path}", file=sys.stderr)
+    icon = None
+    if not args.no_tray:
+        icon = _tray(cfg)
     try:
-        run(cfg=cfg, alert=not args.no_alerts)
+        run(cfg=cfg, alert=not args.no_alerts, icon=icon)
     except KeyboardInterrupt:
         return 0
+    finally:
+        if icon:
+            icon.stop()
     return 0
+
+
+def _tray(cfg: Config):
+    """A tray icon with the few things worth doing from there."""
+    stop = []
+
+    def open_log():
+        path = AuditLog().path
+        if sys.platform == "win32" and os.path.exists(path):
+            os.startfile(path)  # noqa: S606 - the user asked to see their own log
+
+    def scan_autostart():
+        found = persist_mod.scan(cfg)
+        notify("MinerSentry: autostart scan",
+               f"{len(found)} miner-like entr{'y' if len(found) == 1 else 'ies'} found"
+               if found else "No miner-like autostart entries.", cfg)
+
+    icon = tray_mod.TrayIcon(tooltip="MinerSentry — watching", items=[
+        tray_mod.MenuItem("Open detection log", open_log),
+        tray_mod.MenuItem("Scan autostart now", scan_autostart),
+        tray_mod.MenuItem("", None),
+        tray_mod.MenuItem("Stop watching", lambda: stop.append(True) or os._exit(0)),
+    ])
+    if not icon.start():
+        print(f"note: no tray icon ({icon.error})", file=sys.stderr)
+        return None
+    return icon
 
 
 if __name__ == "__main__":
