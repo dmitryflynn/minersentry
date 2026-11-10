@@ -35,25 +35,30 @@ from .scoring import (
 def _parent_name_map(procs, wanted: dict) -> dict[int, str]:
     """{pid: parent process name} for the processes that have a parent rule.
 
-    Only those few are looked up, so this costs a handful of calls per pass
-    rather than one per process.
+    `Process.parent()` is used rather than looking up `ppid()` ourselves,
+    because it checks that the parent started BEFORE the child and returns
+    None when the recorded parent PID has since been recycled. Doing the
+    lookup by hand reported whatever process later took that number: on a CI
+    runner that turned csrss.exe — whose parent smss.exe exits after boot —
+    into a parent anomaly. A parent that cannot be identified is unknown, not
+    wrong, so it is left out entirely.
+
+    Only the few processes with a rule are looked up, so this costs a handful
+    of calls per pass rather than one per process.
     """
-    names = {p.pid: (p.info.get("name") or "").lower() for p, _raw in procs}
     out: dict[int, str] = {}
     for p, _raw in procs:
         if (p.info.get("name") or "").lower() not in wanted:
             continue
         try:
-            ppid = p.ppid()
-        except Exception:  # noqa: BLE001
-            continue
-        parent = names.get(ppid)
-        if parent is None:
-            try:
-                parent = psutil.Process(ppid).name().lower()
-            except Exception:  # noqa: BLE001
+            parent = p.parent()
+            if parent is None:
                 continue
-        out[p.pid] = parent
+            name = parent.name()
+        except Exception:  # noqa: BLE001 - an exited parent is not evidence
+            continue
+        if name:
+            out[p.pid] = name.lower()
     return out
 
 

@@ -123,6 +123,36 @@ def test_parent_anomaly_only_for_processes_with_one_right_parent():
     assert e._parent_anomaly(other) == ""
 
 
+def test_a_recycled_parent_pid_is_not_an_anomaly(monkeypatch):
+    """csrss.exe's parent smss.exe exits after boot. Looking the parent PID up
+    by hand returned whatever process later took that number, which made
+    csrss.exe a parent anomaly on a CI runner. psutil's parent() checks that
+    the parent started first and answers None when the PID was recycled."""
+    from minersentry import engine as engine_module
+    from types import SimpleNamespace
+
+    class Recycled:
+        pid = 900
+
+        def parent(self):      # what psutil does when the ppid was reused
+            return None
+
+        @property
+        def info(self):
+            return {"name": "csrss.exe"}
+
+    got = engine_module._parent_name_map([(Recycled(), 0.0)],
+                                         {"csrss.exe": "smss.exe"})
+    assert got == {}           # unknown, so no anomaly is reported
+
+    class Honest(Recycled):
+        def parent(self):
+            return SimpleNamespace(name=lambda: "SMSS.EXE")
+
+    assert engine_module._parent_name_map([(Honest(), 0.0)],
+                                          {"csrss.exe": "smss.exe"}) == {900: "smss.exe"}
+
+
 def test_an_exited_parent_is_unknown_not_wrong():
     e = _engine()
     e._parent_names = {}
