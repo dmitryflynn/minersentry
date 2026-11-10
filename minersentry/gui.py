@@ -21,7 +21,9 @@ from . import __app_name__, __version__
 from .audit import AuditLog
 from .engine import Engine, ProcInfo
 from . import gpu as gpu_mod
+from . import persistence as persist_mod
 from . import probe as probe_mod
+from . import quarantine as quarantine_mod
 
 
 def _is_elevated() -> bool:
@@ -156,8 +158,14 @@ class MinerSentryApp:
         self.btn_monitor.pack(side="left")
         self._btn(bar, "🔬  Deep scan (memory)", self.request_deep, "#6e40c9").pack(side="left", padx=(8, 0))
         self._btn(bar, "🪤  Run evasion probe", self.run_probe, "#bb8009").pack(side="left", padx=(8, 0))
+        self._btn(bar, "🧷  Scan autostart", self.scan_autostart, "#1f6feb").pack(
+            side="left", padx=(8, 0))
+        self._btn(bar, "⏸  Suspend selected", self.suspend_selected, "#8957e5").pack(
+            side="left", padx=(8, 0))
         self.btn_kill = self._btn(bar, "⛔  Terminate selected", self.kill_selected, RED)
         self.btn_kill.pack(side="left", padx=(8, 0))
+        self._btn(bar, "🔒  Quarantine binary", self.quarantine_selected, "#9e6a03").pack(
+            side="left", padx=(8, 0))
 
         # Hidden-compute banner (shown only when flagged).
         self.hidden_banner = tk.Frame(self.root, bg="#3a1d1d")
@@ -205,9 +213,10 @@ class MinerSentryApp:
                                    highlightthickness=0)
         self.detail_text.pack(fill="both", expand=True, padx=14, pady=(0, 8))
         self.detail_text.insert("1.0", "Select a process to see why it scored "
-                                        "the way it did.\n\nMinerSentry combines five "
+                                        "the way it did.\n\nMinerSentry combines "
                                         "independent signals; a process only reaches "
-                                        "\"Likely Miner\" when several agree.")
+                                        "\"Likely Miner\" when several agree, and work "
+                                        "alone (CPU or GPU load) never convicts.")
         self.detail_text.configure(state="disabled")
 
         # Event log (detections + scan events), newest at the bottom.
@@ -358,6 +367,8 @@ class MinerSentryApp:
                     if not auto:  # the timed sweep runs quietly
                         self._set_status(note)
                         self._add_event(note)
+                elif kind == "autostart":
+                    self._show_autostart(item[1])
                 elif kind == "event":
                     self._add_event(item[1])
                 elif kind == "error":
@@ -488,6 +499,128 @@ class MinerSentryApp:
                 "Access denied",
                 f"Could not terminate {name} (PID {pid}).\n\n"
                 "Run MinerSentry as Administrator to act on protected processes.")
+
+    # -- autostart ----------------------------------------------------------
+    def scan_autostart(self) -> None:
+        """Scan Run keys / tasks / services / cron for miner-like entries."""
+        self._set_status("Scanning autostart locations…")
+        threading.Thread(target=self._autostart_thread, daemon=True).start()
+
+    def _autostart_thread(self) -> None:
+        try:
+            found = persist_mod.scan(self.engine.cfg)
+            self.q.put(("autostart", found))
+        except Exception as e:  # noqa: BLE001
+            self.q.put(("error", f"autostart scan failed: {type(e).__name__}: {e}"))
+
+    def _show_autostart(self, found: list) -> None:
+        if not found:
+            self._set_status("Autostart: no miner-like entries.")
+            self._add_event("autostart: nothing miner-like found")
+            return
+        lines = [f"{len(found)} miner-like autostart entr"
+                 f"{'y' if len(found) == 1 else 'ies'}:", ""]
+        for e in found:
+            lines.append(f"{e.score:>3}  {e.kind}")
+            lines.append(f"     {e.name}")
+            if e.exe:
+                lines.append(f"     {e.exe}")
+            for label in e.labels[:3]:
+                lines.append(f"       - {label}")
+            lines.append(f"     in {e.location}")
+            lines.append("")
+            self._add_event(f"autostart {e.score}: {e.summary}")
+        self.detail_text.configure(state="normal")
+        self.detail_text.delete("1.0", "end")
+        self.detail_text.insert("1.0", "\n".join(lines))
+        self.detail_text.configure(state="disabled")
+        self._set_status(f"Autostart: {len(found)} miner-like entry(ies) — see the detail panel.")
+        self._offer_removal(found)
+
+    def _offer_removal(self, found: list) -> None:
+        """Ask, per entry, whether to disable it. Every removal is reversible.
+
+        Finding the task that revives a miner on reboot is only half the job:
+        left in place, the miner comes back. Each removal records what it did
+        to the actions journal so it can be put back exactly.
+        """
+        for e in found:
+            what = {"run-key": "delete this registry value",
+                    "startup-folder": "move this file to quarantine",
+                    "scheduled-task": "delete this scheduled task",
+                    "hidden-task": "delete this hidden scheduled task",
+                    "service": "disable this service",
+                    "service-dll": "disable this service"}.get(
+                        e.kind, f"act on this {e.kind} entry")
+            if not messagebox.askyesno(
+                    "Remove autostart entry",
+                    f"{e.name}\n{e.exe or e.command[:70]}\n\nIn: {e.location}\n"
+                    f"Score: {e.score}/100\n\nMinerSentry can {what}. "
+                    f"It is recorded so it can be undone. Proceed?"):
+                continue
+            r = persist_mod.remove_entry(e)
+            self._add_event(("autostart removed: " if r.ok else "autostart removal failed: ")
+                            + r.message)
+            self._set_status(r.message)
+            if not r.ok:
+                messagebox.showerror("Autostart", r.message)
+
+    # -- response actions ---------------------------------------------------
+    def _selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Select a process", "Select a process first.")
+            return None, None
+        pid = int(sel[0])
+        return pid, self.rows.get(pid)
+
+    def suspend_selected(self) -> None:
+        """Freeze a process instead of killing it: it stops, evidence survives."""
+        pid, row = self._selected()
+        if pid is None:
+            return
+        name = row.name if row else str(pid)
+        if not messagebox.askyesno(
+                "Suspend process",
+                f"Suspend {name} (PID {pid})?\n\n"
+                f"It stops running but is not killed, so it can still be inspected. "
+                f"Use Resume to undo."):
+            return
+        r = quarantine_mod.suspend(pid)
+        self._set_status(r.message)
+        self._add_event(("suspended: " if r.ok else "suspend failed: ") + r.message)
+        if r.ok and messagebox.askyesno("Suspended", r.message + "\n\nResume it now?"):
+            back = quarantine_mod.resume(pid)
+            self._set_status(back.message)
+            self._add_event("resumed: " + back.message)
+        elif not r.ok:
+            messagebox.showerror("Suspend", r.message)
+
+    def quarantine_selected(self) -> None:
+        """Move the selected process's binary somewhere it cannot launch."""
+        pid, row = self._selected()
+        if pid is None:
+            return
+        exe = (row.exe if row else "") or ""
+        if not exe or not os.path.isfile(exe):
+            messagebox.showinfo("Quarantine", "The binary for that process can't be "
+                                              "located (it may need Administrator).")
+            return
+        if not messagebox.askyesno(
+                "Quarantine binary",
+                f"Move this file to the MinerSentry quarantine folder?\n\n{exe}\n\n"
+                f"The process must be stopped first, so it will be terminated. "
+                f"The original location is recorded, so this can be undone."):
+            return
+        r = quarantine_mod.quarantine_file(exe, kill_first=True)
+        self._set_status(r.message)
+        self._add_event(("quarantined: " if r.ok else "quarantine failed: ") + r.message)
+        if not r.ok:
+            messagebox.showerror("Quarantine", r.message)
+        else:
+            messagebox.showinfo("Quarantined", r.message +
+                                "\n\nUndo it from the quarantine folder under "
+                                "%LOCALAPPDATA%\\MinerSentry.")
 
     def _set_status(self, text: str) -> None:
         self.status.configure(text="  " + text)

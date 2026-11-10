@@ -20,6 +20,7 @@ from typing import Callable
 from .config import Config
 from .engine import Engine, ProcInfo
 from . import gpu as gpu_mod
+from . import persistence as persist_mod
 
 
 def run_session(duration: float, cfg: Config | None = None,
@@ -47,6 +48,8 @@ def run_session(duration: float, cfg: Config | None = None,
     scope_ok = False
     results: list[ProcInfo] = []
     deep_at = min(12.0, duration * 0.5)  # memory-sweep once history has warmed
+    deep_every = max(10.0, duration / 4)  # and again, in case the first missed
+    last_deep = 0.0
 
     def _record(elapsed: float) -> None:
         for r in results:
@@ -76,13 +79,22 @@ def run_session(duration: float, cfg: Config | None = None,
         if gpu_sample or gpu_only:
             util, windows, ctx = gpu_mod.sample()
             e.set_gpu_util(util, windows, ctx)
-        if deep and deep_thread is None and elapsed >= deep_at:
+        if deep and elapsed >= deep_at and (deep_thread is None
+                                            or not deep_thread.is_alive()):
             # Memory sweep on its own thread (like the GUI) so CPU sampling keeps
             # its cadence; a synchronous sweep starved the CPU window of samples.
-            targets = e.deep_scan_targets(force=force_pids)
-            deep_thread = threading.Thread(
-                target=lambda: [e.deep_probe(pid) for pid in targets], daemon=True)
-            deep_thread.start()
+            #
+            # Repeated, not once: the targets are chosen from the state at that
+            # moment, and a process that is not yet ranked into the list (a busy
+            # machine, a target that started late) would otherwise never be
+            # memory-scanned for the rest of the session. Already-scanned PIDs
+            # come from the cache, so a repeat sweep is cheap.
+            if time.time() - last_deep >= deep_every:
+                last_deep = time.time()
+                targets = e.deep_scan_targets(force=force_pids)
+                deep_thread = threading.Thread(
+                    target=lambda: [e.deep_probe(pid) for pid in targets], daemon=True)
+                deep_thread.start()
         results = e.scan_once(deep=False)
         _record(elapsed)
         # Keep a steady cadence: sleep only what is left of the interval. Sleeping
@@ -135,6 +147,30 @@ def summarize(e: Engine, results: list[ProcInfo], first_hit: dict[int, float],
     }
 
 
+def _print_autostart(found: list[dict]) -> None:
+    """Autostart findings as a short table; silence means nothing was found."""
+    if not found:
+        print("\nAutostart: no miner-like entries.")
+        return
+    print(f"\nAutostart: {len(found)} miner-like entr"
+          f"{'y' if len(found) == 1 else 'ies'}")
+    for f in found:
+        print(f"  {f['score']:>3}  {f['kind']:<16} {f['name'][:34]:<34} {f['exe'][-44:]}")
+        for label in f["labels"][:3]:
+            print(f"       - {label}")
+        print(f"       in {f['location']}")
+
+
+def _report_autostart(cfg: Config, as_json: bool) -> int:
+    found = persist_mod.summarize(persist_mod.scan(cfg))
+    if as_json:
+        print(json.dumps({"autostart": found,
+                          "config_warnings": list(cfg.load_warnings)}, indent=2))
+    else:
+        _print_autostart(found)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Headless MinerSentry scan.")
     ap.add_argument("--duration", type=float, default=25.0, help="seconds to run")
@@ -155,8 +191,53 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--config", type=str, default=None,
                     help="load tuning from this JSON file (trusted fully); default is "
                          "the admin config plus the restricted per-user config")
+    ap.add_argument("--autostart", action="store_true",
+                    help="also scan autostart locations (Run keys, tasks, services, "
+                         "cron, systemd) for miner-like entries")
+    ap.add_argument("--autostart-only", action="store_true",
+                    help="scan ONLY autostart locations and exit (no process scan)")
+    ap.add_argument("--autostart-remove", metavar="NAME",
+                    help="disable or remove the autostart entry with this name "
+                         "(reversible; recorded in the actions journal)")
+    ap.add_argument("--autostart-undo", action="store_true",
+                    help="undo the last autostart removal")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     args = ap.parse_args(argv)
+
+    if args.autostart_undo:
+        records = persist_mod.removals()
+        if not records:
+            print("Nothing to undo.", file=sys.stderr)
+            return 1
+        r = persist_mod.undo_removal(records[-1])
+        print(r.message, file=sys.stdout if r.ok else sys.stderr)
+        return 0 if r.ok else 1
+
+    if args.autostart_remove:
+        cfg = Config.load(args.config)
+        wanted = args.autostart_remove.lower()
+        found = [e for e in persist_mod.scan(cfg)
+                 if wanted in e.name.lower()]
+        if not found:
+            print(f"No reported autostart entry matches {args.autostart_remove!r}. "
+                  f"Run --autostart-only to see what was found.", file=sys.stderr)
+            return 1
+        if len(found) > 1:
+            print("That matches more than one entry; be more specific:", file=sys.stderr)
+            for e in found:
+                print(f"  {e.name}  ({e.kind}, {e.location})", file=sys.stderr)
+            return 1
+        r = persist_mod.remove_entry(found[0])
+        print(r.message, file=sys.stdout if r.ok else sys.stderr)
+        if r.ok:
+            print("Undo it with: minersentry-scan --autostart-undo")
+        return 0 if r.ok else 1
+
+    if args.autostart_only:
+        cfg = Config.load(args.config)
+        for w in cfg.load_warnings:
+            print(f"config: {w}", file=sys.stderr)
+        return _report_autostart(cfg, as_json=args.json)
 
     if not args.json:
         print(f"MinerSentry headless scan - {args.duration:.0f}s ...", file=sys.stderr)
@@ -182,6 +263,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.gpu_only:
         report_pids = e.gpu_scope if pid_set is None else pid_set & e.gpu_scope
     summary = summarize(e, results, first_hit, watch=args.watch, pids=report_pids)
+    if args.autostart:
+        summary["autostart"] = persist_mod.summarize(persist_mod.scan(cfg))
 
     if args.json:
         print(json.dumps(summary, indent=2))
@@ -196,6 +279,8 @@ def main(argv: list[str] | None = None) -> int:
             print("\n[!] hidden compute: " + summary["hidden_compute"]["note"])
         print(f"\n{summary['likely_miners']} likely miner(s), "
               f"{summary['suspicious']} suspicious{gpu_note}")
+        if args.autostart:
+            _print_autostart(summary["autostart"])
     return 0
 
 

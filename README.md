@@ -58,13 +58,14 @@ desktop and stays quiet on a cloud host; see [Profiles](#profiles-desktop-and-cl
 | Signal | What it measures |
 |---|---|
 | **cpu** | Sustained, steady **core saturation** (a high *floor*, not a bursty peak). Measured per-core, so a one-thread miner on a 20-core box is still caught. |
-| **gpu** | Sustained **GPU compute-engine** utilization by a headless process — catches GPU-only miners that CPU accounting can't see. Per-process compute load comes from the Windows PDH "GPU Engine" counters (vendor-neutral); a CUDA compute context (nvidia-smi) raises confidence. Windowed apps (games/creative) and an allowlist (Blender, OBS, DaVinci, ffmpeg…) are dampened. |
+| **gpu** | Sustained **GPU compute-engine** utilization by a headless process — catches GPU-only miners that CPU accounting can't see. Per-process compute load comes from `nvidia-smi pmon` where NVIDIA is present, falling back to the Windows PDH "GPU Engine" counters for other vendors. That order is from measurement, not preference: with a real OpenCL job holding this laptop's RTX 3050 at 99%, PDH reported one non-zero instance on the whole machine (System/Copy, 0.01%) while pmon reported the job at 98%. A CUDA/OpenCL compute context raises confidence. Windowed apps (games/creative) and an allowlist (Blender, OBS, DaVinci, ffmpeg…) are dampened. |
 | **memory** | Read-only scan of each process's committed memory for miner fingerprints: `stratum+tcp`, `xmrig`, `RandomX`, stratum login/submit JSON, pool names, and a ~2 GiB RandomX dataset. Strings are matched as both 8-bit text and UTF-16 (how .NET miners hold them). Finds miners injected into `svchost`, `explorer`, `dllhost` and the other usual hosts, which are never trust-dampened. |
 | **network** | Established TCP connections to stratum-typical pool ports, and — via bundled threat intel — connections to a **resolved known mining-pool IP on *any* port** (e.g. a pool on 443). Only pool stratum endpoints are listed, never pool websites, and any address in a shared CDN range (Cloudflare, Fastly) is dropped, since unrelated sites share it. A persisted connection scores higher than a transient one. |
 | **name** | Known miner binary names and execution from suspicious directories (Temp, ProgramData, roaming on Windows; /tmp, /dev/shm, /var/tmp on Linux). |
 | **probe** | The **evasion probe** (see below). |
 | **cmdline** | Mining indicators in a process's **arguments**: a `stratum://` URL, a known pool host, a wallet address, an algorithm (`rx/0`, `kawpow`), and miner-only flags (`--donate-level`, `--randomx-1gb-pages`). A miner can rename its binary and strip its strings, but it still has to be told where to send the money. Generic flags every CLI uses (`-o`, `-u`, `-t`, `--tls`) are capped below the hard-evidence line, so they corroborate but can never convict. Only the matched **labels** are kept, never the command line: wallets, passwords and worker names are read and discarded. |
 | **swarm** | Load summed **per executable**, not per process. Twenty copies of one unsigned binary at a quarter core each duck every per-process floor while mining five cores; judged together they don't. Only untrusted executables are grouped, so a browser's renderers are not a swarm, and like cpu/gpu it needs miner-specific corroboration to convict. |
+| **autostart** | Run keys, startup folders, services, scheduled tasks (Windows); cron, systemd units, shell profiles (Linux). Every other signal judges a process that is already running — this is the one that finds a miner *installed but not started*, which is how practically every real cryptojacker survives a reboot. Entries are scored with the same evidence as processes: command-line indicators, a known miner name, a drop location, an unsigned binary. |
 | **perf** *(Linux)* | Per-process **cache-misses-per-instruction** via user-mode `perf_event_open`. RandomX's random reads across its ~2 GB dataset produce an order-of-magnitude higher miss rate than ordinary compute — a fingerprint of the algorithm visible even when the miner is CPU-capped. Degrades to a no-op where `perf_event_paranoid` forbids it. |
 
 Alongside the per-process signals, a **hidden-compute** banner flags work the
@@ -204,8 +205,14 @@ appears as `msentry_target.exe` when run with `--unsigned`.)
 - **Deep scan (memory)** — memory-fingerprint the candidates now. This also
   runs by itself every 45 s (`deep_auto_interval`) while monitoring is on.
 - **Run evasion probe** — the monitor-decoy test.
+- **Scan autostart** — read Run keys, tasks, services, cron and systemd and
+  report anything miner-like, with where it lives so you can go and look.
+- **Suspend selected** — freeze a process instead of killing it: it stops
+  earning and stays intact to inspect. Offers to resume immediately.
 - **Terminate selected** — ends the selected process after a confirmation, and
   refuses if the PID now belongs to a different process than the row showed.
+- **Quarantine binary** — move the executable somewhere it cannot launch,
+  recording where it came from so it can be put back.
 
 ## Headless scan & benchmark
 
@@ -215,6 +222,19 @@ Run the engine with no GUI (for scripting, CI, or a quick check):
 python -m minersentry.cli --duration 25            # table of non-idle processes + verdicts
 python -m minersentry.cli --duration 25 --json     # machine-readable summary
 ```
+
+Scan autostart locations, with or without a process scan:
+
+```bash
+minersentry-scan --autostart-only          # just the autostart check
+minersentry-scan --autostart-only --json
+minersentry-scan --duration 30 --autostart # processes and autostart together
+```
+
+On the desktop this was built on that reads 884 entries in about 4 seconds and
+reports none of them: the threshold is set so a list nobody reads is not the
+default outcome. A Run key pointing at a miner with a pool URL and a wallet
+scores 100.
 
 Reproduce the evasion benchmark — each **benign** behavioral profile from
 `samples/fake_miner.py` run past the engine, with verdict and time-to-detect:
@@ -352,11 +372,37 @@ things: coverage of processes you cannot otherwise read, and the only honest
 form of self-protection available — a miner running as you cannot kill a SYSTEM
 service, whereas a user-level watchdog it can kill is theatre.
 
-New detections raise a desktop notification (a Windows toast, falling back to
-`msg`; `notify-send` or `wall` on Linux) and always land in the detection log.
+While it runs there is a tray icon (Windows, built on `Shell_NotifyIcon`, no
+dependency) with the few things worth doing from there: open the detection log,
+scan autostart now, stop watching. Run it with `--no-tray` if you would rather
+it stayed invisible.
+
+New detections raise a desktop notification — a balloon on the tray icon, else a
+Windows toast, else `msg`; `notify-send` or `wall` on Linux — and always land in
+the detection log. The watcher also re-scans autostart locations periodically,
+and notices if its OWN autostart entry is deleted while it is running, which is
+something worth being told about.
 `notify_min_verdict` chooses the bar (`Likely Miner` by default, or
 `Suspicious`), and `notify_command` runs your own command with the title and
 body instead.
+
+## Responding to a detection
+
+Killing a miner destroys what you would want to look at and invites it straight
+back from whatever autostart entry started it. The alternatives are all
+reversible, all confirmed, and all recorded in `actions.jsonl` so an undo never
+depends on remembering what was done:
+
+| Action | What it does | Undo |
+|---|---|---|
+| Suspend | freezes the process; it stops earning, stays inspectable | Resume |
+| Quarantine | moves the binary where it cannot launch, remembering its home | Restore |
+| Block address | one firewall rule by IP; the miner keeps failing to submit | Unblock |
+| Terminate | ends it, as before | none |
+
+Suspending your own processes needs no privileges. Firewall rules and moving a
+file out of a system directory need Administrator, and the actions say so rather
+than failing obscurely.
 
 ## Configuration
 
@@ -383,10 +429,16 @@ the GUI stuck showing "Scan error".
 
 ## Limitations (honest ones)
 
-- GPU-compute scoring reads per-process utilization from the PDH "GPU Engine"
-  counters, which Windows only materializes while a process is *actively* using
-  the compute engine — so an idle GPU shows nothing, and the signal appears once
-  a real GPU workload runs.
+- GPU-compute scoring prefers `nvidia-smi pmon` and falls back to the PDH "GPU
+  Engine" counters. On the NVIDIA laptop this was developed on, the PDH path
+  reports nothing for CUDA/OpenCL work even at 99% GPU load, so without
+  `nvidia-smi` on PATH the GPU signal is effectively blind there. Verified with
+  real OpenCL load (`samples/gpu_load.py`): 98% read, signal 80, and still
+  correctly **Clean** — headless compute alone is not mining.
+- Autostart scanning reads what the current user can read. Another user's
+  `HKCU` Run keys and some scheduled tasks need elevation, and shortcut targets
+  are resolved through the shell, which may be unavailable in a locked-down
+  session.
 - The hidden-compute gap catches rootkit-hidden *CPU* and VM/WSL load, but true
   per-process package power (RAPL) isn't exposed in Windows user mode without a
   driver, so that remains experimental/off by default.

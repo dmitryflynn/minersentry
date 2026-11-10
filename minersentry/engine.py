@@ -31,6 +31,31 @@ from .scoring import (
 )
 
 
+def _own_code_roots() -> tuple[str, ...]:
+    """Directories whose code IS MinerSentry: the package, and the harnesses
+    that import it (bench, tests) when running from a checkout.
+
+    Deliberately NOT the whole checkout root. `samples/` lives there and exists
+    to imitate a miner — excluding it would blind the detector to its own test
+    target, which is exactly what happened the first time this was written.
+    Nor is the parent of an installed package included: that is site-packages,
+    and it would excuse every tool on the machine.
+    """
+    package = os.path.dirname(os.path.realpath(__file__))
+    roots = [os.path.normcase(package) + os.sep]
+    parent = os.path.dirname(package)
+    if (os.path.isfile(os.path.join(parent, "pyproject.toml"))
+            and os.path.isdir(os.path.join(parent, "minersentry"))):
+        for sub in ("bench", "tests"):
+            path = os.path.join(parent, sub)
+            if os.path.isdir(path):
+                roots.append(os.path.normcase(path) + os.sep)
+        entry = os.path.join(parent, "main.py")      # a second GUI instance
+        if os.path.isfile(entry):
+            roots.append(os.path.normcase(entry))
+    return tuple(roots)
+
+
 class ProcInfo:
     __slots__ = ("pid", "name", "exe", "username", "cpu", "cpu_mean", "cpu_min",
                  "mem_mb", "threads", "signals", "verdict", "score", "mem_result",
@@ -78,6 +103,14 @@ class Engine:
         # is shared with unrelated scripts, so only our own PID is excluded.
         self._self_exe = (os.path.normcase(os.path.realpath(sys.executable))
                           if getattr(sys, "frozen", False) else "")
+        # Directories whose code IS MinerSentry. A second process running our
+        # own code (the benchmark, the test suite, a CLI alongside the GUI)
+        # necessarily holds the marker table in memory, so it reads as a miner
+        # the moment it works hard — our own signatures convicting our own
+        # tooling. Interpreters are not trust-dampened any more, which is right
+        # for a miner written in Python but removed what used to cover this.
+        self._own_code_roots = _own_code_roots()
+        self._own_tooling: set[int] = set()
         self._mem_cache: dict[int, memscan.MemScanResult] = {}  # from deep scans
         # Per-PID metadata cache (refresh the process name on every pass).
         # Recomputing exe()/username()/Authenticode every
@@ -161,6 +194,7 @@ class Engine:
         self._meta.pop(pid, None)
         self._perf_ratio.pop(pid, None)
         self._cmd_hits.pop(pid, None)
+        self._own_tooling.discard(pid)
         self._warm.discard(pid)
         for key in [k for k in self._conn_seen if k[0] == pid]:
             self._conn_seen.pop(key, None)
@@ -322,6 +356,28 @@ class Engine:
         return score_cmdline(cmdline_mod.score_of(hits, self.cfg.cmdline_generic_cap),
                              cmdline_mod.labels(hits), self.cfg)
 
+    def _runs_our_code(self, argv: list) -> bool:
+        """True if these arguments execute a file inside MinerSentry's own tree.
+
+        Verified by resolved PATH, never by a name: a miner that merely puts
+        "minersentry" in its command line gains nothing, because the path has
+        to land inside the installed package (or its checkout) — somewhere it
+        would already need write access to reach.
+        """
+        for arg in argv[1:]:
+            if not arg or arg.startswith("-"):
+                continue
+            try:
+                resolved = os.path.normcase(os.path.realpath(arg))
+            except (OSError, ValueError):
+                continue
+            for root in self._own_code_roots:
+                # a directory root ends in a separator; a file root is exact
+                if (resolved.startswith(root) if root.endswith(os.sep)
+                        else resolved == root):
+                    return True
+        return False
+
     def _read_cmdline(self, proc: psutil.Process) -> list:
         """Extract (and cache) argument indicators for one process.
 
@@ -334,6 +390,8 @@ class Engine:
             argv = proc.cmdline()
         except Exception:  # noqa: BLE001 - telemetry must never break a scan
             return []        # other-user/protected processes need admin
+        if self._own_code_roots and self._runs_our_code(argv):
+            self._own_tooling.add(proc.pid)
         hits = cmdline_mod.indicators(argv, self.cfg)
         del argv             # don't keep the raw arguments around
         return hits
@@ -601,6 +659,8 @@ class Engine:
             # and vanish from the scan entirely.
             if self._self_exe and info.exe and os.path.normcase(info.exe) == self._self_exe:
                 continue
+            if p.pid in self._own_tooling:
+                continue      # another process running MinerSentry itself
 
             info.mem_result = self._mem_cache.get(p.pid)
             info.signals = self._build_signals(info, conn_map.get(p.pid, []), now)
@@ -652,6 +712,7 @@ class Engine:
             self._perf_ratio.pop(dead, None)
         for dead in set(self._cmd_hits) - live_pids:
             self._cmd_hits.pop(dead, None)
+        self._own_tooling &= live_pids
         self._warm &= live_pids
         # Prune GPU history in place under the lock (reassigning the dict would
         # race the sampler thread's defaultdict insert -> "changed size" errors).

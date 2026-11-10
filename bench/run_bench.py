@@ -38,6 +38,10 @@ PROFILES = [
     ("cpu-capped 25% + pool", ["--threads", "1", "--cap", "25", "--net"], "a stealth miner that still talks to a pool"),
     ("pool connection", ["--threads", "1", "--net"], "a miner holding a stratum pool connection"),
     ("evasion (headless)", ["--threads", "1", "--evade"], "a miner that pauses when a monitor opens"),
+    # Real GPU compute, driven through the graphics driver's OpenCL runtime.
+    # Skipped automatically where no GPU/OpenCL is available.
+    ("gpu compute + strings", ["--threads", "1", "--cap", "15", "--gpu"],
+     "a GPU miner: headless compute engine load plus resident strings"),
 ]
 
 
@@ -104,7 +108,8 @@ def run_profile(label: str, args: list[str], duration: float) -> dict:
     try:
         time.sleep(2.0)  # let it start and ramp
         target = proc.pid
-        e, results, first_hit = run_session(duration, cfg=Config.load())
+        e, results, first_hit = run_session(duration, cfg=Config.load(),
+                                            gpu_sample="--gpu" in args)
         summary = summarize(e, results, first_hit)
         # The fake_miner runs under this subprocess PID (python.exe).
         row = next((p for p in summary["processes"] if p["pid"] == target), None)

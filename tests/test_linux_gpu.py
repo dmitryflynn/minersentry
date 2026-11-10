@@ -71,11 +71,24 @@ def test_unsupported_sm_values_warn():
 
 
 def test_windows_keeps_existing_collectors():
+    # _sample_pdh_compute became _sample_windows: pmon first (it is what
+    # actually reads NVIDIA compute), PDH behind it for other vendors.
     with patch.object(sys, 'platform', 'win32'), patch.object(gpu, 'IS_WINDOWS', True), \
-         patch.object(gpu, '_sample_pdh_compute', return_value={42: 80}), \
+         patch.object(gpu, '_sample_windows', return_value={42: 80}), \
          patch.object(gpu, 'window_owner_pids', return_value={43}), \
          patch.object(gpu, '_sample_nvidia_ctx', return_value={42}):
         assert gpu.sample() == ({42: 80}, {43}, {42})
+
+
+def test_windows_compute_context_is_passed_to_the_pdh_fallback():
+    seen = []
+    with patch.object(sys, 'platform', 'win32'), patch.object(gpu, 'IS_WINDOWS', True), \
+         patch.object(gpu, '_run', return_value=''), \
+         patch.object(gpu, '_sample_pdh', side_effect=lambda ctx: seen.append(ctx) or {}), \
+         patch.object(gpu, 'window_owner_pids', return_value=set()), \
+         patch.object(gpu, '_sample_nvidia_ctx', return_value={99}):
+        gpu.sample()
+    assert seen == [{99}]   # the 3D-engine fallback is limited to compute contexts
 
 
 def test_nonzero_command_exit_is_not_valid_telemetry():

@@ -168,6 +168,18 @@ class Config:
     notify_command: str = ""
     notify_min_verdict: str = "Likely Miner"   # or "Suspicious"
 
+    # -- autostart (persistence) scanning -----------------------------------
+    # Every other signal judges a RUNNING process; a miner that is merely
+    # installed in a Run key / task / service / cron line is invisible until it
+    # next starts. A desktop has dozens of legitimate autostart entries, so
+    # only entries scoring at least this much are reported.
+    persistence_enabled: bool = True
+    persistence_min_score: int = 45
+    persistence_interval: float = 900.0   # background re-scan seconds (0 = off)
+    # How often the watcher re-checks that its OWN autostart entry still exists
+    # (0 = off). Something removing it is worth saying out loud.
+    tamper_check_interval: float = 300.0
+
     # -- deployment profile --------------------------------------------------
     # "desktop" (default): a known miner binary name on its own is Suspicious,
     # because on a personal machine an idle or paused xmrig is still worth a look.
