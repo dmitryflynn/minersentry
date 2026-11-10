@@ -787,6 +787,14 @@ def remove_entry(entry: PersistEntry) -> "quarantine.Result":
     service that something else depends on breaks more than it fixes.
     """
     kind = entry.kind
+    registry_kinds = ("run-key", "ifeo-debugger", "appinit-dll", "winlogon",
+                      "service", "service-dll")
+    if kind in registry_kinds and not IS_WINDOWS:
+        # `import winreg` raises ModuleNotFoundError off Windows; answer
+        # instead of letting that escape to the caller.
+        return quarantine.Result(
+            False, f"{kind} entries live in the Windows registry; there is "
+                   f"nothing of that kind to remove on this platform.")
     if kind in ("run-key", "ifeo-debugger", "appinit-dll", "winlogon"):
         return _remove_registry_value(entry)
     if kind == "startup-folder":

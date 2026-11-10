@@ -15,6 +15,13 @@ from minersentry import quarantine
 from minersentry.config import Config
 
 CFG = Config()
+WINDOWS = sys.platform == "win32"
+# "a drop location" is a different set of paths per platform, because
+# suspicious_dir_hints is
+DROP_PAYLOAD = (r"C:\Users\x\AppData\Local\Temp\payload.dll" if WINDOWS
+                else "/tmp/payload.so")
+SYSTEM_PAYLOAD = (r"C:\Windows\System32\dhcpcsvc.dll" if WINDOWS
+                  else "/usr/lib/dhcpcsvc.so")
 POOL_ARGS = "-o pool.supportxmr.com:3333 -u 4" + "9" * 94
 TASK_XML = (
     '<?xml version="1.0"?>\n'
@@ -60,12 +67,10 @@ def test_service_dll_payload_is_scored_not_the_svchost_host():
     runs is the DLL. 232 services on the development machine were being checked
     by the wrong file."""
     evil = P.PersistEntry(kind="service-dll", location="HKLM...", name="EvilSvc",
-                          command=r"C:\Users\x\AppData\Local\Temp\payload.dll",
-                          exe=r"C:\Users\x\AppData\Local\Temp\payload.dll")
+                          command=DROP_PAYLOAD, exe=DROP_PAYLOAD)
     assert scored(evil).score >= CFG.persistence_min_score
     good = P.PersistEntry(kind="service-dll", location="HKLM...", name="Dhcp",
-                          command=r"C:\Windows\System32\dhcpcsvc.dll",
-                          exe=r"C:\Windows\System32\dhcpcsvc.dll")
+                          command=SYSTEM_PAYLOAD, exe=SYSTEM_PAYLOAD)
     assert P.score_entry(good, CFG, is_trusted=lambda *a: True,
                          isfile=lambda p: True).score == 0
 
@@ -156,6 +161,7 @@ def test_removal_of_a_missing_value_is_reported_not_crashed(tmp_path, monkeypatc
     assert not r.ok
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="the registry is Windows-only")
 def test_unrecognised_registry_location_is_rejected():
     r = P.remove_entry(P.PersistEntry(kind="run-key", location="nonsense",
                                       name="x", command="x"))
