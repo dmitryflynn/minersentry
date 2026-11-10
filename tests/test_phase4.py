@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import time
+from types import SimpleNamespace
 
 import psutil
 import pytest
@@ -165,19 +166,31 @@ def test_quarantine_and_restore_round_trip(tmp_path, monkeypatch):
 
 
 def test_quarantine_refuses_while_the_binary_is_running(tmp_path, monkeypatch):
-    import shutil
-    import subprocess
+    """Moving a file out from under a running process is how you corrupt an
+    install, so quarantine refuses until the process is gone.
+
+    The owning process is injected rather than really launched: a bare copy of
+    the interpreter cannot find its standard library on every machine (it died
+    instantly on a CI runner with "No module named 'encodings'"), which made
+    the quarantine succeed and the test fail for the wrong reason.
+    """
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
-    copy = tmp_path / "runner.exe"
-    shutil.copy2(sys.executable, copy)
-    p = subprocess.Popen([str(copy), "-I", "-c", "import time; time.sleep(30)"])
-    try:
-        time.sleep(1.0)
-        r = quarantine.quarantine_file(str(copy))
-        assert not r.ok and "still running" in r.message
-    finally:
-        p.kill()
-        p.wait(timeout=10)
+    target = tmp_path / "runner.exe"
+    target.write_bytes(b"not a real binary")
+    monkeypatch.setattr(quarantine, "processes_using",
+                        lambda path: [SimpleNamespace(pid=4242)])
+    r = quarantine.quarantine_file(str(target))
+    assert not r.ok and "still running" in r.message and "4242" in r.message
+    assert target.exists()                      # nothing was moved
+
+
+def test_quarantine_proceeds_once_nothing_is_using_the_binary(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    target = tmp_path / "runner.exe"
+    target.write_bytes(b"not a real binary")
+    monkeypatch.setattr(quarantine, "processes_using", lambda path: [])
+    assert quarantine.quarantine_file(str(target)).ok
+    assert not target.exists()
 
 
 def test_quarantine_will_not_overwrite_a_restored_original(tmp_path, monkeypatch):
