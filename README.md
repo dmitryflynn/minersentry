@@ -63,6 +63,7 @@ desktop and stays quiet on a cloud host; see [Profiles](#profiles-desktop-and-cl
 | **network** | Established TCP connections to stratum-typical pool ports, and — via bundled threat intel — connections to a **resolved known mining-pool IP on *any* port** (e.g. a pool on 443). Only pool stratum endpoints are listed, never pool websites, and any address in a shared CDN range (Cloudflare, Fastly) is dropped, since unrelated sites share it. A persisted connection scores higher than a transient one. |
 | **name** | Known miner binary names and execution from suspicious directories (Temp, ProgramData, roaming on Windows; /tmp, /dev/shm, /var/tmp on Linux). |
 | **probe** | The **evasion probe** (see below). |
+| **cmdline** | Mining indicators in a process's **arguments**: a `stratum://` URL, a known pool host, a wallet address, an algorithm (`rx/0`, `kawpow`), and miner-only flags (`--donate-level`, `--randomx-1gb-pages`). A miner can rename its binary and strip its strings, but it still has to be told where to send the money. Generic flags every CLI uses (`-o`, `-u`, `-t`, `--tls`) are capped below the hard-evidence line, so they corroborate but can never convict. Only the matched **labels** are kept, never the command line: wallets, passwords and worker names are read and discarded. |
 | **perf** *(Linux)* | Per-process **cache-misses-per-instruction** via user-mode `perf_event_open`. RandomX's random reads across its ~2 GB dataset produce an order-of-magnitude higher miss rate than ordinary compute — a fingerprint of the algorithm visible even when the miner is CPU-capped. Degrades to a no-op where `perf_event_paranoid` forbids it. |
 
 Alongside the per-process signals, a **hidden-compute** banner flags work the
@@ -91,6 +92,10 @@ can't trip it:
 - core saturation **+** a connection to a known mining pool
 - miner strings in memory **+** a long-lived connection on a stratum port
 - core saturation **+** a known miner binary name
+- **mining arguments** (pool URL / wallet / miner-only flags) **+** any sustained
+  load, GPU compute, pool connection, resident strings or dataset. The arguments
+  already say what the process is for, so the bar on the behavioral side is low:
+  a miner throttled to a third of a core is still caught.
 - a process that **throttles under the evasion probe** while using the CPU
 - **GPU compute** saturation **+** miner strings / a known miner name / a pool connection
 
@@ -305,6 +310,29 @@ signal **plus** a miner-specific artifact (resident stratum/XMRig strings, a
 known-pool connection, a ~2 GiB RandomX dataset, a miner name, or the evasion
 reaction), none of which legitimate software has.
 
+## Configuration
+
+Two files, deliberately not equal in authority:
+
+| File | Who can write it | What it may change |
+|---|---|---|
+| `%ProgramFiles%\MinerSentry\config.json` (`/etc/minersentry/config.json`) | Administrator / root only | everything |
+| `%LOCALAPPDATA%\MinerSentry\config.json` (`~/MinerSentry/config.json`) | the logged-in user, and so anything running as them | scan timing within bounds; **adding** miner names and pool ports |
+
+Anything running as the user can write the per-user file, malware included. One
+line there used to be enough to switch detection off — raise the verdict
+thresholds, or add `"trusted_dirs": ["C:\\"]` to trust the whole disk. So that
+file may now only make MinerSentry *more* suspicious, never less. Everything it
+tries to relax is ignored and reported in the event log (`config_warnings` in
+`--json`). Real tuning belongs in the admin file, which is honored only when it
+is genuinely protected: inside Program Files on Windows, root-owned and not
+group- or world-writable on Linux. `--config FILE` loads one file and trusts it
+fully, for testing.
+
+Every value is validated for type, range and shape. A malformed entry is skipped
+with a warning instead of raising mid-scan, which used to leave the CLI dead and
+the GUI stuck showing "Scan error".
+
 ## Limitations (honest ones)
 
 - GPU-compute scoring reads per-process utilization from the PDH "GPU Engine"
@@ -330,6 +358,12 @@ reaction), none of which legitimate software has.
   very start of a session is learned as normal. The VM/WSL check and every
   per-process signal still apply.
 - Full memory coverage of protected/other-user processes requires Administrator.
+  The same applies to reading their **arguments**: on this desktop 166 of 357
+  processes would not hand them over unelevated, so a miner running as another
+  user (or as SYSTEM) is judged on behavior alone until you elevate.
+- MinerSentry recognizes itself by PID, and by its own file path when running as
+  the packaged `.exe`. It used to skip anything *named* `MinerSentry.exe`, which
+  meant a miner could disappear from the scan by taking that name.
 - The memory scan reads a bounded slice of each process (48 MiB by default), and
   some regions fail to read. `--json` output includes a `memory_coverage` block
   per process (`bounded` or `partial`, bytes read, regions that failed) so a

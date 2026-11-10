@@ -2,6 +2,7 @@
 
 from minersentry.cli import summarize
 from minersentry.engine import ProcInfo
+from minersentry.config import Config
 from minersentry.power import HiddenComputeReport
 from minersentry.scoring import Signal
 
@@ -11,6 +12,7 @@ class _StubEngine:
 
     def __init__(self, report=None):
         self.hidden_report = report or HiddenComputeReport()
+        self.cfg = Config()
 
 
 def _proc(pid, name, verdict, score, cpu=0.0, gpu=0.0, sigs=None):

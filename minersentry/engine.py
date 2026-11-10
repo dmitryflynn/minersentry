@@ -12,18 +12,21 @@ from __future__ import annotations
 
 import ntpath
 import os
+import sys
 import threading
 import time
 from collections import defaultdict, deque
 
 import psutil
 
+from . import cmdline as cmdline_mod
 from . import memscan, perfcounters, poolintel, power, trust
 from .audit import AuditLog
 from .config import Config
 from .scoring import (
     Signal, combine, is_miner_name, name_stem, score_cpu, score_dataset,
-    score_gpu, score_memory, score_name, score_network, score_perf, score_probe,
+    score_cmdline, score_gpu, score_memory, score_name, score_network, score_perf,
+    score_probe,
 )
 
 
@@ -70,6 +73,10 @@ class Engine:
         self._probe_drops: dict[int, float] = {}
         self._warm: set[int] = set()
         self._self_pid = os.getpid()
+        # Only a frozen build has an exe of its own; under Python the interpreter
+        # is shared with unrelated scripts, so only our own PID is excluded.
+        self._self_exe = (os.path.normcase(os.path.realpath(sys.executable))
+                          if getattr(sys, "frozen", False) else "")
         self._mem_cache: dict[int, memscan.MemScanResult] = {}  # from deep scans
         # Per-PID metadata cache (refresh the process name on every pass).
         # Recomputing exe()/username()/Authenticode every
@@ -110,6 +117,11 @@ class Engine:
         self._big_mem_pids: set[int] = set()
         # Per-PID cache-miss-ratio from the Linux PMU (set during deep probes).
         self._perf_ratio: dict[int, float] = {}
+        # Mining indicators from each PID's arguments. Only the matched labels
+        # are kept (never the command line itself: it can hold wallets,
+        # passwords and tokens). Arguments don't change for a PID's lifetime,
+        # so this is resolved once per PID.
+        self._cmd_hits: dict[int, list] = {}
         self.audit = audit or AuditLog()
         self.last_scan_errors = 0  # memory OpenProcess failures last deep pass
         for p in (() if gpu_only else psutil.process_iter()):  # prime CPU baselines
@@ -138,6 +150,7 @@ class Engine:
         self._last_verdict.pop(pid, None)
         self._meta.pop(pid, None)
         self._perf_ratio.pop(pid, None)
+        self._cmd_hits.pop(pid, None)
         self._warm.discard(pid)
         for key in [k for k in self._conn_seen if k[0] == pid]:
             self._conn_seen.pop(key, None)
@@ -249,7 +262,29 @@ class Engine:
             score_probe(self._probe_drops.get(info.pid, 0.0), cfg),
             score_dataset(large_dataset, cfg),
             score_perf(self._perf_ratio.get(info.pid), cfg),
+            self._cmdline_signal(info.pid),
         ]
+
+    def _cmdline_signal(self, pid: int) -> Signal:
+        hits = self._cmd_hits.get(pid) or []
+        return score_cmdline(cmdline_mod.score_of(hits, self.cfg.cmdline_generic_cap),
+                             cmdline_mod.labels(hits), self.cfg)
+
+    def _read_cmdline(self, proc: psutil.Process) -> list:
+        """Extract (and cache) argument indicators for one process.
+
+        Reading arguments costs ~0.1 ms, and they are fixed for a PID's
+        lifetime, so this runs once per PID. Only labels are stored.
+        """
+        if not self.cfg.cmdline_enabled:
+            return []
+        try:
+            argv = proc.cmdline()
+        except Exception:  # noqa: BLE001 - telemetry must never break a scan
+            return []        # other-user/protected processes need admin
+        hits = cmdline_mod.indicators(argv, self.cfg)
+        del argv             # don't keep the raw arguments around
+        return hits
 
     def _trusted(self, info: ProcInfo) -> bool:
         """Resolve (and cache) the trust flag on first need."""
@@ -319,6 +354,9 @@ class Engine:
                 _add(pid)
         for pid in list(self._big_mem_pids):            # ~2 GiB dataset, any CPU
             _add(pid)
+        for pid, hits in list(self._cmd_hits.items()):  # mining arguments, any CPU
+            if cmdline_mod.score_of(hits, self.cfg.cmdline_generic_cap) >= self.cfg.hard_cmdline:
+                _add(pid)
         # Cap only the auto-discovered additions so the list can't grow without
         # bound, while always keeping the busy and explicitly-forced targets.
         capped = targets[:max(protected, max(1, limit) * 3)]
@@ -329,6 +367,8 @@ class Engine:
         pool = {pid for pid, _ip, _port in list(self._conn_seen)}
         named = {pid for pid, meta in list(self._meta.items())
                  if is_miner_name(meta[0], self.cfg) or is_miner_name(meta[1], self.cfg)}
+        named |= {pid for pid, hits in list(self._cmd_hits.items())
+                  if cmdline_mod.score_of(hits, self.cfg.cmdline_generic_cap) >= self.cfg.hard_cmdline}
         big = set(self._big_mem_pids)
         gpu = set(gpu_busy)
         # busy AND running from an odd place (Temp, ProgramData, very short name)
@@ -473,6 +513,7 @@ class Engine:
                 except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
                     username = ""
                 meta = (name, exe, username, None)  # trust resolved lazily
+                self._cmd_hits[p.pid] = self._read_cmdline(p)
                 self._meta[p.pid] = meta
             live_name = p.info.get("name")
             if live_name and live_name != meta[0]:
@@ -480,8 +521,11 @@ class Engine:
                 self._meta[p.pid] = meta
             info.name, info.exe, info.username, info.trusted = meta
             info.ctime = self._ctime.get(p.pid)
-            if os.path.basename(info.exe).lower() == "minersentry.exe":
-                continue  # never flag ourselves
+            # Another instance of THIS installed binary (same file path) is us.
+            # Matching by file name let any miner rename itself MinerSentry.exe
+            # and vanish from the scan entirely.
+            if self._self_exe and info.exe and os.path.normcase(info.exe) == self._self_exe:
+                continue
 
             info.mem_result = self._mem_cache.get(p.pid)
             info.signals = self._build_signals(info, conn_map.get(p.pid, []), now)
@@ -531,6 +575,8 @@ class Engine:
             self._ctime.pop(dead, None)
         for dead in set(self._perf_ratio) - live_pids:
             self._perf_ratio.pop(dead, None)
+        for dead in set(self._cmd_hits) - live_pids:
+            self._cmd_hits.pop(dead, None)
         self._warm &= live_pids
         # Prune GPU history in place under the lock (reassigning the dict would
         # race the sampler thread's defaultdict insert -> "changed size" errors).
