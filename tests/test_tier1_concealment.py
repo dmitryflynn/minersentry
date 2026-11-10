@@ -199,9 +199,32 @@ def test_disabled_protection_is_reported(monkeypatch):
     assert found and found[0].kind == "defender-disabled" and found[0].score >= 70
 
 
-def test_tamper_scan_is_quiet_here():
-    real = [f for f in tamper.scan() if f.score > 0]
-    assert real == [], [f.detail for f in real]
+def test_live_tamper_scan_returns_well_formed_findings():
+    """Runs against whatever machine this is, and checks the shape rather than
+    the result.
+
+    An earlier version asserted "nothing is tampered with here", which is a
+    fact about one desktop and not about the code. CI disproved it the honest
+    way: the GitHub Windows runner excludes `C:\\` and `D:\\` from Defender
+    entirely, and the scan reported both — correctly.
+    """
+    kinds = {"defender-exclusion", "defender-disabled", "hosts-blackhole",
+             "defender-unreadable"}
+    for f in tamper.scan():
+        assert f.kind in kinds, f.kind
+        assert 0 <= f.score <= 100
+        assert f.detail and f.where
+        assert isinstance(f.labels, list)
+
+
+def test_an_exclusion_covering_a_whole_drive_scores_high(monkeypatch):
+    """What the CI runner turned out to have: the entire drive excluded."""
+    monkeypatch.setattr(tamper, "_defender_exclusions", lambda: ["C:\\"])
+    monkeypatch.setattr(tamper, "_defender_disabled", lambda: [])
+    monkeypatch.setattr(tamper, "_read", lambda p: "")
+    found = tamper.scan()
+    assert found[0].kind == "defender-exclusion" and found[0].score >= 70
+    assert any("whole drive" in label for label in found[0].labels)
 
 
 # == the remaining autostart locations =====================================
