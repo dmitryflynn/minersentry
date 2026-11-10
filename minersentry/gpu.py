@@ -160,6 +160,22 @@ def _sample_nvidia_ctx() -> set[int]:
 
 
 
+def pmon_is_usable(text: str) -> bool:
+    """True if `nvidia-smi pmon` actually ran and produced its table.
+
+    An idle GPU gives a valid header and no compute rows, which is an ANSWER
+    ("nothing is computing"), not a failure. Treating it as a failure sent
+    every sample on to `typeperf`, costing seconds for a counter set that
+    reports nothing for NVIDIA anyway.
+    """
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            fields = line.split()
+            if all(key in fields for key in ("gpu", "pid", "type", "sm")):
+                return True
+    return False
+
+
 def parse_nvidia_pmon(text: str) -> dict[int, float]:
     """Read per-process SM utilization, keeping the busiest GPU for each PID.
 
@@ -229,8 +245,11 @@ def _sample_windows(compute_ctx: set[int]) -> dict[int, float]:
     """
     util: dict[int, float] = {}
     text = _run(["nvidia-smi", "pmon", "-s", "u", "-c", "1"], timeout=20.0)
-    if text:
-        util = parse_nvidia_pmon(text)
+    if pmon_is_usable(text):
+        # pmon answered, so skip PDH entirely: `typeperf -sc 2` costs a couple
+        # of seconds every sample and reports nothing useful for NVIDIA. An
+        # empty map here means "nothing is computing", which is an answer.
+        return parse_nvidia_pmon(text)
     for pid, value in _sample_pdh(compute_ctx).items():
         util.setdefault(pid, value)
     return util

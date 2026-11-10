@@ -26,9 +26,40 @@ from .config import Config
 from .scoring import (
     Signal, combine, is_miner_name, name_stem, score_cpu, score_dataset,
     score_cmdline, score_gpu, score_memory, score_name, score_network, score_perf,
+    score_stealth,
     score_swarm,
     score_probe,
 )
+
+
+def _parent_name_map(procs, wanted: dict) -> dict[int, str]:
+    """{pid: parent process name} for the processes that have a parent rule.
+
+    `Process.parent()` is used rather than looking up `ppid()` ourselves,
+    because it checks that the parent started BEFORE the child and returns
+    None when the recorded parent PID has since been recycled. Doing the
+    lookup by hand reported whatever process later took that number: on a CI
+    runner that turned csrss.exe — whose parent smss.exe exits after boot —
+    into a parent anomaly. A parent that cannot be identified is unknown, not
+    wrong, so it is left out entirely.
+
+    Only the few processes with a rule are looked up, so this costs a handful
+    of calls per pass rather than one per process.
+    """
+    out: dict[int, str] = {}
+    for p, _raw in procs:
+        if (p.info.get("name") or "").lower() not in wanted:
+            continue
+        try:
+            parent = p.parent()
+            if parent is None:
+                continue
+            name = parent.name()
+        except Exception:  # noqa: BLE001 - an exited parent is not evidence
+            continue
+        if name:
+            out[p.pid] = name.lower()
+    return out
 
 
 def _own_code_roots() -> tuple[str, ...]:
@@ -111,6 +142,12 @@ class Engine:
         # for a miner written in Python but removed what used to cover this.
         self._own_code_roots = _own_code_roots()
         self._own_tooling: set[int] = set()
+        self._expected_parent = {}
+        for pair in self.cfg.expected_parents:
+            child, _, parent = pair.partition(":")
+            if child and parent:
+                self._expected_parent[child.strip().lower()] = parent.strip().lower()
+        self._parent_names: dict[int, str] = {}
         self._mem_cache: dict[int, memscan.MemScanResult] = {}  # from deep scans
         # Per-PID metadata cache (refresh the process name on every pass).
         # Recomputing exe()/username()/Authenticode every
@@ -322,6 +359,7 @@ class Engine:
             score_perf(self._perf_ratio.get(info.pid), cfg),
             self._cmdline_signal(info.pid),
             score_swarm(*self._swarm.get(info.pid, (0, 0.0)), cfg),
+            score_stealth(self._stealth_reasons(info), cfg),
         ]
 
     def _swarm_map(self, procs) -> dict[int, tuple[int, float]]:
@@ -350,6 +388,53 @@ class Engine:
             for pid, _raw in members:
                 out[pid] = (len(members), cores)
         return out
+
+    def _stealth_reasons(self, info: ProcInfo) -> list[tuple[str, int]]:
+        """Concealment tells for one process. Cheap: no new syscalls per pass."""
+        cfg = self.cfg
+        if not cfg.stealth_enabled:
+            return []
+        reasons: list[tuple[str, int]] = []
+        exe = info.exe or ""
+        if exe:
+            lowered = exe.lower()
+            if lowered.startswith("memfd:") or lowered.endswith(" (deleted)"):
+                reasons.append(("image was never on disk (memfd)", cfg.stealth_memfd_image))
+            elif os.path.isabs(exe) and not os.path.isfile(exe):
+                # Deleted, renamed or moved while running. Windows locks a
+                # running image against deletion but not against a rename, and
+                # the path recorded when the process was first seen then points
+                # at nothing - which is the tell either way.
+                # Kernel pseudo-processes (Registry, MemCompression) report a
+                # bare name rather than a path, so the isabs test excludes them.
+                reasons.append(("the image it started from is gone from that path",
+                                cfg.stealth_deleted_image))
+        result = info.mem_result
+        if result is not None and getattr(result, "injected_hits", 0):
+            reasons.append(("miner strings in unbacked executable memory",
+                            cfg.stealth_injected_strings))
+        if info.name.startswith("[") and info.name.endswith("]") and exe:
+            reasons.append(("pretending to be a kernel thread",
+                            cfg.stealth_kernel_masquerade))
+        parent = self._parent_anomaly(info)
+        if parent:
+            reasons.append((parent, cfg.stealth_parent_anomaly))
+        return reasons
+
+    def _parent_anomaly(self, info: ProcInfo) -> str:
+        """Report a process whose parent is not the only one it should have.
+
+        Only processes with exactly one legitimate parent are listed in
+        `expected_parents`; a parent that has already exited is unknown, not
+        wrong, so re-parenting is never treated as evidence.
+        """
+        expected = self._expected_parent.get(info.name.lower())
+        if not expected:
+            return ""
+        actual = self._parent_names.get(info.pid)
+        if not actual or actual == expected:
+            return ""
+        return f"{info.name} started by {actual}, not {expected}"
 
     def _cmdline_signal(self, pid: int) -> Signal:
         hits = self._cmd_hits.get(pid) or []
@@ -384,14 +469,17 @@ class Engine:
         Reading arguments costs ~0.1 ms, and they are fixed for a PID's
         lifetime, so this runs once per PID. Only labels are stored.
         """
-        if not self.cfg.cmdline_enabled:
-            return []
         try:
             argv = proc.cmdline()
         except Exception:  # noqa: BLE001 - telemetry must never break a scan
             return []        # other-user/protected processes need admin
+        # Recognising our OWN tooling is not part of the cmdline signal and
+        # must not switch off with it: a second process running MinerSentry
+        # holds the marker table in memory and convicts itself otherwise.
         if self._own_code_roots and self._runs_our_code(argv):
             self._own_tooling.add(proc.pid)
+        if not self.cfg.cmdline_enabled:
+            return []
         hits = cmdline_mod.indicators(argv, self.cfg)
         del argv             # don't keep the raw arguments around
         return hits
@@ -589,6 +677,8 @@ class Engine:
             self._cpu_hist[p.pid].append((now, raw))
         self._big_mem_pids = big_mem
         self._swarm = self._swarm_map(procs)
+        if self._expected_parent:
+            self._parent_names = _parent_name_map(procs, self._expected_parent)
 
         if deep:
             self.last_scan_errors = 0

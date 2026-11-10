@@ -64,6 +64,7 @@ desktop and stays quiet on a cloud host; see [Profiles](#profiles-desktop-and-cl
 | **name** | Known miner binary names and execution from suspicious directories (Temp, ProgramData, roaming on Windows; /tmp, /dev/shm, /var/tmp on Linux). |
 | **probe** | The **evasion probe** (see below). |
 | **cmdline** | Mining indicators in a process's **arguments**: a `stratum://` URL, a known pool host, a wallet address, an algorithm (`rx/0`, `kawpow`), and miner-only flags (`--donate-level`, `--randomx-1gb-pages`). A miner can rename its binary and strip its strings, but it still has to be told where to send the money. Generic flags every CLI uses (`-o`, `-u`, `-t`, `--tls`) are capped below the hard-evidence line, so they corroborate but can never convict. Only the matched **labels** are kept, never the command line: wallets, passwords and worker names are read and discarded. |
+| **stealth** | Signs a process is hiding what it is: miner strings sitting in **unbacked executable memory** (code with no file behind it), an image that is gone from the path it started from, a `memfd`-backed binary, a kernel-thread name masquerade, or an unexpected parent for a process that has only one legitimate parent. Hiding is not mining, so this convicts only beside the work or a miner-specific artifact. |
 | **swarm** | Load summed **per executable**, not per process. Twenty copies of one unsigned binary at a quarter core each duck every per-process floor while mining five cores; judged together they don't. Only untrusted executables are grouped, so a browser's renderers are not a swarm, and like cpu/gpu it needs miner-specific corroboration to convict. |
 | **autostart** | Run keys, startup folders, services, scheduled tasks (Windows); cron, systemd units, shell profiles (Linux). Every other signal judges a process that is already running — this is the one that finds a miner *installed but not started*, which is how practically every real cryptojacker survives a reboot. Entries are scored with the same evidence as processes: command-line indicators, a known miner name, a drop location, an unsigned binary. |
 | **perf** *(Linux)* | Per-process **cache-misses-per-instruction** via user-mode `perf_event_open`. RandomX's random reads across its ~2 GB dataset produce an order-of-magnitude higher miss rate than ordinary compute — a fingerprint of the algorithm visible even when the miner is CPU-capped. Degrades to a no-op where `perf_event_paranoid` forbids it. |
@@ -403,6 +404,16 @@ depends on remembering what was done:
 Suspending your own processes needs no privileges. Firewall rules and moving a
 file out of a system directory need Administrator, and the actions say so rather
 than failing obscurely.
+
+## Weakened defences
+
+Before a miner settles in it clears the way, so `--autostart` and
+`--autostart-only` also report what has been done to the machine's defences:
+an antivirus **exclusion** covering a folder (far more strongly when MinerSentry
+has already flagged something inside it), real-time protection switched off by
+policy, and `hosts` entries that point antivirus or update domains at nowhere.
+Where the exclusion list needs Administrator to read, it says so instead of
+reporting that nothing is excluded.
 
 ## Configuration
 

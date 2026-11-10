@@ -322,7 +322,10 @@ def test_windows_sampler_prefers_pmon_over_pdh(monkeypatch):
     monkeypatch.setattr(gpu_mod, "_sample_pdh", lambda ctx: {888: 12.0})
     util = gpu_mod._sample_windows({777})
     assert util[777] == 91.0          # pmon wins where it reports
-    assert util[888] == 12.0          # PDH still fills in the rest
+    # PDH is skipped entirely once pmon has answered: `typeperf -sc 2` costs a
+    # couple of seconds per sample and reports nothing useful for NVIDIA.
+    # The fallback is covered by test_review_fixes.py.
+    assert 888 not in util
 
 
 def test_gpu_load_sample_is_importable_and_honest_about_missing_opencl(monkeypatch):
