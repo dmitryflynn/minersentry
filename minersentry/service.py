@@ -155,8 +155,10 @@ def run(cfg: Config | None = None, once: bool = False,
         if cfg.persistence_enabled and cfg.persistence_interval > 0 and now >= next_persist:
             next_persist = now + cfg.persistence_interval
             try:
+                current = set()
                 for e in persist_mod.scan(cfg):
                     key = f"{e.kind}:{e.location}:{e.name}"
+                    current.add(key)
                     if key in seen_autostart:
                         continue
                     seen_autostart.add(key)
@@ -167,6 +169,10 @@ def run(cfg: Config | None = None, once: bool = False,
                     if alert:
                         notify("MinerSentry: miner-like autostart entry",
                                f"{e.summary} (score {e.score}/100)", cfg)
+                # Forget entries that are gone, so one that is RE-CREATED
+                # alerts again. A miner that rewrites its Run key after you
+                # delete it is exactly what a watcher should keep saying.
+                seen_autostart &= current
             except Exception as e:  # noqa: BLE001
                 log.event(f"autostart scan: {type(e).__name__}: {e}")
         # Tamper check: if our own autostart entry disappears while we are

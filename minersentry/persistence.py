@@ -54,6 +54,10 @@ class PersistEntry:
     name: str                 # the entry's own name
     command: str              # the command line it runs
     exe: str = ""             # the executable, extracted from the command
+    # The file this entry IS, when that differs from what it runs. A shortcut
+    # in the Startup folder is the .lnk; the command is its target. Removing
+    # the entry must touch the .lnk, never the application it points at.
+    file: str = ""
     score: int = 0
     labels: list[str] = field(default_factory=list)
 
@@ -177,6 +181,7 @@ def parse_schtasks_csv(text: str) -> list[PersistEntry]:
     rows are matched on the header columns rather than position.
     """
     out: list[PersistEntry] = []
+    seen: set[tuple[str, str]] = set()
     header: list[str] | None = None
     for row in csv.reader(io.StringIO(text)):
         if not row or not any(c.strip() for c in row):
@@ -193,6 +198,11 @@ def parse_schtasks_csv(text: str) -> list[PersistEntry]:
             continue
         if d.get("Scheduled Task State", "").lower() == "disabled":
             continue
+        # One row per TRIGGER: a task that runs at logon and on a schedule is
+        # listed several times, identically. Report the task once.
+        if (name, command) in seen:
+            continue
+        seen.add((name, command))
         out.append(PersistEntry(kind="scheduled-task", location=name,
                                 name=ntpath.basename(name) or name,
                                 command=command, exe=command_exe(command)))
@@ -290,7 +300,7 @@ def _collect_windows(cfg: Config) -> list[PersistEntry]:
             if os.path.isdir(item) or base.lower() == "desktop.ini":
                 continue
             entry = PersistEntry(kind="startup-folder", location=folder,
-                                 name=base, command=item, exe=item)
+                                 name=base, command=item, exe=item, file=item)
             if base.lower().endswith(".lnk"):
                 entry.exe = ""      # the shortcut's TARGET is what runs
                 links.append(entry)
@@ -383,7 +393,24 @@ def _resolve_shortcuts(links: list[PersistEntry]) -> None:
             e.exe = command_exe(command)
 
 
-def parse_task_xml(text: str, path: str, visible: bool) -> list[PersistEntry]:
+def task_name_from_path(path: str, tasks_root: str) -> str:
+    r"""The scheduler's name for a task file: \Folder\Name. Pure.
+
+    schtasks identifies a task by that name, not by its file. Passing the bare
+    file name instead would miss a task in a folder - or, worse, match a
+    DIFFERENT task with the same leaf name at the root and delete that one.
+    """
+    try:
+        relative = os.path.relpath(path, tasks_root)
+    except ValueError:
+        return "\\" + os.path.basename(path)
+    if relative.startswith(".."):
+        return "\\" + os.path.basename(path)
+    return "\\" + relative.replace("/", "\\")
+
+
+def parse_task_xml(text: str, path: str, visible: bool,
+                   task_name: str = "") -> list[PersistEntry]:
     """Parse a Windows task XML file into entries. Pure.
 
     Reading the task files directly matters because `schtasks` only lists tasks
@@ -422,13 +449,23 @@ def parse_task_xml(text: str, path: str, visible: bool) -> list[PersistEntry]:
         full = f'"{command}" {arguments}'.strip() if arguments else command
         out.append(PersistEntry(
             kind="scheduled-task" if visible else "hidden-task",
-            location=path, name=name, command=full, exe=command_exe(full)))
+            location=task_name or path, name=name, command=full,
+            exe=command_exe(full), file=path))
     return out
 
 
-def _collect_task_files(visible_names: set[str]) -> list[PersistEntry]:
-    """Scheduled tasks read from their XML on disk (needs Administrator)."""
-    root = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "Tasks")
+def tasks_root() -> str:
+    return os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "Tasks")
+
+
+def _collect_task_files(visible_names: set[str], root: str | None = None
+                        ) -> list[PersistEntry]:
+    """Scheduled tasks read from their XML on disk (needs Administrator).
+
+    `root` is injectable so this can be tested against a directory that is not
+    the real one.
+    """
+    root = root or tasks_root()
     out: list[PersistEntry] = []
     for dirpath, _dirs, files in os.walk(root):
         for fname in files:
@@ -436,8 +473,12 @@ def _collect_task_files(visible_names: set[str]) -> list[PersistEntry]:
             text = _read(path)
             if not text.lstrip().startswith("<"):
                 continue
-            visible = fname.lower() in visible_names
-            out += parse_task_xml(text, path, visible)
+            name = task_name_from_path(path, root)
+            # A task the scheduler already listed is not reported twice: the
+            # file walk exists to find the ones it did NOT list.
+            if fname.lower() in visible_names or name.lower() in visible_names:
+                continue
+            out += parse_task_xml(text, path, False, name)
     return out
 
 
@@ -798,7 +839,10 @@ def remove_entry(entry: PersistEntry) -> "quarantine.Result":
     if kind in ("run-key", "ifeo-debugger", "appinit-dll", "winlogon"):
         return _remove_registry_value(entry)
     if kind == "startup-folder":
-        return quarantine.quarantine_file(entry.command)
+        # entry.file is the item in the Startup folder. For a shortcut the
+        # command is its TARGET, and quarantining that would move the
+        # legitimate application instead of the shortcut.
+        return quarantine.quarantine_file(entry.file or entry.command)
     if kind in ("scheduled-task", "hidden-task"):
         return _remove_task(entry)
     if kind in ("service", "service-dll"):

@@ -469,14 +469,17 @@ class Engine:
         Reading arguments costs ~0.1 ms, and they are fixed for a PID's
         lifetime, so this runs once per PID. Only labels are stored.
         """
-        if not self.cfg.cmdline_enabled:
-            return []
         try:
             argv = proc.cmdline()
         except Exception:  # noqa: BLE001 - telemetry must never break a scan
             return []        # other-user/protected processes need admin
+        # Recognising our OWN tooling is not part of the cmdline signal and
+        # must not switch off with it: a second process running MinerSentry
+        # holds the marker table in memory and convicts itself otherwise.
         if self._own_code_roots and self._runs_our_code(argv):
             self._own_tooling.add(proc.pid)
+        if not self.cfg.cmdline_enabled:
+            return []
         hits = cmdline_mod.indicators(argv, self.cfg)
         del argv             # don't keep the raw arguments around
         return hits
