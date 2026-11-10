@@ -63,6 +63,8 @@ desktop and stays quiet on a cloud host; see [Profiles](#profiles-desktop-and-cl
 | **network** | Established TCP connections to stratum-typical pool ports, and — via bundled threat intel — connections to a **resolved known mining-pool IP on *any* port** (e.g. a pool on 443). Only pool stratum endpoints are listed, never pool websites, and any address in a shared CDN range (Cloudflare, Fastly) is dropped, since unrelated sites share it. A persisted connection scores higher than a transient one. |
 | **name** | Known miner binary names and execution from suspicious directories (Temp, ProgramData, roaming on Windows; /tmp, /dev/shm, /var/tmp on Linux). |
 | **probe** | The **evasion probe** (see below). |
+| **cmdline** | Mining indicators in a process's **arguments**: a `stratum://` URL, a known pool host, a wallet address, an algorithm (`rx/0`, `kawpow`), and miner-only flags (`--donate-level`, `--randomx-1gb-pages`). A miner can rename its binary and strip its strings, but it still has to be told where to send the money. Generic flags every CLI uses (`-o`, `-u`, `-t`, `--tls`) are capped below the hard-evidence line, so they corroborate but can never convict. Only the matched **labels** are kept, never the command line: wallets, passwords and worker names are read and discarded. |
+| **swarm** | Load summed **per executable**, not per process. Twenty copies of one unsigned binary at a quarter core each duck every per-process floor while mining five cores; judged together they don't. Only untrusted executables are grouped, so a browser's renderers are not a swarm, and like cpu/gpu it needs miner-specific corroboration to convict. |
 | **perf** *(Linux)* | Per-process **cache-misses-per-instruction** via user-mode `perf_event_open`. RandomX's random reads across its ~2 GB dataset produce an order-of-magnitude higher miss rate than ordinary compute — a fingerprint of the algorithm visible even when the miner is CPU-capped. Degrades to a no-op where `perf_event_paranoid` forbids it. |
 
 Alongside the per-process signals, a **hidden-compute** banner flags work the
@@ -91,6 +93,12 @@ can't trip it:
 - core saturation **+** a connection to a known mining pool
 - miner strings in memory **+** a long-lived connection on a stratum port
 - core saturation **+** a known miner binary name
+- a **swarm** of one binary **+** miner strings, mining arguments, a miner name,
+  a pool connection or the evasion reaction
+- **mining arguments** (pool URL / wallet / miner-only flags) **+** any sustained
+  load, GPU compute, pool connection, resident strings or dataset. The arguments
+  already say what the process is for, so the bar on the behavioral side is low:
+  a miner throttled to a third of a core is still caught.
 - a process that **throttles under the evasion probe** while using the CPU
 - **GPU compute** saturation **+** miner strings / a known miner name / a pool connection
 
@@ -108,6 +116,25 @@ utility that just waits. It then watches which busy processes **collapse their
 CPU to near zero** while the decoys are alive and come back once they're gone.
 Legitimate software has no reason to react to a process monitor appearing; a
 process that goes quiet is self-incriminating.
+
+Two things that gave the decoys away are gone: the folder no longer carries a
+fixed `msentry_` prefix, and each decoy is accompanied by a real off-screen
+window with the matching title (`Task Manager`, `Process Explorer`, …), because
+plenty of evasive miners look for the window rather than the process. Those
+windows pump their messages — a window whose thread doesn't will hang any
+process that enumerates window titles, including the miner and real monitors.
+
+On systems where `sleep` is a multi-call binary (busybox, or coreutils built as
+one program) a renamed copy refuses to run — it reports `unknown program
+'htop'` — so there the decoy carries the monitor name in its command line while
+its process name stays the real tool's. Partial, and better than a probe whose
+decoys never started.
+
+MinerSentry is still the decoys' parent process, which a determined miner could
+check. Launching them through the shell hides that, but then they can only be
+found again by resolving their executable path, which some systems refuse —
+leaving decoys that cannot be confirmed or stopped. Being certain the decoys
+ran is worth more than hiding their parentage, so they are launched directly.
 
 Only the baseline looks at every process. The decoy phases re-measure just the
 processes that were busy, because walking all ~400 processes on a desktop took
@@ -305,6 +332,55 @@ signal **plus** a miner-specific artifact (resident stratum/XMRig strings, a
 known-pool connection, a ~2 GiB RandomX dataset, a miner name, or the evasion
 reaction), none of which legitimate software has.
 
+## Background monitoring
+
+Until you install it, MinerSentry only watches while its window is open, and
+only sees what you can see: on one desktop 170 of 352 processes refused to hand
+over their memory *or* their arguments to an unelevated scan, so those are
+judged on CPU shape alone.
+
+```bash
+minersentry-service --run          # watch in this terminal
+minersentry-service --install      # start at boot as SYSTEM/root (needs admin)
+minersentry-service --status
+minersentry-service --uninstall
+```
+
+Installing registers a scheduled task on Windows (`schtasks`, running as
+SYSTEM) or writes a systemd unit on Linux (running as root). That buys two
+things: coverage of processes you cannot otherwise read, and the only honest
+form of self-protection available — a miner running as you cannot kill a SYSTEM
+service, whereas a user-level watchdog it can kill is theatre.
+
+New detections raise a desktop notification (a Windows toast, falling back to
+`msg`; `notify-send` or `wall` on Linux) and always land in the detection log.
+`notify_min_verdict` chooses the bar (`Likely Miner` by default, or
+`Suspicious`), and `notify_command` runs your own command with the title and
+body instead.
+
+## Configuration
+
+Two files, deliberately not equal in authority:
+
+| File | Who can write it | What it may change |
+|---|---|---|
+| `%ProgramFiles%\MinerSentry\config.json` (`/etc/minersentry/config.json`) | Administrator / root only | everything |
+| `%LOCALAPPDATA%\MinerSentry\config.json` (`~/MinerSentry/config.json`) | the logged-in user, and so anything running as them | scan timing within bounds; **adding** miner names and pool ports |
+
+Anything running as the user can write the per-user file, malware included. One
+line there used to be enough to switch detection off — raise the verdict
+thresholds, or add `"trusted_dirs": ["C:\\"]` to trust the whole disk. So that
+file may now only make MinerSentry *more* suspicious, never less. Everything it
+tries to relax is ignored and reported in the event log (`config_warnings` in
+`--json`). Real tuning belongs in the admin file, which is honored only when it
+is genuinely protected: inside Program Files on Windows, root-owned and not
+group- or world-writable on Linux. `--config FILE` loads one file and trusts it
+fully, for testing.
+
+Every value is validated for type, range and shape. A malformed entry is skipped
+with a warning instead of raising mid-scan, which used to leave the CLI dead and
+the GUI stuck showing "Scan error".
+
 ## Limitations (honest ones)
 
 - GPU-compute scoring reads per-process utilization from the PDH "GPU Engine"
@@ -330,7 +406,27 @@ reaction), none of which legitimate software has.
   very start of a session is learned as normal. The VM/WSL check and every
   per-process signal still apply.
 - Full memory coverage of protected/other-user processes requires Administrator.
-- The memory scan reads a bounded slice of each process (48 MiB by default), and
+  Run `minersentry-service --install` for that coverage continuously.
+  The same applies to reading their **arguments**: on this desktop 166 of 357
+  processes would not hand them over unelevated, so a miner running as another
+  user (or as SYSTEM) is judged on behavior alone until you elevate.
+- MinerSentry recognizes itself by PID, and by its own file path when running as
+  the packaged `.exe`. It used to skip anything *named* `MinerSentry.exe`, which
+  meant a miner could disappear from the scan by taking that name.
+- Content scanning runs at roughly 20 MiB/s (dozens of substring searches per
+  chunk; a single compiled regex over the same literals measured ~7x slower, so
+  it stays as it is). A process at or below 128 MiB is therefore scanned
+  **completely**, which is what a miner's own footprint looks like, while larger
+  processes get a bounded budget spread across their regions. A miner that pads
+  itself past that limit and buries its strings in the gaps can still evade the
+  content scan — its dataset size, arguments, pool traffic and CPU shape don't
+  care. The ~2 GiB RandomX dataset is detected by region size and never read.
+- Connection age comes from the OS on Windows (`Get-NetTCPConnection`), so a
+  short scan can still tell an hours-old pool connection from a fresh one.
+  Linux exposes no connection age, so there "long-lived" means MinerSentry
+  watched it for `net_persist_seconds`; repeatedly reconnecting to the same
+  endpoint counts on both platforms.
+- The memory scan reads a bounded slice of large processes, and
   some regions fail to read. `--json` output includes a `memory_coverage` block
   per process (`bounded` or `partial`, bytes read, regions that failed) so a
   partial scan that found nothing isn't mistaken for a clean one.

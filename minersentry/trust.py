@@ -108,6 +108,12 @@ def _under(path: str, dirs: tuple[str, ...]) -> bool:
     return False
 
 
+def in_trusted_dir(exe: str, trusted_dirs: tuple[str, ...]) -> bool:
+    """True if `exe` lives under a system directory. Pure path logic, no
+    signature check, so callers can use it on every process every pass."""
+    return bool(exe) and _under(exe, trusted_dirs)
+
+
 def is_trusted(exe: str, trusted_dirs: tuple[str, ...],
                untrusted_hints: tuple[str, ...] = ()) -> bool:
     """Return True if `exe` is trusted enough to dampen its memory/name signals.

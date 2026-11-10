@@ -10,12 +10,17 @@ appearing; a process that quiets down is self-incriminating.
 
 from __future__ import annotations
 
+import ctypes
 import os
+import secrets
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+
+from ctypes import wintypes
 
 import psutil
 
@@ -26,6 +31,16 @@ _DECOY_LIFETIME = 30      # decoys outlive the measurement; we kill them after
 DEFAULT_DECOYS_WINDOWS = ("taskmgr.exe", "procexp64.exe", "ProcessHacker.exe",
                           "SystemInformer.exe", "perfmon.exe", "resmon.exe")
 DEFAULT_DECOYS_POSIX = ("htop", "top", "nvtop", "btop")
+
+# Window titles the matching monitor really shows, for title-based checks.
+WINDOW_TITLES = {
+    "taskmgr.exe": "Task Manager",
+    "procexp64.exe": "Process Explorer",
+    "processhacker.exe": "Process Hacker",
+    "systeminformer.exe": "System Informer",
+    "perfmon.exe": "Performance Monitor",
+    "resmon.exe": "Resource Monitor",
+}
 
 
 def _processes() -> dict[int, psutil.Process]:
@@ -53,46 +68,206 @@ def _sample_cpu(procs: dict[int, psutil.Process], interval: float) -> dict[int, 
     return out
 
 
-def _spawn_decoys(names: tuple[str, ...]) -> tuple[list[subprocess.Popen], str | None, str | None]:
+def decoy_processes(procs: list[subprocess.Popen], tmpdir: str | None
+                    ) -> list[psutil.Process]:
+    """Live decoys, found by handle where we have one and by path otherwise.
+
+    A directly launched decoy is already proven alive by its own handle. Only a
+    DETACHED decoy has to be found by the folder it runs from, and resolving a
+    process's executable path is not something every platform will do for us.
+    """
+    out: list[psutil.Process] = []
+    seen: set[int] = set()
+    for d in procs:
+        if d.poll() is None:
+            try:
+                out.append(psutil.Process(d.pid))
+                seen.add(d.pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    if tmpdir:
+        for p in _decoys_under(tmpdir):
+            if p.pid not in seen:
+                out.append(p)
+    return out
+
+
+def decoy_label(p: psutil.Process) -> str:
+    """The monitor name a decoy presents: its process name, or its argv[0].
+
+    Where a waiting binary cannot be renamed (see `_launch_variants`), the
+    decoy name lives in the command line while the process name stays the real
+    tool's, so both places have to be consulted to identify our own decoys.
+    """
+    try:
+        name = p.name()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return ""
+    try:
+        argv = p.cmdline() or []
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        argv = []
+    if argv:
+        first = os.path.basename(argv[0])
+        if first and first != name:
+            return first
+    return name
+
+
+def _wait_for_decoys(procs: list[subprocess.Popen], tmpdir: str, want: int,
+                     timeout: float = 8.0) -> bool:
+    deadline = time.time() + timeout
+    while True:
+        if len(decoy_processes(procs, tmpdir)) >= want:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def _spawn_decoys(names: tuple[str, ...], detach: bool = False
+                  ) -> tuple[list[subprocess.Popen], str | None, str | None]:
     """Spawn one harmless waiting process per decoy name, all at once.
 
-    Each is a copy of a stock utility (ping on Windows, sleep on Linux) saved
-    under the name of a monitoring tool, so Process.name() reports e.g.
-    "taskmgr.exe" or "ProcessHacker.exe" to a miner checking the process list.
-    Nothing real is touched, and no Python interpreter is needed. The decoys
-    are told to wait far longer than the probe needs; the caller kills them."""
-    tmpdir = tempfile.mkdtemp(prefix="msentry_")
+    Each is a copy of a stock utility (ping on Windows, sleep elsewhere) saved
+    under the name of a monitoring tool, so the process list reports e.g.
+    "taskmgr.exe" or "ProcessHacker.exe" to a miner reading it. Nothing real is
+    touched and no Python interpreter is needed.
+
+    The folder name is random: a fixed "msentry_" prefix let a miner ignore any
+    process running from a path containing it.
+
+    Each decoy is launched directly, so we hold a handle to it and can prove it
+    started and stop it again on any platform. Detaching through the shell
+    (`detach=True`) hides that MinerSentry is the parent, but then the decoys
+    can only be found by resolving their executable path, which some systems
+    refuse — leaving decoys that cannot be confirmed or killed. Being certain
+    of the decoys matters more than hiding their parentage, so detaching is off
+    by default and the parent tell is documented instead.
+    """
+    tmpdir = tempfile.mkdtemp(prefix=secrets.token_hex(4) + "-")
     creation = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
     if sys.platform == "win32":
         sysroot = os.environ.get("SystemRoot", r"C:\Windows")
-        sources = [(os.path.join(sysroot, "System32", "PING.EXE"),
-                    ["-n", str(_DECOY_LIFETIME), "127.0.0.1"])]
+        sources = [os.path.join(sysroot, "System32", "PING.EXE")]
+        wait_args = ["-n", str(_DECOY_LIFETIME), "127.0.0.1"]
+        tool = "ping"
     else:
-        sources = [("/bin/sleep", [str(_DECOY_LIFETIME)]),
-                   ("/usr/bin/sleep", [str(_DECOY_LIFETIME)])]
-    src_args = next(((s, a) for s, a in sources if os.path.exists(s)), None)
-    if src_args is None:
+        sources = ["/bin/sleep", "/usr/bin/sleep"]
+        wait_args = [str(_DECOY_LIFETIME)]
+        tool = "sleep"
+    src = next((c for c in sources if os.path.exists(c)), None)
+    if src is None:
         return [], tmpdir, "no suitable decoy binary found"
-    src, args = src_args
-    procs: list[subprocess.Popen] = []
+
+    paths: list[str] = []
     last_err = None
     for name in names:
         # one subfolder per decoy so each keeps its exact image name
-        path = os.path.join(tmpdir, str(len(procs)), name)
+        path = os.path.join(tmpdir, str(len(paths)), name)
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             shutil.copy2(src, path)
-            procs.append(subprocess.Popen(
-                [path, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL, creationflags=creation))
+            paths.append(path)
         except Exception as e:  # noqa: BLE001 - probe must never crash the app
             last_err = f"{type(e).__name__}: {e}"
-    if not procs:
-        return [], tmpdir, last_err or "could not start any decoy"
-    return procs, tmpdir, None
+    if not paths:
+        return [], tmpdir, last_err or "could not copy a decoy"
+
+    procs: list[subprocess.Popen] = []
+    for argv0, extra, use_copy in _launch_variants(tool, names):
+        for p in decoy_processes(procs, tmpdir):
+            try:
+                p.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        procs = []
+        for path, name in zip(paths, names):
+            # argv[0] is passed separately from the file being executed: see
+            # _launch_variants for why each combination is worth trying.
+            image = path if use_copy else src
+            argv = [argv0 or (path if use_copy else name), *extra, *wait_args]
+            try:
+                procs.append(subprocess.Popen(
+                    argv, executable=image, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                    creationflags=creation))
+            except Exception as e:  # noqa: BLE001
+                last_err = f"{type(e).__name__}: {e}"
+        if _wait_for_decoys(procs, tmpdir, len(paths), timeout=4.0):
+            # Being visible is not enough: a wrong argument list dies a moment
+            # later, which would otherwise look like a working decoy for
+            # exactly as long as it takes to check.
+            time.sleep(0.4)
+            if len(decoy_processes(procs, tmpdir)) >= len(paths):
+                return procs, tmpdir, None
+    return procs, tmpdir, last_err or _why_not_started(
+        procs, src, paths[0] if paths else None, wait_args)
 
 
-def _stop_decoys(procs: list[subprocess.Popen]) -> None:
+def _launch_variants(tool: str, names: tuple[str, ...]
+                     ) -> list[tuple[str | None, list[str], bool]]:
+    """(argv[0], extra args, use the renamed copy?) to try, in order.
+
+    On some systems /bin/sleep is a symlink into a MULTI-CALL binary (busybox,
+    or coreutils built as one program) that picks its tool from its own name. A
+    copy renamed "htop" is an unknown tool there and exits at once — observed
+    on a CI runner as `coreutils: unknown program 'htop'`.
+
+    So the renamed copy is tried first, then the ways of naming the tool
+    explicitly, and finally the original binary with argv[0] set to the decoy
+    name. That last one always runs, at the cost of showing the monitor name
+    only in the command line: the process name stays the real tool's. Partial,
+    and better than a probe whose decoys never started.
+    """
+    if sys.platform == "win32":
+        return [(None, [], True)]
+    return [(None, [], True),       # a normal single-purpose binary, renamed
+            (tool, [], True),       # multi-call: argv[0] names the tool
+            (None, [tool], True),   # busybox style: first argument names it
+            (None, [], False)]      # last resort: real binary, decoy argv[0]
+
+
+def _why_not_started(procs: list[subprocess.Popen], src: str,
+                     path: str | None = None, wait_args: list[str] | None = None) -> str:
+    """Say what actually happened to the decoys, not just that they are absent.
+
+    A probe that reports no evasion because its decoys never ran gives the same
+    answer as a clean machine, so the exit codes travel with the message — and,
+    when a copy is still on disk, whatever the copy itself printed.
+    """
+    codes = ["running" if d.poll() is None else str(d.poll()) for d in procs]
+    detail = ""
+    if path and os.path.exists(path):
+        try:
+            r = subprocess.run([path, *(wait_args or [])], capture_output=True,
+                               text=True, timeout=2)
+            msg = (r.stderr or r.stdout or "").strip().splitlines()
+            if msg:
+                detail = f"; it said: {msg[0][:160]}"
+        except subprocess.TimeoutExpired:
+            detail = "; it ran fine when started on its own"
+        except Exception as e:  # noqa: BLE001
+            detail = f"; rerun failed: {type(e).__name__}: {e}"
+    return (f"decoys exited immediately (copies of {src}; exit codes: "
+            f"{', '.join(codes) or 'none launched'}){detail}")
+
+
+def _decoys_under(tmpdir: str) -> list[psutil.Process]:
+    """Live processes running from `tmpdir` (our detached decoys)."""
+    root = os.path.normcase(os.path.realpath(tmpdir))
+    out = []
+    for p in psutil.process_iter(["exe"]):
+        try:
+            exe = p.info.get("exe") or ""
+            if exe and os.path.normcase(exe).startswith(root):
+                out.append(p)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return out
+
+
+def _stop_decoys(procs: list[subprocess.Popen], tmpdir: str | None = None) -> None:
     for d in procs:
         try:
             if d.poll() is None:
@@ -108,6 +283,85 @@ def _stop_decoys(procs: list[subprocess.Popen]) -> None:
                 d.wait(timeout=2)
             except Exception:  # noqa: BLE001
                 pass
+    if tmpdir:                  # detached decoys have no Popen handle
+        live = decoy_processes([], tmpdir)
+        for p in live:
+            try:
+                p.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        psutil.wait_procs(live, timeout=3)
+        for p in _decoys_under(tmpdir):
+            try:
+                p.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        psutil.wait_procs(_decoys_under(tmpdir), timeout=2)
+
+
+class _WindowDecoy:
+    """A real top-level window titled like a monitor, placed off-screen.
+
+    The process decoys only change the process LIST. Plenty of evasive miners
+    look for the window instead (FindWindow / EnumWindows on the title), and a
+    windowless decoy is invisible to those. This creates genuine visible
+    windows — positioned far off-screen so nothing flashes at the user — for
+    the length of the probe. Windows only; a no-op elsewhere.
+    """
+
+    def __init__(self, titles: tuple[str, ...]) -> None:
+        self.titles = titles
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self):
+        if sys.platform == "win32" and self.titles:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+            time.sleep(0.25)        # let the windows exist before we sample
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        return False
+
+    def _run(self) -> None:
+        try:
+            user32 = ctypes.windll.user32
+            user32.CreateWindowExW.restype = wintypes.HWND
+            user32.CreateWindowExW.argtypes = [
+                wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+            user32.DestroyWindow.argtypes = [wintypes.HWND]
+            hwnds = []
+            for title in self.titles:
+                # A plain STATIC control is a real top-level window, so no window
+                # class has to be registered.
+                hwnd = user32.CreateWindowExW(
+                    0x00000080,                      # WS_EX_TOOLWINDOW
+                    "STATIC", title,
+                    0x90000000,                      # WS_POPUP | WS_VISIBLE
+                    -32000, -32000, 200, 100,        # far off-screen
+                    None, None, None, None)
+                if hwnd:
+                    hwnds.append(hwnd)
+            # The messages MUST be pumped. GetWindowText on a window whose
+            # thread does not pump blocks the CALLER until it gives up, so a
+            # decoy without this loop freezes anything enumerating window titles
+            # — the miner we are probing, and any real monitor too.
+            msg = wintypes.MSG()
+            while not self._stop.is_set():
+                while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                    user32.TranslateMessage(ctypes.byref(msg))
+                    user32.DispatchMessageW(ctypes.byref(msg))
+                time.sleep(0.02)
+            for hwnd in hwnds:
+                user32.DestroyWindow(hwnd)
+        except Exception:  # noqa: BLE001 - never break the probe
+            pass
 
 
 def run_probe(window: float = PROBE_WINDOW, settle: float = SETTLE,
@@ -142,11 +396,14 @@ def run_probe(window: float = PROBE_WINDOW, settle: float = SETTLE,
     if err:
         _cleanup(tmpdir)
         return {}, f"Could not launch decoy: {err}"
+    titles = tuple(dict.fromkeys(WINDOW_TITLES.get(os.path.basename(d).lower(), "")
+                                 for d in decoys))
     try:
-        time.sleep(settle)
-        during = _sample_cpu(targets, max(0.5, window - settle - 0.8))  # decoys alive
+        with _WindowDecoy(tuple(t for t in titles if t)):
+            time.sleep(settle)
+            during = _sample_cpu(targets, max(0.5, window - settle - 0.8))
     finally:
-        _stop_decoys(procs)
+        _stop_decoys(procs, tmpdir)
         _cleanup(tmpdir)
     time.sleep(0.6)                                  # let a true evader resume
     after = _sample_cpu(targets, 1.0)                # decoys gone
@@ -183,11 +440,24 @@ def classify_drops(before: dict[int, float], during: dict[int, float],
     return out
 
 
-def _cleanup(tmpdir: str | None) -> None:
+def _cleanup(tmpdir: str | None, timeout: float = 5.0) -> None:
+    """Remove the decoy folder, retrying while the image is still locked.
+
+    Windows keeps a running executable's file locked, and a decoy that has
+    just been asked to exit may hold it for a moment longer, so a single
+    attempt silently leaves the folder behind.
+    """
     if not tmpdir:
         return
-    import shutil
-    try:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-    except Exception:  # noqa: BLE001
-        pass
+    deadline = time.time() + timeout
+    while True:
+        try:
+            shutil.rmtree(tmpdir)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if time.time() >= deadline:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                return
+            time.sleep(0.1)

@@ -39,6 +39,7 @@ def run_session(duration: float, cfg: Config | None = None,
     """
     e = Engine(cfg=cfg or Config.load(), gpu_only=gpu_only)
     e.start_pool_intel()
+    e.start_connection_ages()
     interval = interval if interval is not None else e.cfg.scan_interval
     start = time.time()
     first_hit: dict[int, float] = {}
@@ -129,6 +130,7 @@ def summarize(e: Engine, results: list[ProcInfo], first_hit: dict[int, float],
         "likely_miners": sum(1 for p in procs if p["verdict"] == "Likely Miner"),
         "suspicious": sum(1 for p in procs if p["verdict"] == "Suspicious"),
         "hidden_compute": {"flagged": rep.flagged, "note": rep.note},
+        "config_warnings": list(getattr(getattr(e, "cfg", None), "load_warnings", []) or []),
         "processes": procs,
     }
 
@@ -150,6 +152,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--profile", choices=("desktop", "cloud"), default=None,
                     help="desktop (default): a known miner name alone is Suspicious; "
                          "cloud: a name alone stays Clean until load corroborates it")
+    ap.add_argument("--config", type=str, default=None,
+                    help="load tuning from this JSON file (trusted fully); default is "
+                         "the admin config plus the restricted per-user config")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     args = ap.parse_args(argv)
 
@@ -157,7 +162,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"MinerSentry headless scan - {args.duration:.0f}s ...", file=sys.stderr)
     pid_set = set(args.pid) if args.pid else None
     try:
-        cfg = Config.load()
+        cfg = Config.load(args.config)
+        for w in cfg.load_warnings:
+            print(f"config: {w}", file=sys.stderr)
+        if args.duration < cfg.net_persist_seconds:
+            print(f"note: --duration {args.duration:.0f}s is shorter than "
+                  f"{cfg.net_persist_seconds:.0f}s, so a pool connection can't be "
+                  f"judged long-lived in this scan; it scores as weak evidence.",
+                  file=sys.stderr)
         if args.profile:
             cfg = replace(cfg, profile=args.profile)
         e, results, first_hit = run_session(args.duration, cfg=cfg, interval=args.interval,

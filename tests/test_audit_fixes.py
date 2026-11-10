@@ -150,19 +150,20 @@ def test_memory_result_kept_for_same_process(monkeypatch):
 
 # -- probe decoys --------------------------------------------------------------
 def test_decoys_carry_monitor_names_and_are_cleaned_up():
-    import psutil
     names = ("taskmgr.exe", "ProcessHacker.exe") if sys.platform == "win32" else ("htop", "nvtop")
     procs, tmpdir, err = probe._spawn_decoys(names)
     if err and "no suitable decoy" in err:
         pytest.skip(err)
     try:
-        assert err is None and len(procs) == 2
-        seen = {psutil.Process(p.pid).name() for p in procs}
-        assert seen == set(names)
+        assert err is None
+        live = probe.decoy_processes(procs, tmpdir)
+        seen = {probe.decoy_label(p) for p in live}
+        assert seen == set(names), seen
+        assert "msentry" not in os.path.basename(tmpdir).lower()  # no greppable prefix
     finally:
-        probe._stop_decoys(procs)
+        probe._stop_decoys(procs, tmpdir)
         probe._cleanup(tmpdir)
-    assert all(p.poll() is not None for p in procs)
+    assert probe.decoy_processes(procs, tmpdir) == []
     assert not os.path.exists(tmpdir)
 
 

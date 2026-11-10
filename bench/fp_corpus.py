@@ -138,7 +138,16 @@ def main() -> int:
     out_dir = os.path.dirname(os.path.abspath(__file__))
     _write(os.path.join(out_dir, "fp_results.md"),
            os.path.join(out_dir, "fp_results.csv"), rows, fps, susp, duration)
+    # A pass/fail count hides drift: a workload creeping from 10 to 44 is still
+    # "0 false positives" while sitting one point short of alarming. Report the
+    # margin so a change that quietly erodes it is visible here.
+    susp_at = next((t for t, label in Config().verdict_thresholds
+                    if label == "Suspicious"), 45)
+    worst = max(rows, key=lambda r: r["score"]) if rows else None
     print(f"\nFalse positives (Likely Miner on benign): {len(fps)} / {len(rows)}")
+    if worst:
+        print(f"Closest call: {worst['label']} scored {worst['score']}, "
+              f"{susp_at - worst['score']} below Suspicious ({susp_at})")
     print(f"Wrote {os.path.join(out_dir, 'fp_results.md')}")
     return 1 if fps else 0
 

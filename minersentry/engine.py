@@ -12,18 +12,22 @@ from __future__ import annotations
 
 import ntpath
 import os
+import sys
 import threading
 import time
 from collections import defaultdict, deque
 
 import psutil
 
+from . import cmdline as cmdline_mod
 from . import memscan, perfcounters, poolintel, power, trust
 from .audit import AuditLog
 from .config import Config
 from .scoring import (
     Signal, combine, is_miner_name, name_stem, score_cpu, score_dataset,
-    score_gpu, score_memory, score_name, score_network, score_perf, score_probe,
+    score_cmdline, score_gpu, score_memory, score_name, score_network, score_perf,
+    score_swarm,
+    score_probe,
 )
 
 
@@ -70,6 +74,10 @@ class Engine:
         self._probe_drops: dict[int, float] = {}
         self._warm: set[int] = set()
         self._self_pid = os.getpid()
+        # Only a frozen build has an exe of its own; under Python the interpreter
+        # is shared with unrelated scripts, so only our own PID is excluded.
+        self._self_exe = (os.path.normcase(os.path.realpath(sys.executable))
+                          if getattr(sys, "frozen", False) else "")
         self._mem_cache: dict[int, memscan.MemScanResult] = {}  # from deep scans
         # Per-PID metadata cache (refresh the process name on every pass).
         # Recomputing exe()/username()/Authenticode every
@@ -93,6 +101,12 @@ class Engine:
         self.system_cpu_pct = 0.0  # single-owner system CPU reading (0-100)
         # Network-connection persistence: (pid, ip, port) -> first-seen ts.
         self._conn_seen: dict[tuple[int, str, int], float] = {}
+        # Endpoint history that OUTLIVES a disconnect: {(pid, ip, port):
+        # [first_seen, reconnects]}. Dropping it on disconnect let a miner reset
+        # its own persistence clock by reconnecting.
+        self._conn_hist: dict[tuple[int, str, int], list] = {}
+        # Real connection ages from the OS (Windows), set by a background thread.
+        self._conn_ages: dict[tuple[int, str, int], float] = {}
         # Resolved known-mining-pool IPs (populated by a background thread via
         # start_pool_intel(); empty until then, so tests do no DNS).
         self._pool_ips: set[str] = set()
@@ -110,6 +124,14 @@ class Engine:
         self._big_mem_pids: set[int] = set()
         # Per-PID cache-miss-ratio from the Linux PMU (set during deep probes).
         self._perf_ratio: dict[int, float] = {}
+        # Mining indicators from each PID's arguments. Only the matched labels
+        # are kept (never the command line itself: it can hold wallets,
+        # passwords and tokens). Arguments don't change for a PID's lifetime,
+        # so this is resolved once per PID.
+        self._cmd_hits: dict[int, list] = {}
+        # Per-PID (sibling count, aggregate cores) for processes sharing one
+        # executable, recomputed each pass on the scan thread.
+        self._swarm: dict[int, tuple[int, float]] = {}
         self.audit = audit or AuditLog()
         self.last_scan_errors = 0  # memory OpenProcess failures last deep pass
         for p in (() if gpu_only else psutil.process_iter()):  # prime CPU baselines
@@ -138,9 +160,14 @@ class Engine:
         self._last_verdict.pop(pid, None)
         self._meta.pop(pid, None)
         self._perf_ratio.pop(pid, None)
+        self._cmd_hits.pop(pid, None)
         self._warm.discard(pid)
         for key in [k for k in self._conn_seen if k[0] == pid]:
             self._conn_seen.pop(key, None)
+        for key in [k for k in self._conn_hist if k[0] == pid]:
+            self._conn_hist.pop(key, None)
+        for key in [k for k in self._conn_ages if k[0] == pid]:
+            self._conn_ages.pop(key, None)
         with self._gpu_lock:
             self._gpu_hist.pop(pid, None)
             self._gpu_misses.pop(pid, None)
@@ -179,8 +206,15 @@ class Engine:
             if port not in self.cfg.pool_ports and not known_pool:
                 continue
             key = (pid, ip, port)
-            first = self._conn_seen.setdefault(key, now)
-            persisted = (now - first) >= self.cfg.net_persist_seconds
+            self._conn_seen.setdefault(key, now)
+            hist = self._conn_hist.get(key)
+            if hist is None:
+                # Prefer the OS's own creation time over "when we first saw it".
+                hist = [self._conn_ages.get(key, now), 0]
+                self._conn_hist[key] = hist
+            first, reconnects = hist[0], hist[1]
+            persisted = ((now - first) >= self.cfg.net_persist_seconds
+                         or reconnects >= self.cfg.net_reconnects_persist)
             hits.append((ip, port, port in self.cfg.common_legit_ports,
                          persisted, known_pool))
         return hits
@@ -231,7 +265,10 @@ class Engine:
         # behavioral signals (cpu/probe) untouched. Injection hosts (svchost,
         # explorer, ...) are never dampened: they have no business holding miner
         # strings, and they are exactly where an injected miner lives.
-        injection_host = name_stem(ntpath.basename(info.exe or info.name)) in cfg.injection_hosts
+        stem = name_stem(ntpath.basename(info.exe or info.name))
+        # Neither an injection host nor an interpreter gets its evidence
+        # dampened: the signed binary is the vehicle, not the thing we judge.
+        injection_host = stem in cfg.injection_hosts or stem in cfg.interpreter_hosts
         if (cfg.trusted_dampen < 1.0 and (mem_sig.score or name_sig.score)
                 and not injection_host and self._trusted(info)):
             if mem_sig.score:
@@ -249,7 +286,57 @@ class Engine:
             score_probe(self._probe_drops.get(info.pid, 0.0), cfg),
             score_dataset(large_dataset, cfg),
             score_perf(self._perf_ratio.get(info.pid), cfg),
+            self._cmdline_signal(info.pid),
+            score_swarm(*self._swarm.get(info.pid, (0, 0.0)), cfg),
         ]
+
+    def _swarm_map(self, procs) -> dict[int, tuple[int, float]]:
+        """Group this pass's processes by executable and give each member its
+        group's size and aggregate load.
+
+        Only untrusted executables are grouped: a browser legitimately runs
+        dozens of renderers, and that is not evidence of anything.
+        """
+        if not self.cfg.swarm_enabled:
+            return {}
+        groups: dict[str, list[tuple[int, float]]] = {}
+        for p, raw in procs:
+            if p.pid == self._self_pid or raw < self.cfg.swarm_min_each:
+                continue
+            meta = self._meta.get(p.pid)
+            exe = meta[1] if meta else ""
+            if not exe or trust.in_trusted_dir(exe, self.cfg.trusted_dirs):
+                continue
+            groups.setdefault(os.path.normcase(exe), []).append((p.pid, raw))
+        out: dict[int, tuple[int, float]] = {}
+        for members in groups.values():
+            if len(members) < self.cfg.swarm_min_procs:
+                continue
+            cores = sum(raw for _pid, raw in members) / 100.0
+            for pid, _raw in members:
+                out[pid] = (len(members), cores)
+        return out
+
+    def _cmdline_signal(self, pid: int) -> Signal:
+        hits = self._cmd_hits.get(pid) or []
+        return score_cmdline(cmdline_mod.score_of(hits, self.cfg.cmdline_generic_cap),
+                             cmdline_mod.labels(hits), self.cfg)
+
+    def _read_cmdline(self, proc: psutil.Process) -> list:
+        """Extract (and cache) argument indicators for one process.
+
+        Reading arguments costs ~0.1 ms, and they are fixed for a PID's
+        lifetime, so this runs once per PID. Only labels are stored.
+        """
+        if not self.cfg.cmdline_enabled:
+            return []
+        try:
+            argv = proc.cmdline()
+        except Exception:  # noqa: BLE001 - telemetry must never break a scan
+            return []        # other-user/protected processes need admin
+        hits = cmdline_mod.indicators(argv, self.cfg)
+        del argv             # don't keep the raw arguments around
+        return hits
 
     def _trusted(self, info: ProcInfo) -> bool:
         """Resolve (and cache) the trust flag on first need."""
@@ -270,7 +357,14 @@ class Engine:
             recent = [c for t, c in hist if now - t <= self.cfg.sustained_seconds]
             if recent and pid > 4 and pid != self._self_pid:
                 peak = max(recent)
-                if peak >= self.cfg.deep_cpu_floor:  # only busy processes
+                # A binary outside the system directories is scanned at a much
+                # lower bar: a capped miner sits under the normal floor on
+                # purpose. The check is a path test, so it costs nothing.
+                meta = self._meta.get(pid)
+                floor = self.cfg.deep_cpu_floor
+                if meta and not trust.in_trusted_dir(meta[1], self.cfg.trusted_dirs):
+                    floor = min(floor, self.cfg.deep_cpu_floor_untrusted)
+                if peak >= floor:
                     ranked.append((pid, peak))
         ranked.sort(key=lambda x: x[1], reverse=True)
         return [pid for pid, _ in ranked[:limit]]
@@ -319,6 +413,12 @@ class Engine:
                 _add(pid)
         for pid in list(self._big_mem_pids):            # ~2 GiB dataset, any CPU
             _add(pid)
+        for pid, hits in list(self._cmd_hits.items()):  # mining arguments, any CPU
+            if cmdline_mod.score_of(hits, self.cfg.cmdline_generic_cap) >= self.cfg.hard_cmdline:
+                _add(pid)
+        for pid, (n, cores) in list(self._swarm.items()):   # swarm member, low CPU each
+            if n >= self.cfg.swarm_min_procs and cores >= self.cfg.swarm_min_cores:
+                _add(pid)
         # Cap only the auto-discovered additions so the list can't grow without
         # bound, while always keeping the busy and explicitly-forced targets.
         capped = targets[:max(protected, max(1, limit) * 3)]
@@ -329,6 +429,8 @@ class Engine:
         pool = {pid for pid, _ip, _port in list(self._conn_seen)}
         named = {pid for pid, meta in list(self._meta.items())
                  if is_miner_name(meta[0], self.cfg) or is_miner_name(meta[1], self.cfg)}
+        named |= {pid for pid, hits in list(self._cmd_hits.items())
+                  if cmdline_mod.score_of(hits, self.cfg.cmdline_generic_cap) >= self.cfg.hard_cmdline}
         big = set(self._big_mem_pids)
         gpu = set(gpu_busy)
         # busy AND running from an odd place (Temp, ProgramData, very short name)
@@ -347,16 +449,28 @@ class Engine:
         if self.gpu_only and pid not in self.gpu_scope:
             raise ValueError(f"PID {pid} is outside the GPU-only scan scope")
         ctime = self._live_ctime(pid)
+        budget, region_cap = memscan.budget_for(
+            self._proc_private(pid), self.cfg.mem_max_bytes_per_proc,
+            self.cfg.mem_max_region_read, self.cfg.mem_full_scan_max_bytes)
         r = memscan.scan_process(
-            pid, budget_bytes=self.cfg.mem_max_bytes_per_proc,
-            max_region_read=self.cfg.mem_max_region_read,
+            pid, budget_bytes=budget,
+            max_region_read=region_cap,
             large_dataset_bytes=self.cfg.mem_large_dataset_bytes,
-            full_walk=pid in self._big_mem_pids)
+            full_walk=pid in self._big_mem_pids,
+            region_samples=self.cfg.mem_region_samples)
         # Deep scans run on a background thread and take seconds. Only keep the
         # result if the PID still belongs to the process we scanned.
         if self._same_process(pid, ctime):
             self._mem_cache[pid] = r
         return r
+
+    def _proc_private(self, pid: int) -> int:
+        """Committed private bytes (Windows) or RSS (Linux), 0 if unknown."""
+        try:
+            mi = psutil.Process(pid).memory_info()
+        except Exception:  # noqa: BLE001
+            return 0
+        return int(getattr(mi, "private", None) or getattr(mi, "rss", 0) or 0)
 
     def _live_ctime(self, pid: int) -> float | None:
         try:
@@ -416,6 +530,7 @@ class Engine:
                 continue
             self._cpu_hist[p.pid].append((now, raw))
         self._big_mem_pids = big_mem
+        self._swarm = self._swarm_map(procs)
 
         if deep:
             self.last_scan_errors = 0
@@ -473,6 +588,7 @@ class Engine:
                 except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
                     username = ""
                 meta = (name, exe, username, None)  # trust resolved lazily
+                self._cmd_hits[p.pid] = self._read_cmdline(p)
                 self._meta[p.pid] = meta
             live_name = p.info.get("name")
             if live_name and live_name != meta[0]:
@@ -480,8 +596,11 @@ class Engine:
                 self._meta[p.pid] = meta
             info.name, info.exe, info.username, info.trusted = meta
             info.ctime = self._ctime.get(p.pid)
-            if os.path.basename(info.exe).lower() == "minersentry.exe":
-                continue  # never flag ourselves
+            # Another instance of THIS installed binary (same file path) is us.
+            # Matching by file name let any miner rename itself MinerSentry.exe
+            # and vanish from the scan entirely.
+            if self._self_exe and info.exe and os.path.normcase(info.exe) == self._self_exe:
+                continue
 
             info.mem_result = self._mem_cache.get(p.pid)
             info.signals = self._build_signals(info, conn_map.get(p.pid, []), now)
@@ -531,6 +650,8 @@ class Engine:
             self._ctime.pop(dead, None)
         for dead in set(self._perf_ratio) - live_pids:
             self._perf_ratio.pop(dead, None)
+        for dead in set(self._cmd_hits) - live_pids:
+            self._cmd_hits.pop(dead, None)
         self._warm &= live_pids
         # Prune GPU history in place under the lock (reassigning the dict would
         # race the sampler thread's defaultdict insert -> "changed size" errors).
@@ -541,8 +662,13 @@ class Engine:
         # Drop first-seen timestamps for connections that have CLOSED, so a
         # process that later re-opens the same ip:port starts its persistence
         # clock fresh instead of inheriting a stale (already-"persisted") entry.
-        self._conn_seen = {k: v for k, v in self._conn_seen.items()
-                           if k in live_conns}
+        for key in set(self._conn_seen) - live_conns:
+            self._conn_seen.pop(key, None)
+            hist = self._conn_hist.get(key)
+            if hist is not None:
+                hist[1] += 1      # it dropped; the next sighting is a reconnect
+        self._conn_hist = {k: v for k, v in self._conn_hist.items()
+                           if k[0] in live_pids}
         # Recompute the deep-target snapshot here (on the scan thread, which owns
         # these dicts) so the GUI deep thread reads a stable list, never the live
         # dicts.
@@ -600,6 +726,26 @@ class Engine:
 
     def set_pool_ips(self, ips: set[str]) -> None:
         self._pool_ips = set(ips)
+
+    def start_connection_ages(self) -> None:
+        """Keep OS connection ages fresh on a background thread (Windows).
+
+        Without this, "long-lived" only ever means "we watched it long enough",
+        so a scan shorter than net_persist_seconds could never see a pool
+        connection that had already been up for hours.
+        """
+        if not (self.cfg.net_use_connection_age and sys.platform == "win32"):
+            return
+
+        def _loop():
+            while True:
+                try:
+                    self._conn_ages = poolintel.sample_connection_ages(time.time())
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(max(15.0, self.cfg.net_age_refresh_seconds))
+
+        threading.Thread(target=_loop, daemon=True).start()
 
     def start_pool_intel(self) -> None:
         """Start a background thread that resolves the known mining-pool domains

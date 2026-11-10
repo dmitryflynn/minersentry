@@ -65,8 +65,10 @@ PAGE_GUARD = 0x100
 PAGE_NOACCESS = 0x01
 
 # Ceiling for a memory score built only from generic cues (big mapping,
-# algorithm names, crypto constants). Kept below scoring's hard_memory (40).
-GENERIC_SCORE_CAP = 30
+# algorithm names, crypto constants). Below scoring's hard_memory (40) so they
+# can't convict, and below corrob_nonzero_score (25) so a hashing library's
+# Keccak/Blake2b constants don't even corroborate: every TLS stack has them.
+GENERIC_SCORE_CAP = 24
 
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
@@ -145,10 +147,15 @@ def _wide(marker: bytes) -> bytes:
 
 _WIDE_MARKERS = {m: _wide(m) for m in STRING_MARKERS}
 
-
 def _search_chunk(chunk: bytes, result: MemScanResult, seen: set[str]) -> None:
-    # bytes.lower() only touches ASCII letters, so the zero bytes of a UTF-16LE
-    # string survive and one lowered copy serves both encodings.
+    """Look for every marker in one chunk.
+
+    Deliberately plain `in` tests: each is C-level two-way search, and a single
+    compiled regex alternation over the same literals measured ~7x SLOWER
+    (Python's re has no Aho-Corasick, so it retries alternatives per position).
+    bytes.lower() only touches ASCII letters, so the zero bytes of a UTF-16LE
+    string survive and one lowered copy serves both encodings.
+    """
     lowered = chunk.lower()
     for marker, (label, weight) in STRING_MARKERS.items():
         if label in seen:
@@ -163,10 +170,58 @@ def _search_chunk(chunk: bytes, result: MemScanResult, seen: set[str]) -> None:
             result.hits.append(MemHit(label, weight, "binary", generic=True))
 
 
+def budget_for(private_bytes: int, cfg_budget: int, cfg_region: int,
+               full_scan_max: int) -> tuple[int, int]:
+    """(budget, per-region cap) for a process of this size.
+
+    Content scanning costs ~20 MiB/s (dozens of substring searches per chunk),
+    so a flat budget has to be small — and a small budget is exactly what let a
+    miner bury its pool URL deeper into one big allocation than the scan ever
+    read. A real miner's own footprint is modest (its ~2 GiB RandomX dataset is
+    detected by region SIZE, never read), so any process below `full_scan_max`
+    is covered completely instead of sampled. Browsers and IDEs, which are the
+    expensive ones, keep the bounded sampling.
+    """
+    if 0 < private_bytes <= full_scan_max:
+        whole = private_bytes + (8 * 1024 * 1024)   # slack for growth
+        return whole, whole
+    return cfg_budget, cfg_region
+
+
+def sample_offsets(region_size: int, max_total: int, samples: int) -> list[tuple[int, int]]:
+    """(offset, length) chunks to read inside one region, spread across it.
+
+    Reading only the first `max_total` bytes of every region meant a marker a
+    few MiB into a large allocation was invisible: a miner could bury its pool
+    URL past the read window of a single big buffer. The same byte budget is now
+    spread over several chunks across the region, so burying a string requires
+    hitting the gaps between samples rather than simply being deep.
+
+    A region no larger than the budget is read whole.
+    """
+    if region_size <= 0 or max_total <= 0:
+        return []
+    if samples <= 1 or region_size <= max_total:
+        return [(0, min(region_size, max_total))]
+    chunk = max(4096, max_total // samples)
+    if region_size <= chunk:
+        return [(0, region_size)]
+    span = region_size - chunk
+    step = span // (samples - 1)
+    out, last = [], None
+    for i in range(samples):
+        off = min(span, i * step)
+        if off == last:
+            break
+        out.append((off, chunk))
+        last = off
+    return out
+
+
 def scan_process(pid: int, budget_bytes: int = MAX_BYTES_PER_PROC,
                  max_region_read: int = MAX_REGION_READ,
                  large_dataset_bytes: int = LARGE_DATASET_BYTES,
-                 full_walk: bool = True) -> MemScanResult:
+                 full_walk: bool = True, region_samples: int = 4) -> MemScanResult:
     """Walk readable committed memory of `pid`, looking for miner fingerprints.
 
     Dispatches to the Windows (ReadProcessMemory) or Linux (/proc) backend.
@@ -182,16 +237,18 @@ def scan_process(pid: int, budget_bytes: int = MAX_BYTES_PER_PROC,
     """
     if IS_WINDOWS:
         return _scan_windows(pid, budget_bytes, max_region_read, large_dataset_bytes,
-                             full_walk)
+                             full_walk, region_samples)
     if IS_LINUX:
-        return _scan_linux(pid, budget_bytes, max_region_read, large_dataset_bytes)
+        return _scan_linux(pid, budget_bytes, max_region_read, large_dataset_bytes,
+                           region_samples)
     r = MemScanResult(pid=pid)
     r.error = "memory scan unsupported on this platform"
     return r
 
 
 def _scan_windows(pid: int, budget_bytes: int, max_region_read: int,
-                  large_dataset_bytes: int, full_walk: bool = True) -> MemScanResult:
+                  large_dataset_bytes: int, full_walk: bool = True,
+                  region_samples: int = 4) -> MemScanResult:
     result = MemScanResult(pid=pid)
     if pid <= 4:
         result.error = "system process"
@@ -227,17 +284,21 @@ def _scan_windows(pid: int, budget_bytes: int, max_region_read: int,
                 result.large_page_dataset = True
 
             if committed and readable and not guarded and result.bytes_scanned < budget_bytes:
-                to_read = min(region_size, max_region_read, budget_bytes - result.bytes_scanned)
-                read.value = 0
-                ok = _k32.ReadProcessMemory(handle, ctypes.c_void_p(base),
-                                            buf, to_read, ctypes.byref(read))
-                n = min(read.value, to_read)
-                if not ok or n < to_read:
-                    result.regions_failed += 1
-                if n:
-                    _search_chunk(buf.raw[:n], result, seen)
-                    result.bytes_scanned += n
-                    result.regions_scanned += 1
+                for off, want in sample_offsets(region_size, max_region_read, region_samples):
+                    left = budget_bytes - result.bytes_scanned
+                    if left <= 0:
+                        break
+                    to_read = min(want, left)
+                    read.value = 0
+                    ok = _k32.ReadProcessMemory(handle, ctypes.c_void_p(base + off),
+                                                buf, to_read, ctypes.byref(read))
+                    n = min(read.value, to_read)
+                    if not ok or n < to_read:
+                        result.regions_failed += 1
+                    if n:
+                        _search_chunk(buf.raw[:n], result, seen)
+                        result.bytes_scanned += n
+                        result.regions_scanned += 1
 
             next_addr = base + region_size
             if next_addr <= addr:
@@ -282,7 +343,7 @@ def maps_has_large_dataset(regions: list[tuple[int, int, str, str]],
 
 
 def _scan_linux(pid: int, budget_bytes: int, max_region_read: int,
-                large_dataset_bytes: int) -> MemScanResult:
+                large_dataset_bytes: int, region_samples: int = 4) -> MemScanResult:
     result = MemScanResult(pid=pid)
     if pid <= 0:
         result.error = "invalid pid"
@@ -318,19 +379,23 @@ def _scan_linux(pid: int, budget_bytes: int, max_region_read: int,
                 break  # budget spent; large_dataset flag already set from maps
             if "r" not in perms:
                 continue
-            to_read = min(end - start, max_region_read, budget_bytes - result.bytes_scanned)
-            try:
-                mem.seek(start)
-                data = mem.read(to_read)
-            except (OSError, ValueError, OverflowError):
-                result.regions_failed += 1
-                continue
-            if len(data) < to_read:
-                result.regions_failed += 1
-            if data:
-                _search_chunk(data, result, seen)
-                result.bytes_scanned += len(data)
-                result.regions_scanned += 1
+            for off, want in sample_offsets(end - start, max_region_read, region_samples):
+                left = budget_bytes - result.bytes_scanned
+                if left <= 0:
+                    break
+                to_read = min(want, left)
+                try:
+                    mem.seek(start + off)
+                    data = mem.read(to_read)
+                except (OSError, ValueError, OverflowError):
+                    result.regions_failed += 1
+                    continue
+                if len(data) < to_read:
+                    result.regions_failed += 1
+                if data:
+                    _search_chunk(data, result, seen)
+                    result.bytes_scanned += len(data)
+                    result.regions_scanned += 1
         result.scanned = True
         result.coverage_status = "partial" if result.regions_failed else "bounded"
         if result.regions_failed:

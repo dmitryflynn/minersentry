@@ -69,6 +69,7 @@ class MinerSentryApp:
         self.audit = AuditLog(on_event=lambda line: self.q.put(("event", line)))
         self.engine = Engine(audit=self.audit)
         self.engine.start_pool_intel()
+        self.engine.start_connection_ages()
         self.monitoring = False
         self.rows: dict[int, ProcInfo] = {}
         self.worker: threading.Thread | None = None
@@ -80,6 +81,8 @@ class MinerSentryApp:
         self._gpu_stop = threading.Event()
 
         self._build_ui()
+        for w in self.engine.cfg.load_warnings:   # e.g. a tampered per-user config
+            self.q.put(("event", "config: " + w))
         self._poll_queue()
         # Kick off an immediate first scan so the table isn't empty.
         self.start_monitor()

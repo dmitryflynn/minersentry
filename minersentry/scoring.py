@@ -209,6 +209,37 @@ def score_perf(miss_ratio: float | None, cfg: Config) -> Signal:
     return Signal("perf", 0, detail)
 
 
+def score_swarm(nprocs: int, cores: float, cfg: Config) -> Signal:
+    """Score many processes of ONE executable sharing a large aggregate load.
+
+    Per-process floors are easy to duck by splitting the work: twenty workers at
+    a quarter core each trip nothing while mining five cores. Load is summed per
+    executable instead. Like cpu/gpu this is work, not proof — build farms and
+    test runners look the same — so it stays out of the weighted blend and
+    convicts only next to something miner-specific.
+    """
+    if not cfg.swarm_enabled or nprocs < cfg.swarm_min_procs or cores < cfg.swarm_min_cores:
+        return Signal("swarm", 0, "no process swarm")
+    return Signal("swarm", cfg.swarm_score,
+                  f"{nprocs} processes of this binary using {cores:.1f} cores together")
+
+
+def score_cmdline(score: int, labels: list[str], cfg: Config) -> Signal:
+    """Score mining indicators found in a process's arguments.
+
+    A miner can rename its binary and strip its strings, but it still has to be
+    told where to send the money. `score` already carries the generic cap from
+    `cmdline.score_of`, so generic flags (-o/-u/-t, which every CLI uses) can
+    never reach the hard-evidence threshold on their own; a stratum URL, a known
+    pool host, a miner-only flag or a wallet can. Kept out of the weighted blend
+    like dataset/perf: it convicts through the conviction pairs, which require
+    the actual work alongside it.
+    """
+    if not labels:
+        return Signal("cmdline", 0, "no mining indicators in arguments")
+    return Signal("cmdline", min(100, score), "; ".join(labels[:4]))
+
+
 def combine(signals: list[Signal], cfg: Config) -> tuple[int, str]:
     """Blend signal scores into a final (score, verdict).
 
@@ -231,7 +262,9 @@ def combine(signals: list[Signal], cfg: Config) -> tuple[int, str]:
     # The blend may only pass the cap with a miner-specific artifact: hard
     # memory/probe evidence or a connection to a known pool. Everything else
     # (load, port numbers, big mappings) has to go through a conviction pair.
-    miner_artifact = hard_evidence or by.get("network", 0) >= cfg.net_score_known_pool
+    miner_artifact = (hard_evidence
+                      or by.get("network", 0) >= cfg.net_score_known_pool
+                      or by.get("cmdline", 0) >= cfg.hard_cmdline)
     if (not corroborated and not hard_evidence) or not miner_artifact:
         score = min(score, cfg.suspicious_cap)
 
@@ -240,8 +273,10 @@ def combine(signals: list[Signal], cfg: Config) -> tuple[int, str]:
         if by.get(a, 0) >= ma and by.get(b, 0) >= mb:
             score = max(score, floor)
 
-    # Desktop profile: a known miner binary name is worth surfacing even idle.
-    if cfg.profile == "desktop" and by.get("name", 0) >= cfg.hard_name:
+    # Desktop profile: a known miner name, or arguments that configure mining,
+    # are worth surfacing even on an idle process (a miner waiting to start).
+    if cfg.profile == "desktop" and (by.get("name", 0) >= cfg.hard_name
+                                     or by.get("cmdline", 0) >= cfg.hard_cmdline):
         score = max(score, cfg.desktop_name_floor)
 
     score = max(0, min(100, score))
