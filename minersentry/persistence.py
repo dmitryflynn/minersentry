@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import csv
 import glob
+import hashlib
 import io
 import ntpath
 import os
@@ -44,7 +45,13 @@ W_HIDDEN_LAUNCHER = 20
 # because the usual autostart lists do not show them.
 W_RARE_LOCATION = 35
 RARE_KINDS = {"ifeo-debugger", "appinit-dll", "winlogon", "wmi-consumer",
-              "hidden-task", "com-hijack", "ld-preload", "ssh-forced-command"}
+              "hidden-task", "com-hijack", "ld-preload", "ssh-forced-command",
+              "netsh-helper", "appcert-dll", "active-setup", "print-monitor",
+              "lsa-package", "gpo-script", "pam-module", "udev-rule"}
+# An accessibility binary replaced by a shell is not a matter of degree: the
+# file in System32 IS cmd.exe. Nothing legitimate does this, so it gets a floor
+# rather than a weight, and the floor alone is enough to report.
+W_SYSTEM_SWAP = 75
 
 
 @dataclass
@@ -160,7 +167,20 @@ def score_entry(entry: PersistEntry, cfg: Config,
             "com-hijack": "COM server hijack under HKCU",
             "ld-preload": "loaded into every process that starts (ld.so.preload)",
             "ssh-forced-command": "runs on every login with that SSH key",
+            "netsh-helper": "DLL loaded by netsh.exe every time it runs",
+            "appcert-dll": "AppCertDlls: loaded into every process that starts one",
+            "active-setup": "Active Setup StubPath: runs at logon before the desktop",
+            "print-monitor": "print monitor DLL, loaded by spoolsv.exe as SYSTEM",
+            "lsa-package": "LSA package, loaded into lsass.exe at boot",
+            "gpo-script": "Group Policy startup/logon script",
+            "pam-module": "PAM module, loaded on every authentication",
+            "udev-rule": "udev rule that runs a program on a device event",
         }.get(entry.kind, entry.kind))
+
+    if entry.kind == "accessibility-swap":
+        score = max(score, W_SYSTEM_SWAP)
+        labels.append("an accessibility binary in System32 has been replaced "
+                      "by a shell")
 
     low = (entry.command or "").lower()
     if any(k in low for k in ("-w hidden", "-windowstyle hidden", "-enc",
@@ -345,7 +365,9 @@ def _collect_windows(cfg: Config) -> list[PersistEntry]:
     visible = {os.path.basename(t.location).lower() for t in tasks}
     visible |= {t.name.lower() for t in tasks}
     for extra in (lambda: _collect_task_files(visible), _collect_service_dlls,
-                  _collect_hijacks, _collect_wmi, _collect_bits):
+                  _collect_hijacks, _collect_wmi, _collect_bits,
+                  _collect_load_points, _collect_lsa, _collect_gpo_scripts,
+                  _collect_office_addins, _collect_accessibility):
         try:
             out += extra()
         except Exception:  # noqa: BLE001 - one unreadable area must not stop the scan
@@ -575,6 +597,334 @@ def _collect_hijacks() -> list[PersistEntry]:
     return out
 
 
+# -- the less-travelled Windows load points ---------------------------------
+# None of these show up in Task Manager's Startup tab, msconfig, or `schtasks`,
+# which is the whole reason they get used. They are all cheap registry reads.
+#
+# There is deliberately no allowlist of known-good DLLs here. Every machine has
+# a dozen legitimate netsh helpers and print monitors, and keeping a list of
+# their names current is a losing game. Instead the existing trust-first
+# scoring does the work: a signed DLL under System32 earns only the
+# rare-location weight (35), which is below the reporting threshold (45), so it
+# stays silent — while an unsigned DLL, or one in a drop directory, clears it.
+
+# (kind, hive, path, subkey_value, payload)
+#   subkey_value None  -> every value under the key is a payload
+#   subkey_value "X"   -> each subkey's value "X" is the payload
+#   payload "dll"      -> the value is a module name, resolved against System32
+#   payload "command"  -> the value is a command line, parsed by command_exe
+# The distinction matters: command_exe("AppMon.dll") happily returns
+# "AppMon.dll", so treating a print monitor as a command line left the path
+# unresolved, and an unresolved path means the trust and signature checks have
+# no file to look at.
+_LOAD_POINT_KEYS = (
+    ("netsh-helper", "HKLM", r"SOFTWARE\Microsoft\NetSh", None, "dll"),
+    ("appcert-dll", "HKLM",
+     r"System\CurrentControlSet\Control\Session Manager\AppCertDlls", None, "dll"),
+    ("active-setup", "HKLM",
+     r"SOFTWARE\Microsoft\Active Setup\Installed Components", "StubPath",
+     "command"),
+    ("print-monitor", "HKLM",
+     r"SYSTEM\CurrentControlSet\Control\Print\Monitors", "Driver", "dll"),
+)
+
+
+def resolve_system_dll(value: str, isfile=os.path.isfile,
+                       system_root: str | None = None) -> str:
+    r"""Resolve a DLL reference from one of these keys to a full path. Pure
+    apart from the injected `isfile`.
+
+    Most of these values are a bare file name — `dhcpcmonitor.dll`, not a path
+    — because the loader finds them in System32. Left bare, `command_exe`
+    returns nothing, the trust and signature checks have no file to look at,
+    and a malicious DLL would score only the rare-location weight and never be
+    reported. So a bare name is resolved against System32 before scoring.
+    """
+    value = (value or "").strip().strip('"')
+    if not value:
+        return ""
+    value = os.path.expandvars(value)
+    if "\\" in value or "/" in value or (len(value) > 1 and value[1] == ":"):
+        return value
+    root = system_root or os.environ.get("SystemRoot", r"C:\Windows")
+    candidate = ntpath.join(root, "System32", value)
+    return candidate if isfile(candidate) else value
+
+
+def _collect_load_points() -> list[PersistEntry]:
+    """netsh helpers, AppCertDlls, Active Setup StubPath, print monitors."""
+    import winreg as wr
+    hives = {"HKCU": wr.HKEY_CURRENT_USER, "HKLM": wr.HKEY_LOCAL_MACHINE}
+    out: list[PersistEntry] = []
+    for kind, hive, path, subkey_value, payload in _LOAD_POINT_KEYS:
+        resolve = (command_exe if payload == "command" else resolve_system_dll)
+        try:
+            key = wr.OpenKey(hives[hive], path)
+        except OSError:
+            continue
+        try:
+            if subkey_value is None:
+                for i in range(wr.QueryInfoKey(key)[1]):
+                    try:
+                        name, value, _ = wr.EnumValue(key, i)
+                    except OSError:
+                        continue
+                    if not isinstance(value, str) or not value.strip():
+                        continue
+                    out.append(PersistEntry(
+                        kind=kind, location=f"{hive}\\{path}", name=name,
+                        command=value.strip(), exe=resolve(value.strip())))
+            else:
+                for i in range(wr.QueryInfoKey(key)[0]):
+                    try:
+                        sub_name = wr.EnumKey(key, i)
+                        with wr.OpenKey(key, sub_name) as sub:
+                            value, _ = wr.QueryValueEx(sub, subkey_value)
+                    except OSError:
+                        continue
+                    if not isinstance(value, str) or not value.strip():
+                        continue
+                    value = value.strip()
+                    exe = resolve(value)
+                    out.append(PersistEntry(
+                        kind=kind, location=f"{hive}\\{path}\\{sub_name}",
+                        name=f"{sub_name} -> {subkey_value}", command=value,
+                        exe=exe))
+        finally:
+            key.Close()
+    return out
+
+
+_LSA_KEY = r"SYSTEM\CurrentControlSet\Control\Lsa"
+_LSA_VALUES = ("Authentication Packages", "Notification Packages",
+               "Security Packages")
+
+
+def _collect_lsa() -> list[PersistEntry]:
+    """LSA packages: DLLs loaded into lsass.exe at boot, as SYSTEM.
+
+    The values are REG_MULTI_SZ lists, so each element becomes its own entry —
+    which also means removal has to rewrite the list rather than delete the
+    value, and `remove_entry` refuses on purpose.
+    """
+    import winreg as wr
+    out: list[PersistEntry] = []
+    try:
+        key = wr.OpenKey(wr.HKEY_LOCAL_MACHINE, _LSA_KEY)
+    except OSError:
+        return out
+    try:
+        for value_name in _LSA_VALUES:
+            try:
+                value, _ = wr.QueryValueEx(key, value_name)
+            except OSError:
+                continue
+            items = value if isinstance(value, (list, tuple)) else [value]
+            for item in items:
+                if not isinstance(item, str):
+                    continue
+                # Windows stores an empty list as a single element of two
+                # quote characters: `Security Packages` reads as '""' on a
+                # stock install. Left alone that became an entry named ".dll".
+                item = item.strip().strip('"').strip()
+                if not item:
+                    continue
+                name = item if item.lower().endswith(".dll") else item + ".dll"
+                out.append(PersistEntry(
+                    kind="lsa-package", location=f"HKLM\\{_LSA_KEY}",
+                    name=f"{value_name} -> {item}", command=item,
+                    exe=resolve_system_dll(name)))
+    finally:
+        key.Close()
+    return out
+
+
+def parse_ini_scripts(text: str, path: str) -> list[PersistEntry]:
+    """Parse a Group Policy `scripts.ini` into entries. Pure.
+
+    The format is `[Startup]` / `[Logon]` sections holding numbered pairs:
+    `0CmdLine=\\\\dc\\share\\x.exe` and `0Parameters=`. A startup script runs as
+    SYSTEM before anyone logs in, and it is a file on disk rather than a
+    registry value, so nothing else in this module would see it.
+    """
+    out: list[PersistEntry] = []
+    section = ""
+    commands: dict[str, str] = {}
+    params: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip().lstrip("\ufeff")
+        if not line or line.startswith(";"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            continue
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key, value = key.strip(), value.strip()
+        low = key.lower()
+        if low.endswith("cmdline"):
+            commands[f"{section}:{low[:-len('cmdline')]}"] = value
+        elif low.endswith("parameters"):
+            params[f"{section}:{low[:-len('parameters')]}"] = value
+    for ref, command in commands.items():
+        if not command:
+            continue
+        full = command
+        extra = params.get(ref, "")
+        if extra:
+            full = f"{command} {extra}"
+        sect = ref.split(":", 1)[0] or "script"
+        out.append(PersistEntry(kind="gpo-script", location=path,
+                                name=f"{sect} {ref.split(':', 1)[1]}".strip(),
+                                command=full, exe=command_exe(command)))
+    return out
+
+
+def _collect_gpo_scripts() -> list[PersistEntry]:
+    root = os.environ.get("SystemRoot", r"C:\Windows")
+    out: list[PersistEntry] = []
+    for who in ("Machine", "User"):
+        path = ntpath.join(root, "System32", "GroupPolicy", who, "Scripts",
+                           "scripts.ini")
+        text = _read(path)
+        if text:
+            out += parse_ini_scripts(text, path)
+    return out
+
+
+_OFFICE_ADDIN_ROOTS = (
+    ("HKCU", r"Software\Microsoft\Office"),
+    ("HKLM", r"Software\Microsoft\Office"),
+)
+
+
+def _first_string(key, names: tuple[str, ...]) -> str:
+    """The first of `names` that holds a non-empty string, or ""."""
+    import winreg as wr
+    for name in names:
+        try:
+            value, _ = wr.QueryValueEx(key, name)
+        except OSError:
+            continue
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _collect_office_addins() -> list[PersistEntry]:
+    r"""Office add-ins: `Software\Microsoft\Office\<app>\Addins\<id>`.
+
+    These are NOT in RARE_KINDS. Plenty of real add-ins are unsigned and live
+    in %APPDATA% (every corporate XLAM does), so the rare-location weight would
+    turn each one into a finding. An add-in therefore has to earn its score the
+    ordinary way: a miner name, a stratum URL, a hidden launcher.
+    """
+    import winreg as wr
+    hives = {"HKCU": wr.HKEY_CURRENT_USER, "HKLM": wr.HKEY_LOCAL_MACHINE}
+    out: list[PersistEntry] = []
+    for hive, office in _OFFICE_ADDIN_ROOTS:
+        try:
+            root = wr.OpenKey(hives[hive], office)
+        except OSError:
+            continue
+        try:
+            apps = []
+            for i in range(wr.QueryInfoKey(root)[0]):
+                try:
+                    apps.append(wr.EnumKey(root, i))
+                except OSError:
+                    continue
+        finally:
+            root.Close()
+        for app in apps:
+            addins_path = f"{office}\\{app}\\Addins"
+            try:
+                addins = wr.OpenKey(hives[hive], addins_path)
+            except OSError:
+                continue
+            try:
+                for i in range(wr.QueryInfoKey(addins)[0]):
+                    try:
+                        ident = wr.EnumKey(addins, i)
+                        with wr.OpenKey(addins, ident) as sub:
+                            try:
+                                behaviour, _ = wr.QueryValueEx(sub, "LoadBehavior")
+                            except OSError:
+                                behaviour = 3
+                            manifest = _first_string(
+                                sub, ("Manifest", "FriendlyName"))
+                    except OSError:
+                        continue
+                    # 0 = never load, 1 = loaded but not at startup
+                    if isinstance(behaviour, int) and behaviour in (0, 1):
+                        continue
+                    command = manifest if isinstance(manifest, str) else ""
+                    out.append(PersistEntry(
+                        kind="office-addin",
+                        location=f"{hive}\\{addins_path}\\{ident}",
+                        name=ident, command=command or ident,
+                        exe=command_exe(command) if command else ""))
+            finally:
+                addins.Close()
+    return out
+
+
+# A sticky-keys backdoor replaces one of these with a shell, so that the
+# shortcut on the logon screen opens a SYSTEM command prompt. The replacement
+# is the shell binary itself, byte for byte.
+_ACCESSIBILITY_BINARIES = ("sethc.exe", "utilman.exe", "osk.exe",
+                           "Magnify.exe", "Narrator.exe", "DisplaySwitch.exe",
+                           "AtBroker.exe")
+_SHELL_BINARIES = ("cmd.exe", "powershell.exe", "taskmgr.exe", "explorer.exe")
+
+
+def file_digest(path: str) -> str:
+    """sha256 of a file, or "" if it cannot be read."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def swapped_binaries(accessibility: dict[str, str],
+                     shells: dict[str, str]) -> list[tuple[str, str]]:
+    """Accessibility binaries whose digest matches a shell's. Pure.
+
+    A signature check would not do here: Windows system binaries are
+    catalog-signed, so WinVerifyTrust on the file alone fails for the genuine
+    article too — the same reason `trust.is_trusted` falls back to the
+    directory. Comparing digests against the shells instead gives an answer
+    with no false positives: either the file in System32 *is* cmd.exe or it is
+    not.
+    """
+    by_digest = {digest: name for name, digest in shells.items() if digest}
+    out = []
+    for name, digest in sorted(accessibility.items()):
+        if digest and digest in by_digest:
+            out.append((name, by_digest[digest]))
+    return out
+
+
+def _collect_accessibility() -> list[PersistEntry]:
+    root = ntpath.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+    shells = {name: file_digest(ntpath.join(root, name))
+              for name in _SHELL_BINARIES}
+    targets = {name: file_digest(ntpath.join(root, name))
+               for name in _ACCESSIBILITY_BINARIES}
+    out = []
+    for name, shell in swapped_binaries(targets, shells):
+        path = ntpath.join(root, name)
+        out.append(PersistEntry(kind="accessibility-swap", location=root,
+                                name=name, command=f"{path} (identical to {shell})",
+                                exe=path, file=path))
+    return out
+
+
 def parse_wmi_consumers(text: str) -> list[PersistEntry]:
     """Parse `Name<TAB>command` lines from the WMI consumer query. Pure."""
     out: list[PersistEntry] = []
@@ -713,8 +1063,24 @@ def _collect_posix(cfg: Config) -> list[PersistEntry]:
             text = _read(path)
             if text:
                 out += parse_authorized_keys(text, path)
-    for rc in ("~/.bashrc", "~/.bash_profile", "~/.profile", "~/.zshrc",
-               "/etc/rc.local", "/etc/profile"):
+    for path in sorted(glob.glob("/etc/pam.d/*")):
+        text = _read(path)
+        if text:
+            out += parse_pam_config(text, path)
+    for path in sorted(glob.glob("/etc/udev/rules.d/*.rules")) + \
+            sorted(glob.glob("/run/udev/rules.d/*.rules")):
+        text = _read(path)
+        if text:
+            out += parse_udev_rules(text, path)
+    # /etc/profile.d is sourced by every login shell and is a directory, so a
+    # new file there needs no edit to an existing one; /etc/init.d still runs
+    # on anything with a sysv-compatible init.
+    shell_files = ["~/.bashrc", "~/.bash_profile", "~/.profile", "~/.zshrc",
+                   "/etc/rc.local", "/etc/profile"]
+    shell_files += sorted(glob.glob("/etc/profile.d/*.sh"))
+    shell_files += [p for p in sorted(glob.glob("/etc/init.d/*"))
+                    if os.path.isfile(p)]
+    for rc in shell_files:
         path = os.path.expanduser(rc)
         text = _read(path)
         if not text:
@@ -778,6 +1144,77 @@ def parse_authorized_keys(text: str, path: str) -> list[PersistEntry]:
     return out
 
 
+_PAM_STANDARD_DIRS = ("/lib/security/", "/lib64/security/",
+                      "/usr/lib/security/", "/usr/lib64/security/",
+                      "/lib/x86_64-linux-gnu/security/",
+                      "/usr/lib/x86_64-linux-gnu/security/",
+                      "/usr/lib/aarch64-linux-gnu/security/",
+                      "/lib/aarch64-linux-gnu/security/")
+
+
+def parse_pam_config(text: str, path: str,
+                     standard_dirs: tuple[str, ...] = _PAM_STANDARD_DIRS
+                     ) -> list[PersistEntry]:
+    """PAM modules loaded from outside the standard module directories. Pure.
+
+    A line in /etc/pam.d names a module, normally by bare name, and PAM finds
+    it in the system module directory. An absolute path to somewhere else means
+    somebody pointed authentication at their own code: it is then loaded into
+    sshd, login, sudo and su on every authentication, as root.
+
+    Only off-path modules are reported. A bare name is the normal case and
+    there are hundreds of them per machine, so reporting those would bury the
+    one line that matters.
+    """
+    out: list[PersistEntry] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        # type control module-path [args]; `-` prefix means "optional"
+        if parts and parts[0] == "-":
+            parts = parts[1:]
+        if len(parts) < 3:
+            continue
+        module = next((p for p in parts[2:] if p.endswith(".so")), "")
+        if not module or not module.startswith("/"):
+            continue
+        if module.startswith(standard_dirs):
+            continue
+        out.append(PersistEntry(kind="pam-module", location=path,
+                                name=os.path.basename(module), command=module,
+                                exe=module))
+    return out
+
+
+_UDEV_RUN = re.compile(r'(?:RUN|PROGRAM|IMPORT)(?:\{[^}]*\})?\s*(?:\+?=)\s*'
+                       r'"([^"]*)"')
+
+
+def parse_udev_rules(text: str, path: str) -> list[PersistEntry]:
+    """udev rules that run a program. Pure.
+
+    `RUN+="..."` runs as root when a device event matches, and a rule matching
+    something that happens at every boot is persistence that no autostart list
+    shows. PROGRAM and IMPORT{program} execute too, so all three are read.
+    """
+    out: list[PersistEntry] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        for command in _UDEV_RUN.findall(line):
+            command = command.strip()
+            if not command:
+                continue
+            out.append(PersistEntry(kind="udev-rule", location=path,
+                                    name=os.path.basename(path),
+                                    command=command,
+                                    exe=command_exe(command)))
+    return out
+
+
 def _read(path: str) -> str:
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -831,15 +1268,54 @@ def remove_entry(entry: PersistEntry) -> "quarantine.Result":
     """
     kind = entry.kind
     registry_kinds = ("run-key", "ifeo-debugger", "appinit-dll", "winlogon",
-                      "service", "service-dll")
+                      "service", "service-dll", "netsh-helper", "appcert-dll",
+                      "active-setup", "lsa-package", "print-monitor",
+                      "office-addin")
     if kind in registry_kinds and not IS_WINDOWS:
         # `import winreg` raises ModuleNotFoundError off Windows; answer
         # instead of letting that escape to the caller.
         return quarantine.Result(
             False, f"{kind} entries live in the Windows registry; there is "
                    f"nothing of that kind to remove on this platform.")
-    if kind in ("run-key", "ifeo-debugger", "appinit-dll", "winlogon"):
+    if kind in ("run-key", "ifeo-debugger", "appinit-dll", "winlogon",
+                "netsh-helper", "appcert-dll", "active-setup"):
+        # All plain single-string values: deleting one removes the entry and
+        # nothing else. _remove_registry_value saves the value and its type
+        # first, so the journal can put it back.
         return _remove_registry_value(entry)
+    if kind == "lsa-package":
+        # REG_MULTI_SZ. Deleting the value would remove every package in the
+        # list, and an lsass that cannot load its authentication packages does
+        # not boot. Rewriting one element of the list in place is possible but
+        # not something to do automatically on the strength of a score.
+        return quarantine.Result(
+            False, f"{entry.name} is one element of a REG_MULTI_SZ list at "
+                   f"{entry.location}. Deleting the whole value stops Windows "
+                   f"booting, so remove just that element by hand after "
+                   f"checking what the DLL is.")
+    if kind == "print-monitor":
+        return quarantine.Result(
+            False, f"A print monitor is a registry SUBKEY ({entry.location}), "
+                   f"not a value. Stop the Print Spooler, delete that subkey, "
+                   f"then start it again — done in the wrong order the spooler "
+                   f"rewrites it.")
+    if kind == "gpo-script":
+        return quarantine.Result(
+            False, f"This runs from {entry.location}, which Group Policy "
+                   f"rewrites from the domain on the next refresh. Removing "
+                   f"the line locally would not hold: fix the GPO, or detach "
+                   f"the machine first.")
+    if kind == "office-addin":
+        return quarantine.Result(
+            False, f"Set LoadBehavior to 0 under {entry.location} to stop the "
+                   f"add-in loading, rather than deleting the key — Office "
+                   f"recreates a deleted add-in key from its own cache.")
+    if kind == "accessibility-swap":
+        return quarantine.Result(
+            False, f"{entry.name} is a Windows system binary that has been "
+                   f"REPLACED, not something added. Quarantining it would "
+                   f"leave System32 short a file; restore the real one with "
+                   f"`sfc /scannow` instead.")
     if kind == "startup-folder":
         # entry.file is the item in the Startup folder. For a shortcut the
         # command is its TARGET, and quarantining that would move the
@@ -849,7 +1325,14 @@ def remove_entry(entry: PersistEntry) -> "quarantine.Result":
         return _remove_task(entry)
     if kind in ("service", "service-dll"):
         return _disable_service(entry)
-    if kind in ("cron", "systemd-unit", "shell-profile"):
+    if kind == "pam-module":
+        return quarantine.Result(
+            False, f"{entry.location} controls authentication. A broken file "
+                   f"there locks every account out, including root, so this is "
+                   f"never edited automatically: keep a root shell open, "
+                   f"comment the line referring to {entry.name}, and test "
+                   f"`sudo true` before closing it.")
+    if kind in ("cron", "systemd-unit", "shell-profile", "udev-rule"):
         return quarantine.Result(
             False, f"{kind} entries are edited by hand on purpose: open "
                    f"{entry.location} and remove the line. Automatic edits to a "

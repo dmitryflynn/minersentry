@@ -232,10 +232,42 @@ minersentry-scan --autostart-only --json
 minersentry-scan --duration 30 --autostart # processes and autostart together
 ```
 
-On the desktop this was built on that reads 884 entries in about 4 seconds and
-reports none of them: the threshold is set so a list nobody reads is not the
+On the desktop this was built on that reads 1,138 entries in about 4.5 seconds
+and reports none of them: the threshold is set so a list nobody reads is not the
 default outcome. A Run key pointing at a miner with a pool URL and a wallet
 scores 100.
+
+What it reads:
+
+| Windows | Linux |
+| --- | --- |
+| Run / RunOnce keys (HKCU, HKLM, Wow6432Node) | `/etc/crontab`, `/etc/cron.d`, per-user crontabs |
+| Startup folders, including `.lnk` targets | systemd `.service` **and `.timer`** units |
+| Services, including `Parameters\ServiceDll` | `~/.config/autostart`, `/etc/xdg/autostart` |
+| Scheduled tasks from `schtasks` **and from task XML on disk** (hidden tasks) | `/etc/ld.so.preload` |
+| IFEO debuggers, AppInit_DLLs, Winlogon Shell/Userinit | `authorized_keys` forced commands |
+| WMI event subscriptions, BITS jobs | shell profiles, `/etc/profile.d`, `/etc/init.d`, `rc.local` |
+| netsh helper DLLs, AppCertDlls, LSA packages | PAM modules loaded from off-path |
+| Active Setup `StubPath`, print monitors | udev rules with `RUN+=` / `PROGRAM=` |
+| Group Policy startup/logon scripts, Office add-ins | |
+| Accessibility binaries replaced by a shell (`sethc.exe`) | |
+
+There is no allowlist of known-good DLLs anywhere in this. Every machine has a
+dozen legitimate netsh helpers and print monitors, and keeping a list of their
+names current is a losing game. Instead a signed file under System32 earns only
+the rare-location weight (35), which sits below the reporting threshold (45),
+so it stays quiet — while an unsigned DLL, or one in a drop directory, clears
+it. The accessibility check is the one exception, and it is not a signature
+check either: Windows system binaries are catalog-signed, so verifying the file
+alone fails for the genuine article too. It compares digests instead, so the
+answer has no middle: either the file in System32 *is* `cmd.exe` or it is not.
+
+Not every finding can be removed for you, and the ones that refuse say why. An
+LSA package is one element of a `REG_MULTI_SZ` list and deleting the value stops
+Windows booting; a print monitor is a subkey the spooler rewrites if you delete
+it in the wrong order; a Group Policy script comes back from the domain on the
+next refresh; a PAM file that breaks locks out every account including root.
+Those are reported with instructions rather than acted on.
 
 Reproduce the evasion benchmark — each **benign** behavioral profile from
 `samples/fake_miner.py` run past the engine, with verdict and time-to-detect:
