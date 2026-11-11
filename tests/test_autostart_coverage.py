@@ -237,9 +237,17 @@ def test_a_udev_rule_running_from_a_drop_directory_is_reported():
     ("accessibility-swap", "sfc"),
     ("pam-module", "locks every account out"),
 ])
-def test_the_unsafe_removals_refuse_and_say_what_to_do(kind, must_mention):
+def test_the_unsafe_removals_refuse_and_say_what_to_do(kind, must_mention,
+                                                       monkeypatch):
     """Each of these would damage a working system if removed mechanically.
-    They are reported with instructions instead of being acted on."""
+    They are reported with instructions instead of being acted on.
+
+    The platform is pinned because the registry-backed kinds answer "there is
+    nothing of that kind on this platform" off Windows, before they reach the
+    guidance this asserts on. That early return has its own test below; what
+    is being checked here is the wording, which is the same either way.
+    """
+    monkeypatch.setattr(P, "IS_WINDOWS", True)
     entry = P.PersistEntry(kind=kind, location="HKLM\\X\\Y", name="thing",
                            command="x", exe="x")
     result = P.remove_entry(entry)
