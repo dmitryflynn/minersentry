@@ -118,7 +118,31 @@ _DEVICE_PREFIX = "\\??\\"
 _SYSROOT_PREFIX = "\\systemroot\\"
 
 
-def resolve_image_path(command: str, system_root: str | None = None) -> str:
+_WIN_VAR = re.compile(r"%([^%\s]+)%")
+
+
+def expand_win_vars(text: str, environ: dict | None = None) -> str:
+    r"""Expand `%VAR%` the way Windows does, on any platform. Pure.
+
+    `os.path.expandvars` is `posixpath.expandvars` off Windows, and that knows
+    only `$VAR` — so `%SystemRoot%\system32\x.sys` came back untouched on
+    Linux, which is 276 of this machine's 793 service entries left unresolved
+    for anyone running the scan or the tests there. Lookup is
+    case-insensitive, as it is on Windows. An unset variable is left as it
+    stands rather than becoming an empty string, so a path never silently
+    collapses to something that happens to exist.
+    """
+    env = os.environ if environ is None else environ
+    lowered = {k.lower(): v for k, v in env.items()}
+
+    def replace(match: "re.Match[str]") -> str:
+        return lowered.get(match.group(1).lower(), match.group(0))
+
+    return _WIN_VAR.sub(replace, text)
+
+
+def resolve_image_path(command: str, system_root: str | None = None,
+                       environ: dict | None = None) -> str:
     r"""Normalise a service `ImagePath` so the path inside it names a real file.
 
     The service control manager accepts four spellings and this module was
@@ -148,7 +172,8 @@ def resolve_image_path(command: str, system_root: str | None = None) -> str:
     s = (command or "").strip()
     if not s:
         return ""
-    root = system_root or os.environ.get("SystemRoot", r"C:\Windows")
+    env = os.environ if environ is None else environ
+    root = system_root or env.get("SystemRoot") or r"C:\Windows"
 
     quote = ""
     if s[0] in "\"'":
@@ -160,7 +185,7 @@ def resolve_image_path(command: str, system_root: str | None = None) -> str:
     else:
         inner, rest = s, ""
 
-    inner = os.path.expandvars(inner)
+    inner = expand_win_vars(inner, env)
     low = inner.lower()
     if low.startswith(_DEVICE_PREFIX):
         inner = inner[len(_DEVICE_PREFIX):]

@@ -18,6 +18,17 @@ from minersentry.config import Config
 CFG = Config()
 THRESHOLD = CFG.persistence_min_score
 ROOT = r"C:\Windows"
+ENV = {"SystemRoot": ROOT, "ProgramFiles": r"C:\Program Files"}
+
+# Config picks platform-specific directory sets, so a test that needs the
+# WINDOWS sets has to say so — these entries come out of the Windows registry
+# whatever platform the suite is running on.
+WIN_CFG = Config(
+    trusted_dirs=(r"c:\program files", r"c:\program files (x86)",
+                  r"c:\windows\system32", r"c:\windows\syswow64"),
+    suspicious_dir_hints=("\\temp\\", "\\appdata\\local\\temp\\",
+                          "\\programdata\\", "\\appdata\\roaming\\"),
+    signature_untrusted_dirs=("\\temp\\", "\\appdata\\",))
 
 
 def _untrusted(exe, trusted_dirs, untrusted_hints=()):
@@ -26,13 +37,13 @@ def _untrusted(exe, trusted_dirs, untrusted_hints=()):
 
 def _score(stored, trusted=False):
     """Score a service entry the way the collector builds one."""
-    image = P.resolve_image_path(stored, system_root=ROOT)
+    image = P.resolve_image_path(stored, system_root=ROOT, environ=ENV)
     entry = P.PersistEntry(
         kind="service", location=r"HKLM\SYSTEM\CurrentControlSet\Services",
         name="WinRing0x64", command=image,
         exe=P.command_exe(image, isfile=lambda p: True))
     return P.score_entry(
-        entry, CFG, isfile=lambda p: True,
+        entry, WIN_CFG, isfile=lambda p: True,
         is_trusted=(lambda *a, **k: True) if trusted else _untrusted)
 
 
@@ -44,8 +55,11 @@ def _score(stored, trusted=False):
     # \SystemRoot\ : 251 entries. This was the only form handled before.
     (r"\SystemRoot\System32\drivers\x.sys", r"C:\Windows\System32\drivers\x.sys"),
     (r"\systemroot\system32\x.sys", r"C:\Windows\system32\x.sys"),
-    # %var% : 276 entries, and nothing called expandvars on this path
-    (r"%SystemRoot%\system32\svchost.exe", None),      # checked below
+    # %var% : 276 entries, and nothing called expandvars on this path.
+    # Expansion is ours rather than os.path's, so these hold on Linux too.
+    (r"%SystemRoot%\system32\svchost.exe", r"C:\Windows\system32\svchost.exe"),
+    (r"%systemroot%\x.sys", r"C:\Windows\x.sys"),          # case-insensitive
+    (r"%NoSuchVar%\x.sys", r"C:\Windows\%NoSuchVar%\x.sys"),   # left standing
     # \??\ : the NT device prefix
     (r"\??\C:\ProgramData\x\x.sys", r"C:\ProgramData\x\x.sys"),
     # already absolute: left exactly as it is
@@ -53,12 +67,7 @@ def _score(stored, trusted=False):
     (r"\\server\share\x.sys", r"\\server\share\x.sys"),
 ])
 def test_every_imagepath_spelling_resolves(stored, expected):
-    out = P.resolve_image_path(stored, system_root=ROOT)
-    if expected is None:                      # %var% depends on the real env
-        assert "%" not in out
-        assert out.lower().endswith("svchost.exe")
-    else:
-        assert out == expected
+    assert P.resolve_image_path(stored, system_root=ROOT, environ=ENV) == expected
 
 
 def test_a_drive_rooted_path_lands_on_the_system_roots_drive():
@@ -164,9 +173,9 @@ def test_a_traversal_does_not_buy_a_trusted_directory():
     is in Temp, and it scored 10 instead of 50 — under the threshold."""
     from minersentry import trust
     evil = r"C:\Windows\System32\..\..\Users\x\AppData\Local\Temp\miner.exe"
-    assert not trust.in_trusted_dir(evil, CFG.trusted_dirs)
+    assert not trust.in_trusted_dir(evil, WIN_CFG.trusted_dirs)
     assert trust.in_trusted_dir(r"C:\Windows\System32\svchost.exe",
-                                CFG.trusted_dirs)
+                                WIN_CFG.trusted_dirs)
 
 
 def test_a_traversal_in_a_run_key_scores_the_same_as_the_real_path():
@@ -175,7 +184,7 @@ def test_a_traversal_in_a_run_key_scores_the_same_as_the_real_path():
     def scored(exe):
         e = P.PersistEntry(kind="run-key", location="HKCU", name="x",
                            command=exe, exe=exe)
-        return P.score_entry(e, CFG, isfile=lambda p: True).score
+        return P.score_entry(e, WIN_CFG, isfile=lambda p: True).score
     assert scored(evil) == scored(ntpath.normpath(evil))
     assert scored(evil) >= THRESHOLD
 
