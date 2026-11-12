@@ -24,6 +24,25 @@ from . import gpu as gpu_mod
 from . import persistence as persist_mod
 from . import probe as probe_mod
 from . import quarantine as quarantine_mod
+from . import tamper as tamper_mod
+
+
+def _describe_removal(record: dict) -> str:
+    """One line for the undo list: what was removed, and from where."""
+    action = record.get("action", "")
+    when = str(record.get("ts", ""))[:19].replace("T", " ")
+    if action == "remove_registry_value":
+        what = f"{record.get('name', '?')} in {record.get('hive', '')}\\{record.get('path', '')}"
+    elif action == "remove_task":
+        what = f"scheduled task {record.get('task', '?')}"
+    elif action == "disable_service":
+        what = f"service {record.get('service', '?')} (disabled)"
+    elif action == "quarantine_file":
+        what = f"{os.path.basename(record.get('original', '?'))} " \
+               f"from {os.path.dirname(record.get('original', ''))}"
+    else:
+        what = action or "unknown action"
+    return f"{when or '(no timestamp)':<19}  {what}"
 
 
 def _is_elevated() -> bool:
@@ -166,6 +185,17 @@ class MinerSentryApp:
         self.btn_kill.pack(side="left", padx=(8, 0))
         self._btn(bar, "🔒  Quarantine binary", self.quarantine_selected, "#9e6a03").pack(
             side="left", padx=(8, 0))
+        self._btn(bar, "↩  Undo a removal", self.undo_removal, "#30363d").pack(
+            side="left", padx=(8, 0))
+
+        # Weakened-defences banner (shown only when the tamper scan finds
+        # something). A Defender exclusion covering a flagged folder is close
+        # to conclusive and belongs at the top of the window, not in a log.
+        self.tamper_banner = tk.Frame(self.root, bg="#3a1d1d")
+        self.tamper_lbl = tk.Label(self.tamper_banner, bg="#3a1d1d",
+                                   fg="#f0a0a0", font=("Segoe UI", 9),
+                                   anchor="w", justify="left")
+        self.tamper_lbl.pack(side="left", padx=10, pady=4)
 
         # Hidden-compute banner (shown only when flagged).
         self.hidden_banner = tk.Frame(self.root, bg="#3a1d1d")
@@ -368,7 +398,7 @@ class MinerSentryApp:
                         self._set_status(note)
                         self._add_event(note)
                 elif kind == "autostart":
-                    self._show_autostart(item[1])
+                    self._show_autostart(item[1], item[2] if len(item) > 2 else [])
                 elif kind == "event":
                     self._add_event(item[1])
                 elif kind == "error":
@@ -414,9 +444,11 @@ class MinerSentryApp:
         rep = self.engine.hidden_report
         if rep.flagged:
             self.hidden_lbl.configure(text="⚠  Hidden compute: " + rep.note)
-            if not self.hidden_banner.winfo_ismapped():
+            # winfo_manager() for the same reason as the tamper banner: this
+            # asks whether the banner is packed, not whether it is on screen.
+            if not self.hidden_banner.winfo_manager():
                 self.hidden_banner.pack(fill="x", padx=16, pady=(0, 6))
-        elif self.hidden_banner.winfo_ismapped():
+        elif self.hidden_banner.winfo_manager():
             self.hidden_banner.pack_forget()
 
         miners = [r for r in results if r.verdict == "Likely Miner"]
@@ -502,21 +534,39 @@ class MinerSentryApp:
 
     # -- autostart ----------------------------------------------------------
     def scan_autostart(self) -> None:
-        """Scan Run keys / tasks / services / cron for miner-like entries."""
-        self._set_status("Scanning autostart locations…")
+        """Scan the autostart locations, and the defences, in one pass."""
+        self._set_status("Scanning autostart locations and defences…")
         threading.Thread(target=self._autostart_thread, daemon=True).start()
 
     def _autostart_thread(self) -> None:
         try:
             found = persist_mod.scan(self.engine.cfg)
-            self.q.put(("autostart", found))
+            # The tamper scan takes the paths the autostart scan just flagged,
+            # because an exclusion that covers one of them is close to
+            # conclusive. Running the two separately is what made that
+            # correlation impossible to see.
+            flagged = tuple(e.exe for e in found if e.exe)
+            try:
+                weakened = tamper_mod.scan(self.engine.cfg, flagged_paths=flagged)
+            except Exception as e:  # noqa: BLE001 - a scan is not worth losing
+                weakened = []
+                self.q.put(("event", f"defence check failed: "
+                                     f"{type(e).__name__}: {e}"))
+            self.q.put(("autostart", found, weakened))
         except Exception as e:  # noqa: BLE001
             self.q.put(("error", f"autostart scan failed: {type(e).__name__}: {e}"))
 
-    def _show_autostart(self, found: list) -> None:
+    def _show_autostart(self, found: list, weakened: list | None = None) -> None:
+        weakened = weakened or []
+        self._show_tamper(weakened)
         if not found:
-            self._set_status("Autostart: no miner-like entries.")
+            note = "Autostart: no miner-like entries."
+            if weakened:
+                note += f" Defences: {len(weakened)} finding(s) — see the detail panel."
+            self._set_status(note)
             self._add_event("autostart: nothing miner-like found")
+            if weakened:
+                self._render_tamper_detail(weakened, autostart=[])
             return
         lines = [f"{len(found)} miner-like autostart entr"
                  f"{'y' if len(found) == 1 else 'ies'}:", ""]
@@ -530,12 +580,129 @@ class MinerSentryApp:
             lines.append(f"     in {e.location}")
             lines.append("")
             self._add_event(f"autostart {e.score}: {e.summary}")
+        lines += self._tamper_lines(weakened)
         self.detail_text.configure(state="normal")
         self.detail_text.delete("1.0", "end")
         self.detail_text.insert("1.0", "\n".join(lines))
         self.detail_text.configure(state="disabled")
-        self._set_status(f"Autostart: {len(found)} miner-like entry(ies) — see the detail panel.")
+        status = f"Autostart: {len(found)} miner-like entry(ies)"
+        real = [f for f in weakened if f.score > 0]
+        if real:
+            status += f", {len(real)} defence finding(s)"
+        self._set_status(status + " — see the detail panel.")
         self._offer_removal(found)
+
+    # -- weakened defences --------------------------------------------------
+    def _tamper_lines(self, weakened: list) -> list[str]:
+        """The defence findings, as detail-panel text."""
+        real = [f for f in weakened if f.score > 0]
+        notes = [f for f in weakened if f.score == 0]
+        out: list[str] = ["", "-" * 48, ""]
+        if not real:
+            out.append("Defences: nothing tampered with."
+                       if not notes else f"Defences: {notes[0].detail}")
+            return out
+        out.append(f"{len(real)} defence finding"
+                   f"{'' if len(real) == 1 else 's'}:")
+        out.append("")
+        for f in real:
+            out.append(f"{f.score:>3}  {f.kind}")
+            out.append(f"     {f.detail}")
+            for label in f.labels[:3]:
+                out.append(f"       - {label}")
+            out.append(f"     in {f.where}")
+            out.append("")
+        for f in notes:
+            out.append(f"     note: {f.detail}")
+        return out
+
+    def _render_tamper_detail(self, weakened: list, autostart: list) -> None:
+        self.detail_text.configure(state="normal")
+        self.detail_text.delete("1.0", "end")
+        self.detail_text.insert("1.0", "\n".join(self._tamper_lines(weakened)))
+        self.detail_text.configure(state="disabled")
+
+    def _show_tamper(self, weakened: list) -> None:
+        """Log every finding, and raise a banner for the serious ones.
+
+        Until this existed the GUI never mentioned defence tampering at all:
+        a machine whose Defender was switched off by policy, with the miner's
+        folder excluded, showed a clean dashboard.
+        """
+        real = [f for f in weakened if f.score > 0]
+        for f in real:
+            self._add_event(f"defences {f.score}: {f.kind} — {f.detail}")
+        for f in (f for f in weakened if f.score == 0):
+            self._add_event(f"defences: {f.detail}")
+        if not real:
+            self._hide_tamper_banner()
+            return
+        worst = max(real, key=lambda f: f.score)
+        self.tamper_lbl.configure(
+            text=f"  Defences weakened: {worst.detail}"
+                 + (f"  (+{len(real) - 1} more)" if len(real) > 1 else ""))
+        # winfo_manager(), not winfo_ismapped(): the question is whether the
+        # banner is PACKED, and ismapped answers whether it is currently drawn.
+        # While the window is minimised or not yet drawn, ismapped is 0 for a
+        # packed widget, so a hide would be skipped and a stale banner left
+        # behind, and a show would re-pack on every render.
+        if not self.tamper_banner.winfo_manager():
+            self.tamper_banner.pack(fill="x", padx=16, pady=(0, 6))
+
+    def _hide_tamper_banner(self) -> None:
+        if self.tamper_banner.winfo_manager():
+            self.tamper_banner.pack_forget()
+
+    # -- undoing a removal --------------------------------------------------
+    def undo_removal(self) -> None:
+        """Put back an autostart entry that was removed.
+
+        The removal dialog says the action is recorded so it can be undone.
+        It was true of the journal and false of this window: nothing here
+        called `undo_removal`, and the only way back was the command line.
+        """
+        records = persist_mod.removals()
+        if not records:
+            messagebox.showinfo("Undo a removal",
+                                "Nothing has been removed yet, so there is "
+                                "nothing to put back.")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Undo a removal")
+        win.configure(bg=BG)
+        win.transient(self.root)
+        tk.Label(win, bg=BG, fg=FG, font=("Segoe UI", 10), justify="left",
+                 text="Newest first. Restoring puts the entry back exactly as "
+                      "it was.").pack(anchor="w", padx=14, pady=(12, 6))
+        box = tk.Listbox(win, bg=PANEL, fg=FG, width=92, height=10,
+                         font=("Consolas", 9), selectbackground=ACCENT,
+                         relief="flat", highlightthickness=0, activestyle="none")
+        box.pack(fill="both", expand=True, padx=14)
+        newest_first = list(reversed(records))
+        for record in newest_first:
+            box.insert("end", "  " + _describe_removal(record))
+        box.selection_set(0)
+
+        def restore() -> None:
+            selection = box.curselection()
+            if not selection:
+                return
+            record = newest_first[selection[0]]
+            result = persist_mod.undo_removal(record)
+            self._add_event(("removal undone: " if result.ok
+                             else "undo failed: ") + result.message)
+            self._set_status(result.message)
+            if result.ok:
+                messagebox.showinfo("Undo a removal", result.message, parent=win)
+                win.destroy()
+            else:
+                messagebox.showerror("Undo a removal", result.message, parent=win)
+
+        row = tk.Frame(win, bg=BG)
+        row.pack(fill="x", padx=14, pady=12)
+        self._btn(row, "Restore selected", restore, "#1f6feb").pack(side="left")
+        self._btn(row, "Close", win.destroy, "#30363d").pack(side="right")
 
     def _offer_removal(self, found: list) -> None:
         """Ask, per entry, whether to disable it. Every removal is reversible.

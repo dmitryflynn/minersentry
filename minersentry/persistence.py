@@ -1464,7 +1464,11 @@ def remove_entry(entry: PersistEntry) -> "quarantine.Result":
         # entry.file is the item in the Startup folder. For a shortcut the
         # command is its TARGET, and quarantining that would move the
         # legitimate application instead of the shortcut.
-        return quarantine.quarantine_file(entry.file or entry.command)
+        # `kind` is passed so `removals()` can see this as a removal; without
+        # it an "undo the last removal" skipped straight past a startup-folder
+        # removal to an older, unrelated entry.
+        return quarantine.quarantine_file(entry.file or entry.command,
+                                          kind=entry.kind)
     if kind in ("scheduled-task", "hidden-task"):
         return _remove_task(entry)
     if kind in ("service", "service-dll"):
@@ -1568,6 +1572,9 @@ def undo_removal(record: dict) -> "quarantine.Result":
     """Reverse one removal, from its journal record."""
     action = record.get("action")
     try:
+        if action == "quarantine_file":
+            # a startup-folder removal; the file goes back where it came from
+            return quarantine.restore_file(record.get("stored", ""))
         if action == "remove_registry_value":
             import winreg as wr
             hive = {"HKCU": wr.HKEY_CURRENT_USER,
@@ -1606,6 +1613,32 @@ def undo_removal(record: dict) -> "quarantine.Result":
 
 
 def removals(limit: int = 200) -> list[dict]:
-    """Removals recorded so far, newest last."""
-    kinds = {"remove_registry_value", "remove_task", "disable_service"}
-    return [r for r in quarantine.history(limit) if r.get("action") in kinds]
+    """Removals recorded so far, newest last.
+
+    A startup-folder removal is journalled by `quarantine_file`, and leaving
+    that action out had a worse consequence than an incomplete list: "undo the
+    last removal" takes the newest record here, so after removing a malicious
+    shortcut it skipped past it and restored an older, unrelated registry
+    entry — an entry the user never asked to bring back, while the shortcut
+    stayed quarantined.
+
+    Only quarantines that came from an autostart removal count; one carries
+    `kind`. A process binary quarantined from the dashboard is undone through
+    `quarantine.restore_file`, which is a different action with a different
+    meaning, and it is not a removal of an autostart entry.
+    """
+    actions = {"remove_registry_value", "remove_task", "disable_service"}
+    out = []
+    for record in quarantine.history(limit):
+        action = record.get("action")
+        if action in actions:
+            out.append(record)
+        elif action == "quarantine_file" and record.get("kind"):
+            out.append(record)
+        elif action == "restore_file":
+            # already undone: drop the quarantine it reversed, so an undo
+            # never offers the same record twice
+            out = [r for r in out
+                   if not (r.get("action") == "quarantine_file"
+                           and r.get("stored") == record.get("stored"))]
+    return out

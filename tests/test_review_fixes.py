@@ -30,7 +30,8 @@ def test_removing_a_startup_shortcut_moves_the_lnk_not_its_target(monkeypatch):
     would move the legitimate application the shortcut points at."""
     moved = []
     monkeypatch.setattr(quarantine, "quarantine_file",
-                        lambda path, kill_first=False: moved.append(path) or
+                        lambda path, kill_first=False, kind="":
+                        moved.append(path) or
                         quarantine.Result(True, "moved"))
     entry = P.PersistEntry(
         kind="startup-folder", location=r"C:\Users\x\...\Startup",
@@ -46,7 +47,8 @@ def test_removing_a_startup_shortcut_moves_the_lnk_not_its_target(monkeypatch):
 def test_a_plain_startup_file_still_removes_itself(monkeypatch):
     moved = []
     monkeypatch.setattr(quarantine, "quarantine_file",
-                        lambda path, kill_first=False: moved.append(path) or
+                        lambda path, kill_first=False, kind="":
+                        moved.append(path) or
                         quarantine.Result(True, "moved"))
     item = r"C:\Users\x\...\Startup\dropper.exe"
     P.remove_entry(P.PersistEntry(kind="startup-folder", location="f", name="d",
