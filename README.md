@@ -243,7 +243,7 @@ What it reads:
 | --- | --- |
 | Run / RunOnce keys (HKCU, HKLM, Wow6432Node) | `/etc/crontab`, `/etc/cron.d`, per-user crontabs |
 | Startup folders, including `.lnk` targets | systemd `.service` **and `.timer`** units |
-| Services, including `Parameters\ServiceDll` | `~/.config/autostart`, `/etc/xdg/autostart` |
+| Services and kernel drivers, including `Parameters\ServiceDll` | `~/.config/autostart`, `/etc/xdg/autostart` |
 | Scheduled tasks from `schtasks` **and from task XML on disk** (hidden tasks) | `/etc/ld.so.preload` |
 | IFEO debuggers, AppInit_DLLs, Winlogon Shell/Userinit | `authorized_keys` forced commands |
 | WMI event subscriptions, BITS jobs | shell profiles, `/etc/profile.d`, `/etc/init.d`, `rc.local` |
@@ -251,6 +251,15 @@ What it reads:
 | Active Setup `StubPath`, print monitors | udev rules with `RUN+=` / `PROGRAM=` |
 | Group Policy startup/logon scripts, Office add-ins | |
 | Accessibility binaries replaced by a shell (`sethc.exe`) | |
+
+A service's `ImagePath` is read in all four spellings the service control
+manager accepts — relative, `\SystemRoot\`, `%SystemRoot%` and the `\??\`
+device prefix — because a path that resolves to no file gives the signature,
+unsigned and drop-location checks nothing to look at. Handling only one of
+them left 490 of 793 service entries on the development desktop unchecked. A
+kernel driver registered from outside `System32\drivers` and the DriverStore
+carries its own weight: of 461 driver services here, 460 are in those two
+places, and the one exception is signed.
 
 There is no allowlist of known-good DLLs anywhere in this. Every machine has a
 dozen legitimate netsh helpers and print monitors, and keeping a list of their

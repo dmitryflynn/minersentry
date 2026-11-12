@@ -48,6 +48,47 @@ RARE_KINDS = {"ifeo-debugger", "appinit-dll", "winlogon", "wmi-consumer",
               "hidden-task", "com-hijack", "ld-preload", "ssh-forced-command",
               "netsh-helper", "appcert-dll", "active-setup", "print-monitor",
               "lsa-package", "gpo-script", "pam-module", "udev-rule"}
+# A kernel driver is how a miner gets at the MSRs it wants to tune, and
+# loading one needs a service entry, which this module already reads. Of the
+# 461 driver services on the development machine, 460 sit under
+# System32\drivers or the DriverStore. The single exception is a VPN's driver
+# under Program Files, which is signed and therefore trusted, so this weight
+# is gated on the file NOT being trusted and that exception costs nothing.
+#
+# It is a weight rather than a floor because the file still has to be
+# untrusted, and 30 is chosen so an unsigned driver clears the threshold (45)
+# on the location alone: nothing legitimate loads a driver from a user-
+# writable directory, and waiting for a second indicator would mean waiting
+# for the driver to already be in use.
+W_ROGUE_DRIVER = 30
+_DRIVER_SUBDIRS = (r"System32\drivers", r"System32\DriverStore",
+                   r"SysWOW64\drivers")
+
+
+def driver_dirs(system_root: str | None = None) -> tuple[str, ...]:
+    """The directories a kernel driver legitimately loads from."""
+    root = system_root or os.environ.get("SystemRoot", r"C:\Windows")
+    return tuple(ntpath.join(root, sub) for sub in _DRIVER_SUBDIRS)
+
+
+def is_rogue_driver(exe: str, system_root: str | None = None,
+                    under=trust.in_trusted_dir) -> bool:
+    r"""True if `exe` is a .sys outside the directories drivers load from.
+
+    The containment test is `trust.in_trusted_dir`, which matches whole path
+    components against an absolute root, rather than a substring test. A
+    substring test would accept `C:\Users\x\system32\drivers\evil.sys` —
+    anyone can create a folder with that name — which is the same mistake that
+    once let `C:\Program Files2` count as being under `C:\Program Files`.
+    """
+    if not exe or not exe.lower().endswith(".sys"):
+        return False
+    # normpath first, or a traversal defeats the containment test:
+    # C:\Windows\System32\drivers\..\..\Users\x\evil.sys starts with the
+    # driver directory as a string while the file is somewhere else entirely.
+    return not under(ntpath.normpath(exe), driver_dirs(system_root))
+
+
 # An accessibility binary replaced by a shell is not a matter of degree: the
 # file in System32 IS cmd.exe. Nothing legitimate does this, so it gets a floor
 # rather than a weight, and the floor alone is enough to report.
@@ -71,6 +112,76 @@ class PersistEntry:
     @property
     def summary(self) -> str:
         return f"{self.kind}: {self.name} -> {self.exe or self.command[:60]}"
+
+
+_DEVICE_PREFIX = "\\??\\"
+_SYSROOT_PREFIX = "\\systemroot\\"
+
+
+def resolve_image_path(command: str, system_root: str | None = None) -> str:
+    r"""Normalise a service `ImagePath` so the path inside it names a real file.
+
+    The service control manager accepts four spellings and this module was
+    only handling one of them. Surveyed across the 793 service entries on the
+    development machine:
+
+        %var%                  276
+        \SystemRoot\ prefix    251
+        RELATIVE               214
+        absolute                51
+        \??\ prefix              1
+
+    Only the `\SystemRoot\` form was expanded, and nothing called
+    `expandvars`, so **490 of 793 service entries (62%) had an `exe` that
+    resolved to no file at all**. That is not a cosmetic problem: with no file
+    to look at, `isfile` fails, so the unsigned weight never applies,
+    `trust.is_trusted` is handed a path that does not exist, and the
+    drop-location hints are matched against a string with no directory in it.
+    A driver registered as `System32\drivers\x.sys` scored 15 where the same
+    driver written absolutely scored 50.
+
+    Arguments are preserved, because an ImagePath often carries them
+    (`svchost.exe -k netsvcs`), and a relative path is joined to the system
+    root rather than the working directory, which is what the SCM does.
+    Pure: no filesystem access, `system_root` injectable.
+    """
+    s = (command or "").strip()
+    if not s:
+        return ""
+    root = system_root or os.environ.get("SystemRoot", r"C:\Windows")
+
+    quote = ""
+    if s[0] in "\"'":
+        end = s.find(s[0], 1)
+        if end > 0:
+            quote, inner, rest = s[0], s[1:end], s[end + 1:]
+        else:
+            quote, inner, rest = s[0], s[1:], ""
+    else:
+        inner, rest = s, ""
+
+    inner = os.path.expandvars(inner)
+    low = inner.lower()
+    if low.startswith(_DEVICE_PREFIX):
+        inner = inner[len(_DEVICE_PREFIX):]
+    elif low.startswith(_SYSROOT_PREFIX):
+        inner = ntpath.join(root, inner[len(_SYSROOT_PREFIX):])
+    elif not _looks_absolute(inner):
+        inner = ntpath.join(root, inner)
+
+    return f"{quote}{inner}{quote}{rest}" if quote else inner
+
+
+def _looks_absolute(path: str) -> bool:
+    r"""True for `C:\...`, `\\server\share\...` and `/...`.
+
+    A single leading backslash (`\Windows\x.sys`) is deliberately NOT absolute:
+    it is rooted on the current drive, and `ntpath.join` against the system
+    root resolves it to that drive, which is what the SCM does.
+    """
+    return bool(path) and (
+        path.startswith("\\\\") or path.startswith("/")
+        or (len(path) > 1 and path[1] == ":"))
 
 
 def command_exe(command: str, isfile=os.path.isfile) -> str:
@@ -109,8 +220,12 @@ def command_exe(command: str, isfile=os.path.isfile) -> str:
         candidate = " ".join(parts[:n])
         if isfile(candidate):
             return candidate
+        # .sys and .dll are here because services and ServiceDll entries point
+        # at them; without them a kernel driver whose path contains a space
+        # fell through to parts[0] and was truncated at the space.
         if candidate.lower().endswith((".exe", ".bat", ".cmd", ".com", ".scr",
-                                       ".ps1", ".vbs", ".js", ".sh")):
+                                       ".ps1", ".vbs", ".js", ".sh", ".sys",
+                                       ".dll")):
             return candidate
     return parts[0]
 
@@ -153,6 +268,10 @@ def score_entry(entry: PersistEntry, cfg: Config,
             if isfile(entry.exe):
                 score += W_UNSIGNED
                 labels.append("unsigned binary outside the system directories")
+            if is_rogue_driver(entry.exe):
+                score += W_ROGUE_DRIVER
+                labels.append("kernel driver loaded from outside the driver "
+                              "directories")
         if len(name_stem(base)) <= 3 and not exe_l.startswith(cfg.trusted_dirs):
             labels.append("very short name")
 
@@ -349,10 +468,8 @@ def _collect_windows(cfg: Config) -> list[PersistEntry]:
                     continue
                 if not isinstance(image, str) or start == 4:   # 4 = disabled
                     continue
-                image = image.strip()
-                if image.lower().startswith("\\systemroot\\"):
-                    image = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
-                                         image[len("\\systemroot\\"):])
+                # Four spellings reach here, not one: see resolve_image_path.
+                image = resolve_image_path(image)
                 out.append(PersistEntry(kind="service",
                                         location=r"HKLM\SYSTEM\CurrentControlSet\Services",
                                         name=svc, command=image,
@@ -529,7 +646,9 @@ def _collect_service_dlls() -> list[PersistEntry]:
                 continue
             if not isinstance(dll, str) or not dll.strip():
                 continue
-            dll = os.path.expandvars(dll.strip())
+            # A ServiceDll is stored the same four ways an ImagePath is; this
+            # path previously only called expandvars.
+            dll = resolve_image_path(dll)
             out.append(PersistEntry(
                 kind="service-dll",
                 location=rf"HKLM\SYSTEM\CurrentControlSet\Services\{svc}\Parameters",
