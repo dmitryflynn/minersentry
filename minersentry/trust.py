@@ -13,7 +13,9 @@ a standard trusted directory. Results are cached by path.
 from __future__ import annotations
 
 import ctypes
+import ntpath
 import os
+import posixpath
 import sys
 from ctypes import wintypes
 
@@ -95,12 +97,23 @@ def _under(path: str, dirs: tuple[str, ...]) -> bool:
     C:\Program Files, and any user can create new folders in the root of C:\.
     Separator and case handling follow the path's own style (a path containing a
     backslash or drive colon is treated as Windows), so it is testable anywhere.
+
+    The path is NORMALISED before the comparison, because a prefix test on a
+    raw string is defeated by a traversal:
+
+        C:\Windows\System32\..\..\Users\x\AppData\Local\Temp\miner.exe
+
+    begins with a trusted directory while the file is in Temp. A Run key or
+    service ImagePath holding that spelling scored 10 instead of 50 — below
+    the reporting threshold — and the registry value is attacker-controlled,
+    so this was reachable. Process images come from the OS already normalised,
+    so this changes nothing for the behavioral signals.
     """
     win = "\\" in path or (len(path) > 1 and path[1] == ":")
     if win:
-        p, sep = path.lower().replace("/", "\\"), "\\"
+        p, sep = ntpath.normpath(path).lower().replace("/", "\\"), "\\"
     else:
-        p, sep = path, "/"
+        p, sep = posixpath.normpath(path), "/"
     for d in dirs:
         d = (d.lower().replace("/", "\\") if win else d).rstrip("\\/")
         if d and (p == d or p.startswith(d + sep)):
