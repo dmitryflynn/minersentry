@@ -442,6 +442,18 @@ depends on remembering what was done:
 | Block address | one firewall rule by IP; the miner keeps failing to submit | Unblock |
 | Terminate | ends it, as before | none |
 
+Autostart removals are verified by execution, not only by unit test. A test
+that monkeypatches `subprocess.run` or `winreg` proves the right command was
+*built*; it cannot catch a well-formed command pointed at the wrong thing,
+which is what both destructive bugs found in review turned out to be. So
+`bench/live_removal.py` plants a real entry per kind, runs the real removal,
+checks the entry is gone from the authoritative source, runs the real undo and
+checks it came back unchanged — then cleans up. `bench/live_removal.md` records
+what that covers and, just as importantly, what it does not: a service needs
+Administrator, and the system-wide DLL load points (AppCertDlls, LSA packages,
+netsh helpers, print monitors) are deliberately never planted on a working
+machine.
+
 Suspending your own processes needs no privileges. Firewall rules and moving a
 file out of a system directory need Administrator, and the actions say so rather
 than failing obscurely.

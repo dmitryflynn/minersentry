@@ -45,3 +45,11 @@ packages = ["minersentry"]
 
 [tool.setuptools.dynamic]
 version = { attr = "minersentry.__version__" }
+
+[tool.pytest.ini_options]
+markers = [
+    # Tests that plant a real autostart entry on the machine they run on and
+    # then remove it. Skipped unless MINERSENTRY_LIVE_REMOVAL=1, which
+    # bench/live_removal.py sets; see tests/test_live_removal.py.
+    "live: mutates this machine; opt in with MINERSENTRY_LIVE_REMOVAL=1",
+]
