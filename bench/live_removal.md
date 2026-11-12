@@ -4,7 +4,7 @@ Each row planted a real entry, ran the real removal, checked the entry was gone 
 
 - Host: Windows 11, Python 3.13.14
 - Administrator: no
-- Run: 2026-11-11 19:29
+- Run: 2026-11-11 21:32
 
 | Test | Outcome | Note |
 |---|---|---|

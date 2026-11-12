@@ -438,6 +438,7 @@ depends on remembering what was done:
 | Action | What it does | Undo |
 |---|---|---|
 | Suspend | freezes the process; it stops earning, stays inspectable | Resume |
+| Remove autostart | deletes the registry value, task, or startup file that revives it | Undo a removal |
 | Quarantine | moves the binary where it cannot launch, remembering its home | Restore |
 | Block address | one firewall rule by IP; the miner keeps failing to submit | Unblock |
 | Terminate | ends it, as before | none |
@@ -460,13 +461,19 @@ than failing obscurely.
 
 ## Weakened defences
 
-Before a miner settles in it clears the way, so `--autostart` and
-`--autostart-only` also report what has been done to the machine's defences:
+Before a miner settles in it clears the way, so the autostart scan — the
+`Scan autostart` button in the GUI as well as `--autostart` and
+`--autostart-only` — also reports what has been done to the machine's defences:
 an antivirus **exclusion** covering a folder (far more strongly when MinerSentry
 has already flagged something inside it), real-time protection switched off by
 policy, and `hosts` entries that point antivirus or update domains at nowhere.
 Where the exclusion list needs Administrator to read, it says so instead of
 reporting that nothing is excluded.
+
+The two scans share one pass so the correlation can actually happen: the
+autostart findings' paths are handed to the defence check, and an exclusion
+that covers one of them is reported against it. A serious finding raises a
+banner at the top of the window rather than only appearing in the event log.
 
 ## Configuration
 

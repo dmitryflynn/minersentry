@@ -195,11 +195,18 @@ def list_blocks() -> list[str]:
 
 
 # -- binary quarantine -----------------------------------------------------
-def quarantine_file(path: str, kill_first: bool = False) -> Result:
+def quarantine_file(path: str, kill_first: bool = False,
+                    kind: str = "") -> Result:
     """Move a binary where it cannot be launched, remembering where it was.
 
     A running image is locked on Windows, so the owning processes have to be
     gone first — `kill_first` does that only when the caller asks.
+
+    `kind` records what the file WAS, when the caller knows: an autostart
+    removal passes the entry kind so the record can be told apart from a
+    quarantined process binary. Without it `persistence.removals()` could not
+    see a startup-folder removal at all, and "undo the last removal" restored
+    an older, unrelated entry instead.
     """
     if not os.path.isfile(path):
         return Result(False, f"{path} is not a file.")
@@ -223,7 +230,8 @@ def quarantine_file(path: str, kill_first: bool = False) -> Result:
     except OSError as e:
         hint = "" if is_elevated() else " Moving a file out of a system directory needs Administrator."
         return Result(False, f"Could not quarantine {path}: {e}.{hint}")
-    _record("quarantine_file", original=path, stored=dest)
+    _record("quarantine_file", original=path, stored=dest,
+            **({"kind": kind} if kind else {}))
     return Result(True, f"Moved {os.path.basename(path)} to the quarantine folder.",
                   undo=f"restore_file({dest!r})")
 
