@@ -20,6 +20,7 @@ from collections import defaultdict, deque
 import psutil
 
 from . import cmdline as cmdline_mod
+from . import containers as containers_mod
 from . import memscan, perfcounters, poolintel, power, trust
 from .audit import AuditLog
 from .config import Config
@@ -90,7 +91,7 @@ def _own_code_roots() -> tuple[str, ...]:
 class ProcInfo:
     __slots__ = ("pid", "name", "exe", "username", "cpu", "cpu_mean", "cpu_min",
                  "mem_mb", "threads", "signals", "verdict", "score", "mem_result",
-                 "trusted", "gpu", "ctime")
+                 "trusted", "gpu", "ctime", "container")
 
     def __init__(self, pid: int, cpu: float = 0.0) -> None:
         self.pid = pid
@@ -111,6 +112,10 @@ class ProcInfo:
         # slowest call in a pass) and only when a score would be dampened.
         self.trusted: bool | None = False
         self.ctime: float | None = None   # process start time (PID-reuse guard)
+        # The container or pod this process belongs to, when it is in one.
+        # On a server "which pod" is the answer an operator can act on; a
+        # host PID is gone the moment the container restarts.
+        self.container = None            # containers.Container | None
 
     @property
     def signal_summary(self) -> str:
@@ -153,6 +158,9 @@ class Engine:
         # Recomputing exe()/username()/Authenticode every
         # pass for ~300 processes made each pass multi-second).
         self._meta: dict[int, tuple[str, str, str, bool]] = {}
+        # A process's cgroup never changes, so this is resolved once per
+        # PID like exe and username. Empty on Windows, which has no cgroups.
+        self._container: dict[int, containers_mod.Container | None] = {}
         # PID -> process start time. Every per-PID cache above and below is
         # keyed by PID alone, and Windows recycles PIDs quickly; when the start
         # time changes the PID belongs to a new process and all of its cached
@@ -231,6 +239,7 @@ class Engine:
         self._meta.pop(pid, None)
         self._perf_ratio.pop(pid, None)
         self._cmd_hits.pop(pid, None)
+        self._container.pop(pid, None)
         self._own_tooling.discard(pid)
         self._warm.discard(pid)
         for key in [k for k in self._conn_seen if k[0] == pid]:
@@ -744,6 +753,9 @@ class Engine:
                 self._meta[p.pid] = meta
             info.name, info.exe, info.username, info.trusted = meta
             info.ctime = self._ctime.get(p.pid)
+            if p.pid not in self._container:
+                self._container[p.pid] = containers_mod.of_pid(p.pid)
+            info.container = self._container[p.pid]
             # Another instance of THIS installed binary (same file path) is us.
             # Matching by file name let any miner rename itself MinerSentry.exe
             # and vanish from the scan entirely.
@@ -870,7 +882,8 @@ class Engine:
             self.audit.record_detection(
                 pid=info.pid, name=info.name, exe=info.exe,
                 score=info.score, verdict=info.verdict,
-                signals=[(s.name, s.score, s.detail) for s in info.signals])
+                signals=[(s.name, s.score, s.detail) for s in info.signals],
+                container=info.container.label if info.container else "")
 
     def set_probe_drops(self, drops: dict[int, float]) -> None:
         self._probe_drops = dict(drops)

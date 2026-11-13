@@ -20,6 +20,7 @@ from typing import Callable
 from .config import Config
 from .engine import Engine, ProcInfo
 from . import gpu as gpu_mod
+from . import containers as containers_mod
 from . import persistence as persist_mod
 from . import tamper as tamper_mod
 
@@ -135,6 +136,13 @@ def summarize(e: Engine, results: list[ProcInfo], first_hit: dict[int, float],
             "ttd_s": first_hit.get(r.pid),
             "signals": {s.name: s.score for s in r.signals if s.score > 0},
             "memory_coverage": _coverage(r),
+            # Only present when there is one, so a host machine's output does
+            # not gain a column of nulls.
+            **({"container": {"runtime": r.container.runtime,
+                              "id": r.container.id,
+                              "pod": r.container.pod,
+                              "label": r.container.label}}
+               if getattr(r, "container", None) else {}),
         })
     procs.sort(key=lambda p: p["score"], reverse=True)
     rep = e.hidden_report
@@ -143,6 +151,12 @@ def summarize(e: Engine, results: list[ProcInfo], first_hit: dict[int, float],
         "likely_miners": sum(1 for p in procs if p["verdict"] == "Likely Miner"),
         "suspicious": sum(1 for p in procs if p["verdict"] == "Suspicious"),
         "hidden_compute": {"flagged": rep.flagged, "note": rep.note},
+        # Grouped, because the container is the unit an operator acts on: four
+        # busy PIDs in one pod is one thing to go and look at, not four.
+        "containers": containers_mod.summarize(
+            {r.pid: r.container for r in results
+             if getattr(r, "container", None)},
+            scores={r.pid: r.score for r in results}),
         "config_warnings": list(getattr(getattr(e, "cfg", None), "load_warnings", []) or []),
         "processes": procs,
     }
@@ -298,6 +312,13 @@ def main(argv: list[str] | None = None) -> int:
             ttd = f"  (detected +{p['ttd_s']}s)" if p["ttd_s"] is not None else ""
             print(f"{p['pid']:>7}  {p['cpu']:>5.0f} {p['gpu']:>5.0f} {p['score']:>5}  "
                   f"{p['verdict']:<13} {p['name']}{ttd}")
+        if summary.get("containers"):
+            print("\nContainers:")
+            for c in summary["containers"]:
+                shown = ", ".join(str(x) for x in c["pids"][:8])
+                more = f" (+{len(c['pids']) - 8})" if len(c["pids"]) > 8 else ""
+                worst = f"  worst {c['worst']}" if c["worst"] else ""
+                print(f"  {c['label']:<44} pid {shown}{more}{worst}")
         if summary["hidden_compute"]["flagged"]:
             print("\n[!] hidden compute: " + summary["hidden_compute"]["note"])
         print(f"\n{summary['likely_miners']} likely miner(s), "
