@@ -23,11 +23,35 @@ Two honest caveats:
   cache too. The score reflects that: a hit is corroboration, and the detail
   says what was resolved so a person can judge it.
 
-One trap this has to avoid: MinerSentry's own pool-IP resolution (on by
-default) looks up every known pool domain, and those lookups land in the same
-cache. Reporting them would be the tool convicting itself — the same mistake as
-flagging its own benchmark. `poolintel.our_lookups()` records what we resolved
-and those entries are excluded.
+**The trap this has to avoid, and what it cost to get right.** MinerSentry's
+own pool-IP resolution looks up every known pool domain, and those lookups land
+in this very cache. Reporting them is the tool citing itself as evidence — the
+same mistake as flagging its own benchmark.
+
+Two earlier attempts were not enough, and the second produced eleven false
+findings on a working machine:
+
+1. Recording what *this process* resolved. Useless across restarts: a freshly
+   started scan knows nothing about the lookups the previous run made, and a
+   DNS entry outlives the process that caused it.
+2. Excluding the known-pool list while `pool_intel_enabled` is on. Wrong
+   condition — whether we resolved those domains ten minutes ago has nothing to
+   do with the current setting. Turning pool intel *off* unmasked nine domains
+   we had resolved ourselves. Worse, two of the eleven were CNAME *targets* of
+   our lookups (`pool-phx.supportxmr.com` behind `pool.supportxmr.com`) and so
+   were not on the list at all — an exact-name exclusion could never have
+   caught them.
+
+What works is stateless and does not depend on configuration: never report a
+hostname under a domain we are capable of resolving ourselves. The whole
+registrable domain of every known pool is excluded, which covers the names we
+ask for and the CNAME chains they drag in.
+
+Nothing of value is lost. A miner talking to a *listed* pool is already caught
+by the network signal, at a higher score, through the IPs that resolution
+produced. What this check uniquely adds is a pool-shaped hostname on a domain
+we have never heard of — which is also the case the bundled list can never
+cover.
 """
 
 from __future__ import annotations
@@ -44,10 +68,11 @@ from .config import Config
 
 IS_WINDOWS = sys.platform == "win32"
 
-# A cached lookup of a domain on the known list is strong corroboration; a
-# keyword match on an unknown host is weaker, because the keywords are
-# substrings ("randomx", "xmr-") that a legitimate hostname can carry.
-SCORE_KNOWN_POOL = 60
+# Every finding here is a keyword match on a domain we do not resolve
+# ourselves (see the module docstring on why the known list is excluded
+# outright). The keywords are substrings — "randomx", "xmr-" — that a
+# legitimate hostname can carry, and the cache cannot say which process
+# asked, so this corroborates and never convicts on its own.
 SCORE_KEYWORD = 40
 
 
@@ -120,35 +145,53 @@ def read_cache() -> tuple[list[tuple[str, str]], str]:
     return [], "resolvectl show-cache"
 
 
+def registrable_domain(hostname: str) -> str:
+    """The last two labels of a hostname. Pure.
+
+    An approximation of the registrable domain — it treats `example.co.uk` as
+    `co.uk` — and that is acceptable here because it is only ever used to
+    decide what to EXCLUDE. Over-excluding costs a finding; under-excluding
+    reports our own lookups as evidence, which is far worse.
+    """
+    parts = [p for p in (hostname or "").lower().rstrip(".").split(".") if p]
+    return ".".join(parts[-2:]) if len(parts) >= 2 else ".".join(parts)
+
+
+def our_domains(known=None) -> set[str]:
+    """Registrable domains MinerSentry resolves itself, so never reports."""
+    known = poolintel.KNOWN_POOL_DOMAINS if known is None else known
+    return {registrable_domain(d) for d in known}
+
+
 def findings_for(entries: list[tuple[str, str]], where: str,
                  ours: dict[str, float] | None = None,
                  is_pool=poolintel.is_pool_hostname,
                  known=None) -> list[DnsFinding]:
     """Score the cache contents. Pure, so it is tested against captured output.
 
-    `ours` is what this process resolved itself; those entries are dropped.
+    Excludes every hostname under a domain we resolve ourselves, and anything
+    this process is recorded as having looked up. See the module docstring:
+    without the domain-level rule the tool reports its own lookups, including
+    the CNAME targets behind them.
     """
     ours = ours or {}
-    known = (poolintel.KNOWN_POOL_DOMAINS if known is None else known)
-    known_lower = {d.lower().rstrip(".") for d in known}
+    skip_domains = our_domains(known)
     seen: dict[str, DnsFinding] = {}
     for host, data in entries:
         if not host or host in ours:
             continue
+        if registrable_domain(host) in skip_domains:
+            continue        # ours, or a CNAME target dragged in by ours
         if not is_pool(host):
             continue
-        exact = host in known_lower
-        score = SCORE_KNOWN_POOL if exact else SCORE_KEYWORD
-        existing = seen.get(host)
-        if existing is not None and existing.score >= score:
+        if host in seen:
             continue
-        labels = ["on the known mining-pool list" if exact
-                  else "hostname carries a mining-pool keyword",
-                  "the resolver cache does not record which process asked"]
         seen[host] = DnsFinding(
             kind="pool-lookup", hostname=host,
             detail=f"{host} was resolved" + (f" -> {data}" if data else ""),
-            where=where, score=score, labels=labels)
+            where=where, score=SCORE_KEYWORD,
+            labels=["hostname carries a mining-pool keyword",
+                    "the resolver cache does not record which process asked"])
     return sorted(seen.values(), key=lambda f: (-f.score, f.hostname))
 
 
@@ -157,18 +200,11 @@ def scan(cfg: Config | None = None) -> list[DnsFinding]:
     cfg = cfg or Config.load()
     if not getattr(cfg, "dns_cache_enabled", True):
         return []
+    # Not conditioned on pool_intel_enabled: whether we resolved those domains
+    # ten minutes ago has nothing to do with the current setting, and making
+    # that mistake produced eleven false findings. findings_for() excludes the
+    # registrable domains outright.
     ours = dict(poolintel.our_lookups())
-    if getattr(cfg, "pool_intel_enabled", True):
-        # Pool-IP intelligence resolves EVERY known pool domain, on a timer,
-        # and those lookups sit in this same cache. our_lookups() only knows
-        # what THIS process resolved, so a freshly started scan would report
-        # the previous run's lookups as evidence. Excluding the known list
-        # while pool intel is on is stateless and loses nothing: a miner that
-        # talks to a domain on that list is already caught by the network
-        # signal, through the IPs that resolution produced. What the DNS cache
-        # uniquely adds is a pool hostname that is NOT on our list.
-        ours.update({d.lower().rstrip("."): 0.0
-                     for d in poolintel.KNOWN_POOL_DOMAINS})
     entries, where = read_cache()
     if not entries:
         # Say nothing rather than implying the cache was clean: on Linux

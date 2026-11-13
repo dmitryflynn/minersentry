@@ -77,13 +77,16 @@ def test_unparseable_output_yields_nothing_rather_than_raising(text):
 
 
 # == scoring ==============================================================
-def test_a_known_pool_domain_scores_higher_than_a_keyword_match(monkeypatch):
+def test_only_hostnames_we_never_resolve_ourselves_are_reported(monkeypatch):
+    """A domain on the known list is excluded outright, because MinerSentry
+    resolves those itself and would otherwise cite its own lookups. Nothing is
+    lost: a miner talking to a listed pool is caught by the network signal at
+    a higher score, through the IPs that resolution produced."""
     _untouched_lookups(monkeypatch)
     out = D.findings_for(D.parse_resolvectl_cache(RESOLVECTL), "resolvectl")
-    by_host = {f.hostname: f for f in out}
-    assert by_host["pool.supportxmr.com"].score == D.SCORE_KNOWN_POOL
-    assert by_host["rx-randomx.miner-host.example"].score == D.SCORE_KEYWORD
-    assert out[0].score >= out[-1].score, "worst first"
+    hosts = {f.hostname for f in out}
+    assert hosts == {"rx-randomx.miner-host.example"}
+    assert out[0].score == D.SCORE_KEYWORD
 
 
 def test_ordinary_hostnames_are_not_reported(monkeypatch):
@@ -106,7 +109,7 @@ def test_every_finding_says_the_cache_cannot_name_the_process(monkeypatch):
 
 def test_the_same_host_twice_is_one_finding(monkeypatch):
     _untouched_lookups(monkeypatch)
-    entries = [("pool.supportxmr.com", "1.1.1.1")] * 4
+    entries = [("rx-randomx.miner-host.example", "1.1.1.1")] * 4
     assert len(D.findings_for(entries, "x")) == 1
 
 
@@ -151,26 +154,49 @@ def test_a_lookup_is_recorded_even_when_resolution_fails(monkeypatch):
         "the record must be normalised the same way the cache entries are"
 
 
-def test_with_pool_intel_on_the_known_list_is_excluded_entirely(monkeypatch):
-    """our_lookups() only knows this process. A freshly started scan would
-    otherwise report the previous run's lookups, so while pool intel is on the
-    whole known list is excluded -- statelessly, and losing nothing: a miner
-    talking to a listed domain is already caught by the network signal through
-    the IPs that resolution produced."""
-    monkeypatch.setattr(poolintel, "_OUR_LOOKUPS", {})
+def test_a_cname_target_of_our_own_lookup_is_not_reported(monkeypatch):
+    """The bug that made the first two attempts at this useless. Resolving
+    pool.supportxmr.com drags pool-phx.supportxmr.com into the cache as a
+    CNAME target. That name is NOT on the known list, so an exact-name
+    exclusion reported it -- and on a real machine two of eleven false
+    findings were exactly this. The exclusion is by registrable domain."""
+    _untouched_lookups(monkeypatch)
+    entries = [("pool-phx.supportxmr.com", "1.1.1.1"),
+               ("rx-us.unmineable.com", "2.2.2.2"),
+               ("rx-randomx.miner-host.example", "3.3.3.3")]
+    hosts = {f.hostname for f in D.findings_for(entries, "x")}
+    assert hosts == {"rx-randomx.miner-host.example"}
+
+
+def test_the_exclusion_does_not_depend_on_configuration(monkeypatch):
+    """The second attempt excluded the known list only while
+    pool_intel_enabled was on. Wrong condition: whether we resolved those
+    domains ten minutes ago has nothing to do with the current setting, and
+    turning pool intel off unmasked nine domains we had resolved ourselves."""
+    _untouched_lookups(monkeypatch)
     monkeypatch.setattr(D, "read_cache", lambda: (
         [("pool.supportxmr.com", "1.1.1.1"),
+         ("pool-phx.supportxmr.com", "1.1.1.2"),
          ("rx-randomx.miner-host.example", "2.2.2.2")], "test"))
+    for flag in (True, False):
+        hosts = {f.hostname for f in D.scan(Config(pool_intel_enabled=flag))}
+        assert hosts == {"rx-randomx.miner-host.example"}, (
+            f"pool_intel_enabled={flag} changed what was reported")
 
-    on = {f.hostname for f in D.scan(Config(pool_intel_enabled=True))}
-    assert "pool.supportxmr.com" not in on
-    assert "rx-randomx.miner-host.example" in on, (
-        "the unknown pool hostname is exactly what this signal adds")
 
-    off = {f.hostname for f in D.scan(Config(pool_intel_enabled=False))}
-    assert "pool.supportxmr.com" in off, (
-        "with pool intel off we never resolved it, so a cached lookup is "
-        "someone else's")
+@pytest.mark.parametrize("host,expected", [
+    ("pool-phx.supportxmr.com", "supportxmr.com"),
+    ("xmr-eu1.nanopool.org", "nanopool.org"),
+    ("a.b.c.example.net", "example.net"),
+    ("example.com", "example.com"),
+    ("single", "single"),
+    ("", ""),
+])
+def test_the_registrable_domain_is_the_last_two_labels(host, expected):
+    """An approximation -- it treats example.co.uk as co.uk -- and that is
+    fine because it is only used to decide what to EXCLUDE. Over-excluding
+    costs a finding; under-excluding reports our own lookups as evidence."""
+    assert D.registrable_domain(host) == expected
 
 
 # == honest about not having looked =======================================
@@ -281,3 +307,88 @@ def test_a_failing_dns_scan_does_not_stop_the_watcher(monkeypatch, tmp_path):
                            tamper_check_interval=0),
                 once=True, audit=AuditLog(path=str(tmp_path / "d.jsonl")),
                 alert=False)   # must simply return
+
+
+# == the GUI's host-findings panel ========================================
+def test_the_gui_runs_the_lookup_check_in_the_same_pass(monkeypatch):
+    from types import SimpleNamespace
+    from minersentry import gui as gui_mod
+    from minersentry.gui import MinerSentryApp
+
+    monkeypatch.setattr(gui_mod.persist_mod, "scan", lambda cfg: [])
+    monkeypatch.setattr(gui_mod.tamper_mod, "scan",
+                        lambda cfg, flagged_paths=(): [])
+    finding = D.DnsFinding(kind="pool-lookup", hostname="rx.evil.example",
+                           detail="rx.evil.example was resolved", where="t",
+                           score=40)
+    monkeypatch.setattr(gui_mod.dns_mod, "scan", lambda cfg: [finding])
+
+    posted = []
+    MinerSentryApp._autostart_thread(SimpleNamespace(
+        engine=SimpleNamespace(cfg=Config()),
+        q=SimpleNamespace(put=posted.append)))
+    assert posted[-1][0] == "autostart"
+    assert posted[-1][3] == [finding], "the lookups were not passed through"
+
+
+def test_a_failing_lookup_check_does_not_lose_the_rest(monkeypatch):
+    from types import SimpleNamespace
+    from minersentry import gui as gui_mod
+    from minersentry.gui import MinerSentryApp
+
+    monkeypatch.setattr(gui_mod.persist_mod, "scan", lambda cfg: [])
+    monkeypatch.setattr(gui_mod.tamper_mod, "scan",
+                        lambda cfg, flagged_paths=(): [])
+
+    def boom(cfg):
+        raise OSError("powershell missing")
+    monkeypatch.setattr(gui_mod.dns_mod, "scan", boom)
+
+    posted = []
+    MinerSentryApp._autostart_thread(SimpleNamespace(
+        engine=SimpleNamespace(cfg=Config()),
+        q=SimpleNamespace(put=posted.append)))
+    kinds = [p[0] for p in posted]
+    assert "autostart" in kinds and "event" in kinds
+    assert posted[-1][3] == []
+
+
+def test_the_lookup_panel_text_reads_correctly():
+    from minersentry.gui import MinerSentryApp
+    lines = "\n".join(MinerSentryApp._lookup_lines(None, [
+        D.DnsFinding(kind="pool-lookup", hostname="rx.evil.example",
+                     detail="rx.evil.example was resolved -> 1.2.3.4",
+                     where="Get-DnsClientCache", score=40,
+                     labels=["hostname carries a mining-pool keyword",
+                             "the resolver cache does not record which "
+                             "process asked"])]))
+    assert "1 pool lookup in the resolver cache:" in lines
+    assert "rx.evil.example was resolved -> 1.2.3.4" in lines
+    assert "does not record which process asked" in lines
+
+
+def test_the_lookup_panel_says_when_there_is_nothing():
+    from minersentry.gui import MinerSentryApp
+    assert "none in the resolver cache" in "\n".join(
+        MinerSentryApp._lookup_lines(None, []))
+    unreadable = "\n".join(MinerSentryApp._lookup_lines(None, [D.DnsFinding(
+        kind="dns-unreadable", hostname="", detail="no cache could be read",
+        where="x", score=0)]))
+    assert "no cache could be read" in unreadable
+    assert "none in the resolver cache" not in unreadable
+
+
+def test_a_pool_lookup_raises_no_banner_and_touches_no_row():
+    """It cannot be attributed to a process, so it is logged and shown in the
+    panel but never put on a row or in the defences banner."""
+    from types import SimpleNamespace
+    from minersentry.gui import MinerSentryApp
+    events = []
+    app = SimpleNamespace(_add_event=events.append)
+    MinerSentryApp._log_lookups(app, [
+        D.DnsFinding(kind="pool-lookup", hostname="h", detail="h was resolved",
+                     where="x", score=60),
+        D.DnsFinding(kind="dns-unreadable", hostname="", detail="unreadable",
+                     where="x", score=0)])
+    assert events == ["pool lookup 60: h was resolved",
+                      "pool lookups: unreadable"]

@@ -507,12 +507,17 @@ Two limits, stated plainly because they bound what this is worth:
   browser with DoH on behalf of a page, leaves nothing here. This closes one
   door, not the corridor.
 
-MinerSentry's own pool-IP resolution puts every known pool domain into that same
-cache, so while it is enabled those domains are excluded from this check —
-reporting them would be the tool citing itself as evidence. Nothing is lost: a
-miner talking to a listed domain is already caught by the network signal through
-the IPs that resolution produced. What the cache uniquely adds is a pool hostname
-that is **not** on the list.
+MinerSentry's own pool-IP resolution looks up every known pool domain, and those
+lookups land in this very cache — so reporting them would be the tool citing
+itself as evidence. Excluding the exact names is not enough: resolving
+`pool.supportxmr.com` drags its CNAME target `pool-phx.supportxmr.com` in too,
+and that is not on any list. So the whole registrable domain of every known pool
+is excluded, regardless of configuration.
+
+Nothing of value is lost. A miner talking to a *listed* pool is already caught by
+the network signal, at a higher score, through the IPs that resolution produced.
+What the cache uniquely adds is a pool-shaped hostname on a domain the bundled
+list has never heard of — which is also the case that list can never cover.
 
 ## Configuration
 
