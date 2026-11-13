@@ -91,6 +91,41 @@ It does not name the container: a human-readable name lives in the runtime's API
 not in cgroup, and reaching for it would mean talking to a daemon and failing
 differently on every platform.
 
+A process that starts and exits between two 2.5s passes never appears in the
+table, because by the time there is a row to put it on it is gone. MinerSentry
+subscribes to process-creation events as well, and reports those separately —
+judged on their command line, path and name, since there is no CPU history to
+measure and nothing left to memory-scan. A command line is often enough on its
+own: `-o stratum+tcp://pool…:3333 --donate-level 0` scores 100.
+
+What that covers, measured here with twelve processes per case:
+
+| process lifetime | caught | with a command line |
+| --- | --- | --- |
+| ~10 ms | 0–1 of 12 | 0 |
+| 1 s | 11–12 of 12 | 9–12 |
+| 3 s | 12 of 12 | 12 |
+
+So this is **not** the dropper case. A process that launches and exits in
+milliseconds is still invisible: the subscription is WMI polling
+`Win32_Process`, and a process that never exists at a poll instant is never in
+a snapshot. What it closes reliably is the band between about a second and the
+engine's pass — a miner running in short bursts to stay under a sampling
+monitor, which until now was caught only by luck. `Win32_ProcessStartTrace`
+would catch the millisecond case, but it cannot be subscribed to without
+Administrator and it carries no command line, so even elevated it would yield a
+name and a PID rather than something scoreable. On Linux there is no
+unprivileged equivalent at all — the netlink proc connector needs root — and
+the watcher reports itself unavailable there instead of pretending otherwise.
+
+While this is running you will see **one `powershell.exe` child process** — it
+holds the WMI event subscription and streams one JSON line per process start.
+It is stopped when MinerSentry exits, and it also watches its parent and exits
+on its own if MinerSentry is force-quit or crashes, because none of those run a
+cleanup handler and an orphan would keep a WMI subscription. WMI has a per-user
+quota on those, so a leak is not harmless: eleven orphans from test runs took
+this machine to "Quota violation", after which nothing could subscribe at all.
+
 The deep memory scan targets not just the busiest processes but **any process
 holding a pool connection, a miner-like name, or a RandomX-dataset-sized (~2 GiB)
 private allocation — regardless of CPU**. So a heavily throttled stealth miner

@@ -129,6 +129,10 @@ def run(cfg: Config | None = None, once: bool = False,
     cfg = cfg or Config.load()
     log = audit or AuditLog()
     engine = Engine(cfg=cfg, audit=log)
+    # Record processes that start and exit inside one pass. The watcher is
+    # where this matters most: it runs for days, so a burst miner the poll
+    # never samples is exactly what it should be catching.
+    engine.start_procevents()
     engine.start_pool_intel()
     engine.start_connection_ages()
     for w in cfg.load_warnings:
@@ -138,7 +142,7 @@ def run(cfg: Config | None = None, once: bool = False,
                   "are unreadable, so those are judged on behaviour alone")
     alerted: dict[int, str] = {}
     seen_autostart: set[str] = set()
-    seen_lookups: set[str] = set()
+    alerted_transient: set[tuple[int, float]] = set()
     alerts = 0
     next_deep = 0.0
     next_gpu = 0.0
@@ -219,6 +223,16 @@ def run(cfg: Config | None = None, once: bool = False,
         except Exception as e:  # noqa: BLE001 - a bad pass must not end the watch
             log.event(f"scan error: {type(e).__name__}: {e}")
             results = []
+        # Transient processes: alert once each. The engine has already
+        # journalled them, so this is only the notification.
+        for t in getattr(engine, "transient", []):
+            key = (t.pid, t.ts)
+            if key in alerted_transient:
+                continue
+            alerted_transient.add(key)
+            if alert:
+                notify("MinerSentry: a miner-like process started and exited",
+                       f"{t.summary} (score {t.score}/100)", cfg)
         for r in results:
             if not should_alert(r.verdict, cfg.notify_min_verdict):
                 continue
@@ -235,6 +249,10 @@ def run(cfg: Config | None = None, once: bool = False,
         for pid in [p for p in alerted if p not in live]:
             alerted.pop(pid, None)
         if once:
+            # The process-event helper holds a WMI subscription, and WMI has a
+            # per-user quota on those. A once=True call that leaked one would
+            # exhaust it over repeated runs.
+            engine.close()
             return alerts
         time.sleep(max(0.5, cfg.scan_interval))
 
