@@ -22,6 +22,7 @@ from .audit import AuditLog
 from .engine import Engine, ProcInfo
 from . import gpu as gpu_mod
 from . import persistence as persist_mod
+from . import dnscache as dns_mod
 from . import probe as probe_mod
 from . import quarantine as quarantine_mod
 from . import tamper as tamper_mod
@@ -403,7 +404,9 @@ class MinerSentryApp:
                         self._set_status(note)
                         self._add_event(note)
                 elif kind == "autostart":
-                    self._show_autostart(item[1], item[2] if len(item) > 2 else [])
+                    self._show_autostart(item[1],
+                                         item[2] if len(item) > 2 else [],
+                                         item[3] if len(item) > 3 else [])
                 elif kind == "event":
                     self._add_event(item[1])
                 elif kind == "error":
@@ -580,21 +583,45 @@ class MinerSentryApp:
                 weakened = []
                 self.q.put(("event", f"defence check failed: "
                                      f"{type(e).__name__}: {e}"))
-            self.q.put(("autostart", found, weakened))
+            # Pool lookups in the resolver cache are the third host-level
+            # check and belong in the same pass. They are host-level on
+            # purpose: no resolver cache records which process asked, so these
+            # are reported as findings and never attached to a row.
+            try:
+                lookups = dns_mod.scan(self.engine.cfg)
+            except Exception as e:  # noqa: BLE001
+                lookups = []
+                self.q.put(("event", f"pool-lookup check failed: "
+                                     f"{type(e).__name__}: {e}"))
+            # Kept as its own list rather than appended to `weakened`: the two
+            # share a shape, but the banner would then say "Defences
+            # weakened: x.example was resolved", which is not what happened.
+            self.q.put(("autostart", found, weakened, lookups))
         except Exception as e:  # noqa: BLE001
             self.q.put(("error", f"autostart scan failed: {type(e).__name__}: {e}"))
 
-    def _show_autostart(self, found: list, weakened: list | None = None) -> None:
+    def _show_autostart(self, found: list, weakened: list | None = None,
+                        lookups: list | None = None) -> None:
         weakened = weakened or []
+        lookups = lookups or []
         self._show_tamper(weakened)
+        self._log_lookups(lookups)
         if not found:
             note = "Autostart: no miner-like entries."
             if weakened:
                 note += f" Defences: {len(weakened)} finding(s) — see the detail panel."
+            real_lookups = [f for f in lookups if f.score > 0]
+            if real_lookups:
+                note += f" Pool lookups: {len(real_lookups)}."
             self._set_status(note)
             self._add_event("autostart: nothing miner-like found")
-            if weakened:
-                self._render_tamper_detail(weakened, autostart=[])
+            if weakened or lookups:
+                self.detail_text.configure(state="normal")
+                self.detail_text.delete("1.0", "end")
+                self.detail_text.insert(
+                    "1.0", "\n".join(self._tamper_lines(weakened)
+                                     + self._lookup_lines(lookups)))
+                self.detail_text.configure(state="disabled")
             return
         lines = [f"{len(found)} miner-like autostart entr"
                  f"{'y' if len(found) == 1 else 'ies'}:", ""]
@@ -609,6 +636,7 @@ class MinerSentryApp:
             lines.append("")
             self._add_event(f"autostart {e.score}: {e.summary}")
         lines += self._tamper_lines(weakened)
+        lines += self._lookup_lines(lookups)
         self.detail_text.configure(state="normal")
         self.detail_text.delete("1.0", "end")
         self.detail_text.insert("1.0", "\n".join(lines))
@@ -644,11 +672,36 @@ class MinerSentryApp:
             out.append(f"     note: {f.detail}")
         return out
 
-    def _render_tamper_detail(self, weakened: list, autostart: list) -> None:
-        self.detail_text.configure(state="normal")
-        self.detail_text.delete("1.0", "end")
-        self.detail_text.insert("1.0", "\n".join(self._tamper_lines(weakened)))
-        self.detail_text.configure(state="disabled")
+    # -- pool lookups in the resolver cache --------------------------------
+    def _lookup_lines(self, lookups: list) -> list[str]:
+        """The resolver-cache findings, as detail-panel text."""
+        real = [f for f in lookups if f.score > 0]
+        notes = [f for f in lookups if f.score == 0]
+        out: list[str] = ["", "-" * 48, ""]
+        if not real:
+            out.append("Pool lookups: none in the resolver cache."
+                       if not notes else f"Pool lookups: {notes[0].detail}")
+            return out
+        out.append(f"{len(real)} pool lookup{'' if len(real) == 1 else 's'} "
+                   f"in the resolver cache:")
+        out.append("")
+        for f in real:
+            out.append(f"{f.score:>3}  {f.detail}")
+            for label in f.labels[:2]:
+                out.append(f"       - {label}")
+            out.append(f"     from {f.where}")
+            out.append("")
+        return out
+
+    def _log_lookups(self, lookups: list) -> None:
+        """Log each finding. No banner and no row: the resolver cache does not
+        record which process asked, so there is nothing to attribute this to —
+        putting it on a process would attach a score to the wrong PID."""
+        for f in lookups:
+            if f.score > 0:
+                self._add_event(f"pool lookup {f.score}: {f.detail}")
+            else:
+                self._add_event(f"pool lookups: {f.detail}")
 
     def _show_tamper(self, weakened: list) -> None:
         """Log every finding, and raise a banner for the serious ones.

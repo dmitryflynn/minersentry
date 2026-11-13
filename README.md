@@ -524,6 +524,36 @@ autostart findings' paths are handed to the defence check, and an exclusion
 that covers one of them is reported against it. A serious finding raises a
 banner at the top of the window rather than only appearing in the event log.
 
+## Pool lookups in the resolver cache
+
+The same pass reads the OS resolver cache. Pool-IP intelligence is defeated by a
+private proxy, and a pool on 443 leaves only the command line as evidence — but
+a DNS lookup happens *before* any connection exists, and the miner has to find
+the pool somehow. `Get-DnsClientCache` on Windows and `resolvectl show-cache`
+on Linux both read without privileges.
+
+Two limits, stated plainly because they bound what this is worth:
+
+- **No resolver cache records which process asked.** A hit cannot convict a
+  process. It says a pool domain was resolved on this host, and the connection
+  table is where to look next. It is reported as a host-level finding for the
+  same reason the defence checks are.
+- **DNS-over-HTTPS bypasses the OS resolver entirely.** A miner using DoH, or a
+  browser with DoH on behalf of a page, leaves nothing here. This closes one
+  door, not the corridor.
+
+MinerSentry's own pool-IP resolution looks up every known pool domain, and those
+lookups land in this very cache — so reporting them would be the tool citing
+itself as evidence. Excluding the exact names is not enough: resolving
+`pool.supportxmr.com` drags its CNAME target `pool-phx.supportxmr.com` in too,
+and that is not on any list. So the whole registrable domain of every known pool
+is excluded, regardless of configuration.
+
+Nothing of value is lost. A miner talking to a *listed* pool is already caught by
+the network signal, at a higher score, through the IPs that resolution produced.
+What the cache uniquely adds is a pool-shaped hostname on a domain the bundled
+list has never heard of — which is also the case that list can never cover.
+
 ## Configuration
 
 Two files, deliberately not equal in authority:

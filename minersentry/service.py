@@ -27,6 +27,7 @@ import subprocess
 import sys
 import time
 
+from . import dnscache as dns_mod
 from . import persistence as persist_mod
 from . import tray as tray_mod
 from .audit import AuditLog
@@ -180,6 +181,29 @@ def run(cfg: Config | None = None, once: bool = False,
                 seen_autostart &= current
             except Exception as e:  # noqa: BLE001
                 log.event(f"autostart scan: {type(e).__name__}: {e}")
+            # Pool lookups in the resolver cache, on the same timer. A
+            # host-level finding: the cache does not record which process
+            # asked, so this is logged and alerted once per hostname rather
+            # than attributed to a PID.
+            try:
+                current_dns = set()
+                for f in dns_mod.scan(cfg):
+                    if f.score <= 0:
+                        continue
+                    current_dns.add(f.hostname)
+                    if f.hostname in seen_lookups:
+                        continue
+                    seen_lookups.add(f.hostname)
+                    log.event(f"pool lookup {f.score}: {f.detail}")
+                    if alert:
+                        notify("MinerSentry: a mining pool was looked up",
+                               f"{f.detail}\nThe resolver cache does not say "
+                               f"which process asked.", cfg)
+                # A cache entry expires; if the name is resolved again that is
+                # a fresh lookup and worth saying again.
+                seen_lookups &= current_dns
+            except Exception as e:  # noqa: BLE001
+                log.event(f"dns cache scan: {type(e).__name__}: {e}")
         # Tamper check: if our own autostart entry disappears while we are
         # running, something removed it. Say so instead of dying quietly.
         if installed_at_start and cfg.tamper_check_interval > 0 and now >= next_tamper:
