@@ -442,6 +442,12 @@ class MinerSentryApp:
             f"{r.name}   (PID {r.pid})",
             f"user:  {r.username or '—'}",
             f"path:  {r.exe or '—'}",
+        ]
+        # Only when it is in one: a line reading "container: —" on every row of
+        # a desktop scan is noise, and on a server it is the line that matters.
+        if getattr(r, "container", None):
+            lines.append(f"in:    {r.container.label}")
+        lines += [
             f"cpu:   {r.cpu:.0f}%  (mean {r.cpu_mean:.0f}% / floor {r.cpu_min:.0f}%)",
             f"mem:   {r.mem_mb:.0f} MB   threads: {r.threads}",
             "",

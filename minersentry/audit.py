@@ -47,13 +47,21 @@ class AuditLog:
                 pass
 
     def record_detection(self, *, pid: int, name: str, exe: str, score: int,
-                         verdict: str, signals: list[tuple[str, int, str]]) -> None:
-        """Persist a detection (verdict transition) as one JSONL record."""
+                         verdict: str, signals: list[tuple[str, int, str]],
+                         container: str = "") -> None:
+        """Persist a detection (verdict transition) as one JSONL record.
+
+        `container` is written only when the process is in one. A host PID is
+        gone the moment a container restarts, so for a containerised workload
+        it is the only durable thing in this record — without it a log read
+        tomorrow cannot say which workload was mining.
+        """
         rec = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "pid": pid, "name": name, "exe": exe,
             "score": score, "verdict": verdict,
             "signals": [{"name": n, "score": s, "detail": d} for n, s, d in signals],
+            **({"container": container} if container else {}),
         }
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)

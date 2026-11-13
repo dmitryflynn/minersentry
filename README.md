@@ -77,6 +77,20 @@ no process is charged for (interrupts, short-lived processes, kernel work), and
 it grows with load. So the first dozen passes learn what is normal for this
 machine, and only a lasting excess on top of that raises the banner.
 
+On Linux, a process in a container is attributed to it. Cloud cryptojacking
+lives in containers, and a host PID is the one number nobody can act on — it is
+gone the moment the container restarts, and it does not say which deployment to
+roll back. `/proc/<pid>/cgroup` gives the runtime, the container ID, and the
+Kubernetes pod UID where there is one, which is enough to find the workload with
+one `docker inspect` or `kubectl get pod`. Docker, containerd, CRI-O, Podman and
+LXC are each recognised by their own cgroup shape; a process on the host is left
+alone, because claiming a container for it would send someone to roll back a
+workload that was never involved. The CLI groups the findings by container,
+worst first, and a detection in the audit log records which container it was in.
+It does not name the container: a human-readable name lives in the runtime's API,
+not in cgroup, and reaching for it would mean talking to a daemon and failing
+differently on every platform.
+
 The deep memory scan targets not just the busiest processes but **any process
 holding a pool connection, a miner-like name, or a RandomX-dataset-sized (~2 GiB)
 private allocation — regardless of CPU**. So a heavily throttled stealth miner
