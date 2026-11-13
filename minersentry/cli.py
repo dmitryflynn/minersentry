@@ -22,6 +22,7 @@ from .engine import Engine, ProcInfo
 from . import gpu as gpu_mod
 from . import containers as containers_mod
 from . import persistence as persist_mod
+from . import dnscache as dns_mod
 from . import tamper as tamper_mod
 
 
@@ -176,6 +177,23 @@ def _print_autostart(found: list[dict]) -> None:
         print(f"       in {f['location']}")
 
 
+def _print_dns(found: list[dict]) -> None:
+    """Pool lookups in the resolver cache. Host-level: the cache does not
+    record which process asked, so this corroborates and cannot convict."""
+    real = [f for f in found if f["score"] > 0]
+    if not real:
+        notes = [f for f in found if f["score"] == 0]
+        print("\nPool lookups: none in the resolver cache." if not notes
+              else "\nPool lookups: " + notes[0]["detail"])
+        return
+    print(f"\nPool lookups: {len(real)} in the resolver cache "
+          f"(no process attribution -- see which process holds a connection)")
+    for f in real:
+        print(f"  {f['score']:>3}  {f['detail'][:72]}")
+        for label in f["labels"][:1]:
+            print(f"       - {label}")
+
+
 def _print_tamper(found: list[dict]) -> None:
     """Weakened defences: exclusions, disabled protection, hosts redirects."""
     real = [f for f in found if f["score"] > 0]
@@ -195,13 +213,16 @@ def _report_autostart(cfg: Config, as_json: bool) -> int:
     entries = persist_mod.scan(cfg)
     flagged = tuple(e.exe for e in entries if e.exe)
     tampering = tamper_mod.summarize(tamper_mod.scan(cfg, flagged_paths=flagged))
+    lookups = dns_mod.summarize(dns_mod.scan(cfg))
     found = persist_mod.summarize(entries)
     if as_json:
         print(json.dumps({"autostart": found, "defences": tampering,
+                          "pool_lookups": lookups,
                           "config_warnings": list(cfg.load_warnings)}, indent=2))
     else:
         _print_autostart(found)
         _print_tamper(tampering)
+        _print_dns(lookups)
     return 0
 
 
@@ -302,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
         summary["autostart"] = persist_mod.summarize(entries)
         summary["defences"] = tamper_mod.summarize(tamper_mod.scan(
             cfg, flagged_paths=tuple(e.exe for e in entries if e.exe)))
+        summary["pool_lookups"] = dns_mod.summarize(dns_mod.scan(cfg))
 
     if args.json:
         print(json.dumps(summary, indent=2))
@@ -326,6 +348,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.autostart:
             _print_autostart(summary["autostart"])
             _print_tamper(summary["defences"])
+            _print_dns(summary["pool_lookups"])
     return 0
 
 

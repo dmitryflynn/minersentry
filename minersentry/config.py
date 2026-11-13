@@ -71,6 +71,9 @@ class Config:
     net_score_known_pool: int = 90    # connected to a resolved known-pool IP
     pool_intel_enabled: bool = True
     pool_refresh_seconds: float = 900.0
+    # Read the OS resolver cache for pool lookups. A host-level finding, not a
+    # process signal: no resolver cache records which process asked.
+    dns_cache_enabled: bool = True
 
     # -- name/path signal ----------------------------------------------------
     # Known brand basenames, with delimiter/numeric suffix variants. Generic
