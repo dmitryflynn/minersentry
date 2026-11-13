@@ -198,6 +198,16 @@ class Config:
     persistence_enabled: bool = True
     persistence_min_score: int = 45
     persistence_interval: float = 900.0   # background re-scan seconds (0 = off)
+
+    # -- transient processes -------------------------------------------------
+    # Subscribe to process-creation events, so a process that starts and exits
+    # between two 2.5s passes is still recorded. Covers roughly the 1s-2.5s
+    # band; a process that lives milliseconds is still missed. See procevents.
+    procevents_enabled: bool = True
+    # A transient process has no CPU history and nothing left to memory-scan,
+    # so it is judged on its command line, path and name alone. Same bar as an
+    # autostart entry, which is scored by the same code for the same reason.
+    procevents_min_score: int = 45
     # How often the watcher re-checks that its OWN autostart entry still exists
     # (0 = off). Something removing it is worth saying out loud.
     tamper_check_interval: float = 300.0

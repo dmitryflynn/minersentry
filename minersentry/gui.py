@@ -91,6 +91,11 @@ class MinerSentryApp:
         self.engine = Engine(audit=self.audit)
         self.engine.start_pool_intel()
         self.engine.start_connection_ages()
+        # Processes that start and exit between two passes never appear in
+        # the table, because by the time there is a row to put them on they
+        # are gone. They go to the event log instead.
+        self.engine.start_procevents()
+        self._shown_transient: set[tuple[int, float]] = set()
         self.monitoring = False
         self.rows: dict[int, ProcInfo] = {}
         self.worker: threading.Thread | None = None
@@ -409,6 +414,21 @@ class MinerSentryApp:
         self.root.after(200, self._poll_queue)
 
     # -- rendering ----------------------------------------------------------
+    def _log_transient(self) -> None:
+        """Report processes that started and may already be gone.
+
+        There is no row for these: the process has exited, so there is no
+        CPU to show and nothing to select. The event log is the honest
+        place for them.
+        """
+        for t in getattr(self.engine, "transient", []):
+            key = (t.pid, t.ts)
+            if key in self._shown_transient:
+                continue
+            self._shown_transient.add(key)
+            self._add_event(f"started and exited, score {t.score}: "
+                            f"{t.summary}")
+
     def _render(self, results: list[ProcInfo], deep: bool, dt: float) -> None:
         self.rows = {r.pid: r for r in results}
         selected = self.tree.selection()
@@ -439,6 +459,8 @@ class MinerSentryApp:
         if sel_pid is not None and str(sel_pid) in wanted_ids:
             self.tree.selection_set(str(sel_pid))
             self._show_detail(sel_pid)
+
+        self._log_transient()
 
         # Hidden-compute banner.
         rep = self.engine.hidden_report
@@ -818,8 +840,26 @@ class MinerSentryApp:
 
 def main() -> None:
     root = tk.Tk()
-    MinerSentryApp(root)
-    root.mainloop()
+    app = MinerSentryApp(root)
+
+    def on_close() -> None:
+        # The process-event helper holds a WMI subscription, and WMI has a
+        # per-user quota on those: closing the window without stopping it
+        # leaves a PowerShell process behind for the rest of the session.
+        try:
+            app.engine.close()
+        except Exception:  # noqa: BLE001
+            pass
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    try:
+        root.mainloop()
+    finally:
+        try:
+            app.engine.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 if __name__ == "__main__":
