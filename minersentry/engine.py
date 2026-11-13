@@ -21,6 +21,7 @@ import psutil
 
 from . import cmdline as cmdline_mod
 from . import containers as containers_mod
+from . import procevents as procevents_mod
 from . import memscan, perfcounters, poolintel, power, trust
 from .audit import AuditLog
 from .config import Config
@@ -161,6 +162,12 @@ class Engine:
         # A process's cgroup never changes, so this is resolved once per
         # PID like exe and username. Empty on Windows, which has no cgroups.
         self._container: dict[int, containers_mod.Container | None] = {}
+        # Process-creation events. Deliberately NOT started here: starting
+        # it spawns a helper process, and an Engine is constructed freely
+        # (every test, the benchmark, each CLI run). Callers that want it
+        # ask for it with start_procevents().
+        self._procevents: procevents_mod.Watcher | None = None
+        self.transient: list[procevents_mod.ProcEvent] = []
         # PID -> process start time. Every per-PID cache above and below is
         # keyed by PID alone, and Windows recycles PIDs quickly; when the start
         # time changes the PID belongs to a new process and all of its cached
@@ -651,6 +658,60 @@ class Engine:
         return r
 
     # -- one pass -----------------------------------------------------------
+    def start_procevents(self) -> bool:
+        """Begin recording process starts. Returns whether it is running.
+
+        Explicit rather than automatic: it spawns a helper process, and an
+        Engine is constructed freely — by every test, the benchmark, and each
+        CLI run — so doing this in __init__ would start a subprocess nobody
+        asked for. Safe to call twice.
+        """
+        if not getattr(self.cfg, "procevents_enabled", True):
+            return False
+        if self._procevents is not None:
+            return self._procevents.available
+        self._procevents = procevents_mod.Watcher(self.cfg)
+        started = self._procevents.start()
+        if started:
+            self.audit.event("transient-process watch: "
+                             f"{self._procevents.mode}")
+        elif self._procevents.error:
+            self.audit.event("transient-process watch unavailable: "
+                             + self._procevents.error)
+        return started
+
+    @property
+    def procevents_mode(self) -> str:
+        return self._procevents.mode if self._procevents else "off"
+
+    def _collect_transient(self) -> None:
+        """Fold in the processes that started since the last pass.
+
+        These are scored on their command line, path and name only: a process
+        that has exited has no CPU history and nothing left to memory-scan.
+        """
+        watcher = self._procevents
+        if watcher is None or not watcher.available:
+            return
+        threshold = getattr(self.cfg, "procevents_min_score", 45)
+        for event in watcher.drain():
+            if event.score < threshold:
+                continue
+            self.transient.append(event)
+            self.audit.record_detection(
+                pid=event.pid, name=event.name, exe=event.exe,
+                score=event.score, verdict="Transient",
+                signals=[("cmdline", event.score, "; ".join(event.labels[:3]))])
+        # Keep the list bounded; it is a report of this session, not a log.
+        if len(self.transient) > 500:
+            del self.transient[:-500]
+
+    def close(self) -> None:
+        """Stop the helper process, if one was started."""
+        if self._procevents is not None:
+            self._procevents.stop()
+            self._procevents = None
+
     def scan_once(self, deep: bool = False) -> list[ProcInfo]:
         """One light pass over all processes. Cached memory results are applied
         to every process. If `deep`, synchronously memory-scan the top CPU users
@@ -715,6 +776,10 @@ class Engine:
         # self.system_cpu_pct instead) — otherwise two callers steal each other's
         # sampling window and both readings go erratic.
         self.system_cpu_pct = psutil.cpu_percent(None)
+
+        # Processes that started and may already be gone. Drained here so a
+        # caller gets them on the same cadence as everything else.
+        self._collect_transient()
 
         # Hidden-compute accounting: attributed CPU + VM-host loads this pass.
         attributed_raw = sum(raw for _p, raw in procs)

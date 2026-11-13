@@ -21,6 +21,7 @@ from .config import Config
 from .engine import Engine, ProcInfo
 from . import gpu as gpu_mod
 from . import containers as containers_mod
+from . import procevents as procevents_mod
 from . import persistence as persist_mod
 from . import tamper as tamper_mod
 
@@ -43,6 +44,10 @@ def run_session(duration: float, cfg: Config | None = None,
     e = Engine(cfg=cfg or Config.load(), gpu_only=gpu_only)
     e.start_pool_intel()
     e.start_connection_ages()
+    # Processes that start and exit inside one pass are invisible to the poll;
+    # this records them. Started here rather than in Engine() because it
+    # spawns a helper process.
+    e.start_procevents()
     interval = interval if interval is not None else e.cfg.scan_interval
     start = time.time()
     first_hit: dict[int, float] = {}
@@ -151,6 +156,12 @@ def summarize(e: Engine, results: list[ProcInfo], first_hit: dict[int, float],
         "likely_miners": sum(1 for p in procs if p["verdict"] == "Likely Miner"),
         "suspicious": sum(1 for p in procs if p["verdict"] == "Suspicious"),
         "hidden_compute": {"flagged": rep.flagged, "note": rep.note},
+        # Processes that started and may already be gone. Reported apart
+        # from the table on purpose: there is no row to put them on.
+        "transient": procevents_mod.summarize(
+            getattr(e, "transient", []),
+            getattr(getattr(e, "cfg", None), "procevents_min_score", 45)),
+        "transient_watch": getattr(e, "procevents_mode", "off"),
         # Grouped, because the container is the unit an operator acts on: four
         # busy PIDs in one pod is one thing to go and look at, not four.
         "containers": containers_mod.summarize(
@@ -296,6 +307,16 @@ def main(argv: list[str] | None = None) -> int:
     report_pids = pid_set
     if args.gpu_only:
         report_pids = e.gpu_scope if pid_set is None else pid_set & e.gpu_scope
+    try:
+        return _report(e, results, first_hit, args, cfg, report_pids)
+    finally:
+        # The process-event helper holds a WMI subscription, and WMI has a
+        # per-user quota on those. Leaking one per run took this machine to
+        # "Quota violation", after which nothing could subscribe at all.
+        e.close()
+
+
+def _report(e, results, first_hit, args, cfg, report_pids) -> int:
     summary = summarize(e, results, first_hit, watch=args.watch, pids=report_pids)
     if args.autostart:
         entries = persist_mod.scan(cfg)
@@ -312,6 +333,16 @@ def main(argv: list[str] | None = None) -> int:
             ttd = f"  (detected +{p['ttd_s']}s)" if p["ttd_s"] is not None else ""
             print(f"{p['pid']:>7}  {p['cpu']:>5.0f} {p['gpu']:>5.0f} {p['score']:>5}  "
                   f"{p['verdict']:<13} {p['name']}{ttd}")
+        if summary.get("transient"):
+            print("\nStarted and already gone (no process left to score on "
+                  "behaviour):")
+            for t in summary["transient"]:
+                print(f"  {t['score']:>3}  {t['name']} (pid {t['pid']}, "
+                      f"parent {t['ppid']})")
+                if t["cmdline"]:
+                    print(f"       {t['cmdline'][:88]}")
+                for label in t["labels"][:2]:
+                    print(f"       - {label}")
         if summary.get("containers"):
             print("\nContainers:")
             for c in summary["containers"]:
