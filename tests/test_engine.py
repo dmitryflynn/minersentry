@@ -93,3 +93,29 @@ def test_deep_targets_force_survives_cap():
     forced = {91001, 91002, 91003}
     targets = e.deep_scan_targets(limit=6, force=forced)
     assert forced <= set(targets)
+
+
+def test_close_ends_the_background_refresh_loops(monkeypatch):
+    """The loops were `while True` daemon threads, so every engine that started
+    them kept a thread alive for the life of the interpreter. Over a test run
+    that was dozens, and one eventually garbage-collected a Tk object off the
+    main thread, which Tcl treats as fatal."""
+    import threading
+    import time as _time
+    from minersentry import engine as engine_mod
+    from minersentry.config import Config
+
+    monkeypatch.setattr(engine_mod.poolintel, "resolve_pool_ips", lambda: set())
+    monkeypatch.setattr(engine_mod.poolintel, "sample_connection_ages",
+                        lambda now: {})
+    monkeypatch.setattr(engine_mod.sys, "platform", "win32")
+    before = threading.active_count()
+    e = engine_mod.Engine(cfg=Config(pool_intel_enabled=True, gpu_enabled=False))
+    e.start_pool_intel()
+    e.start_connection_ages()
+    assert threading.active_count() >= before + 2
+    e.close()
+    deadline = _time.time() + 5
+    while threading.active_count() > before and _time.time() < deadline:
+        _time.sleep(0.05)
+    assert threading.active_count() <= before, "a refresh loop outlived close()"

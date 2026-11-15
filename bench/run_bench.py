@@ -110,7 +110,10 @@ def run_profile(label: str, args: list[str], duration: float) -> dict:
         target = proc.pid
         e, results, first_hit = run_session(duration, cfg=Config.load(),
                                             gpu_sample="--gpu" in args)
-        summary = summarize(e, results, first_hit)
+        try:
+            summary = summarize(e, results, first_hit)
+        finally:
+            e.close()   # one helper and two refresh threads per profile otherwise
         # The fake_miner runs under this subprocess PID (python.exe).
         row = next((p for p in summary["processes"] if p["pid"] == target), None)
         if row:

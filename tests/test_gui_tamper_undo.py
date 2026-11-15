@@ -266,6 +266,13 @@ def tk_root():
             root.destroy()
         except Exception:  # noqa: BLE001
             pass
+        # Finalise Tk objects HERE, on the thread that made them. Left to the
+        # cyclic collector they are freed on whichever thread happens to
+        # trigger a collection, and Tcl aborts the process when that is not
+        # the main one ("Windows fatal exception 0x80000003", about one run in
+        # two when a background thread was alive).
+        import gc
+        gc.collect()
 
 
 def _banner_app(root):

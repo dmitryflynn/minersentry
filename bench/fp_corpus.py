@@ -99,8 +99,11 @@ def run_profile(label: str, argv: list[str], duration: float) -> dict:
         time.sleep(3.0)
         e, results, first_hit = run_session(duration, cfg=Config.load(),
                                              force_pids={proc.pid})
-        row = next((p for p in summarize(e, results, first_hit, pids={proc.pid})
-                    ["processes"] if p["pid"] == proc.pid), None)
+        try:
+            row = next((p for p in summarize(e, results, first_hit, pids={proc.pid})
+                        ["processes"] if p["pid"] == proc.pid), None)
+        finally:
+            e.close()   # one helper and two refresh threads per workload otherwise
         if row:
             verdict, score, signals = row["verdict"], row["score"], row["signals"]
     except Exception as e:  # noqa: BLE001

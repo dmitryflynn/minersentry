@@ -167,6 +167,10 @@ class Engine:
         # (every test, the benchmark, each CLI run). Callers that want it
         # ask for it with start_procevents().
         self._procevents: procevents_mod.Watcher | None = None
+        # Set by close(). The background refresh loops wait on it instead of
+        # sleeping, so they end when the engine does rather than running for
+        # the life of the interpreter.
+        self._closing = threading.Event()
         self.transient: list[procevents_mod.ProcEvent] = []
         # PID -> process start time. Every per-PID cache above and below is
         # keyed by PID alone, and Windows recycles PIDs quickly; when the start
@@ -707,7 +711,16 @@ class Engine:
             del self.transient[:-500]
 
     def close(self) -> None:
-        """Stop the helper process, if one was started."""
+        """Stop everything this engine started: the process-event helper and
+        the background refresh loops.
+
+        The loops used to be `while True` daemon threads, so every Engine that
+        had started them kept a thread alive until the interpreter exited. In
+        a long test run that left dozens, and one of them eventually ran a
+        garbage collection that finalised a Tk object off the main thread,
+        which Tcl treats as fatal: an intermittent hard crash of the suite.
+        """
+        self._closing.set()
         if self._procevents is not None:
             self._procevents.stop()
             self._procevents = None
@@ -967,12 +980,12 @@ class Engine:
             return
 
         def _loop():
-            while True:
+            while not self._closing.is_set():
                 try:
                     self._conn_ages = poolintel.sample_connection_ages(time.time())
                 except Exception:  # noqa: BLE001
                     pass
-                time.sleep(max(15.0, self.cfg.net_age_refresh_seconds))
+                self._closing.wait(max(15.0, self.cfg.net_age_refresh_seconds))
 
         threading.Thread(target=_loop, daemon=True).start()
 
@@ -984,12 +997,12 @@ class Engine:
             return
 
         def _loop():
-            while True:
+            while not self._closing.is_set():
                 try:
                     self.set_pool_ips(poolintel.resolve_pool_ips())
                 except Exception:  # noqa: BLE001 - DNS must never crash the app
                     pass
-                time.sleep(max(60.0, self.cfg.pool_refresh_seconds))
+                self._closing.wait(max(60.0, self.cfg.pool_refresh_seconds))
 
         threading.Thread(target=_loop, daemon=True).start()
 
