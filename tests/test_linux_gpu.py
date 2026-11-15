@@ -74,21 +74,24 @@ def test_windows_keeps_existing_collectors():
     # _sample_pdh_compute became _sample_windows: pmon first (it is what
     # actually reads NVIDIA compute), PDH behind it for other vendors.
     with patch.object(sys, 'platform', 'win32'), patch.object(gpu, 'IS_WINDOWS', True), \
-         patch.object(gpu, '_sample_windows', return_value={42: 80}), \
+         patch.object(gpu, '_sample_windows', return_value=({42: 80}, set())), \
          patch.object(gpu, 'window_owner_pids', return_value={43}), \
          patch.object(gpu, '_sample_nvidia_ctx', return_value={42}):
         assert gpu.sample() == ({42: 80}, {43}, {42})
 
 
-def test_windows_compute_context_is_passed_to_the_pdh_fallback():
-    seen = []
+def test_windows_3d_engine_load_counts_only_for_compute_clients():
+    # PID 99 holds an NVIDIA compute context; PID 100 drives the same 3D engine
+    # with no compute runtime at all (a game). Only the first is compute.
     with patch.object(sys, 'platform', 'win32'), patch.object(gpu, 'IS_WINDOWS', True), \
          patch.object(gpu, '_run', return_value=''), \
-         patch.object(gpu, '_sample_pdh', side_effect=lambda ctx: seen.append(ctx) or {}), \
+         patch.object(gpu, '_sample_pdh', return_value=({}, {99: 50.0, 100: 60.0})), \
+         patch.object(gpu, 'has_compute_runtime', return_value=False), \
          patch.object(gpu, 'window_owner_pids', return_value=set()), \
          patch.object(gpu, '_sample_nvidia_ctx', return_value={99}):
-        gpu.sample()
-    assert seen == [{99}]   # the 3D-engine fallback is limited to compute contexts
+        util, _windows, ctx = gpu.sample()
+    assert util == {99: 50.0}
+    assert ctx == {99}
 
 
 def test_nonzero_command_exit_is_not_valid_telemetry():

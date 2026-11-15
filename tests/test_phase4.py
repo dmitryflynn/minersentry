@@ -319,8 +319,9 @@ def test_windows_sampler_prefers_pmon_over_pdh(monkeypatch):
         "# gpu        pid  type    sm   mem\n"
         "# Idx          #   C/G     %     %\n"
         "    0        777     C    91     0\n") if "pmon" in args else "")
-    monkeypatch.setattr(gpu_mod, "_sample_pdh", lambda ctx: {888: 12.0})
-    util = gpu_mod._sample_windows({777})
+    monkeypatch.setattr(gpu_mod, "_sample_pdh", lambda: ({888: 12.0}, {}))
+    monkeypatch.setattr(gpu_mod, "other_gpu_present", lambda: False)
+    util, _clients = gpu_mod._sample_windows({777})
     assert util[777] == 91.0          # pmon wins where it reports
     # PDH is skipped entirely once pmon has answered: `typeperf -sc 2` costs a
     # couple of seconds per sample and reports nothing useful for NVIDIA.
