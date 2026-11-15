@@ -121,15 +121,16 @@ def test_pdh_is_skipped_when_pmon_reports(monkeypatch):
     monkeypatch.setattr(gpu_mod, "_run", lambda args, timeout:
                         "# gpu pid type sm mem\n# Idx # C/G % %\n 0 777 C 91 0\n")
     monkeypatch.setattr(gpu_mod, "_sample_pdh",
-                        lambda ctx: pdh_called.append(ctx) or {})
-    assert gpu_mod._sample_windows({777})[777] == 91.0
+                        lambda: pdh_called.append(1) or ({}, {}))
+    monkeypatch.setattr(gpu_mod, "other_gpu_present", lambda: False)
+    assert gpu_mod._sample_windows({777})[0][777] == 91.0
     assert pdh_called == [], "typeperf ran even though nvidia-smi answered"
 
 
 def test_pdh_still_runs_when_pmon_is_silent(monkeypatch):
     monkeypatch.setattr(gpu_mod, "_run", lambda args, timeout: "")
-    monkeypatch.setattr(gpu_mod, "_sample_pdh", lambda ctx: {888: 42.0})
-    assert gpu_mod._sample_windows(set()) == {888: 42.0}
+    monkeypatch.setattr(gpu_mod, "_sample_pdh", lambda: ({888: 42.0}, {}))
+    assert gpu_mod._sample_windows(set())[0] == {888: 42.0}
 
 
 # == F: an entry that comes back must alert again ==========================
@@ -184,6 +185,7 @@ def test_an_idle_pmon_table_counts_as_an_answer(monkeypatch):
     pdh_called = []
     monkeypatch.setattr(gpu_mod, "_run", lambda args, timeout: idle)
     monkeypatch.setattr(gpu_mod, "_sample_pdh",
-                        lambda ctx: pdh_called.append(ctx) or {})
-    assert gpu_mod._sample_windows(set()) == {}
+                        lambda: pdh_called.append(1) or ({}, {}))
+    monkeypatch.setattr(gpu_mod, "other_gpu_present", lambda: False)
+    assert gpu_mod._sample_windows(set())[0] == {}
     assert pdh_called == [], "typeperf ran for an idle GPU that had already answered"

@@ -1,18 +1,25 @@
 """Per-process GPU-compute telemetry.
 
-A GPU miner is invisible to CPU accounting, but it has to saturate the GPU's
-*compute* engine. Windows exposes per-process, per-engine GPU utilization through
-the PDH "GPU Engine" counter set, whose instance names embed both `pid_<N>` and
-`engtype_<Type>`; summing the `engtype_Compute` instances per PID gives each
-process's compute load across every adapter. That is the authoritative,
-vendor-neutral source (works for the NVIDIA + Intel GPUs on this box).
+A GPU miner is invisible to CPU accounting, but it has to keep a GPU busy.
+There is no single source that sees that on every vendor, and what each one
+shows was measured with a real OpenCL job on a hybrid laptop (RTX 3050 + Iris
+Xe) rather than assumed:
 
-`nvidia-smi --query-compute-apps` is used only as enrichment — it reveals which
-PIDs hold a CUDA compute context (per-process utilization reads N/A under WDDM),
-which raises confidence but is never relied on alone.
+    job on the NVIDIA GPU   nvidia-smi pmon: 99%, type C   PDH: nothing at all
+    job on the Intel GPU    nvidia-smi pmon: not listed    PDH: 98.7%, 3D engine
 
-Linux NVIDIA sampling uses nvidia-smi pmon SM activity for compute-only rows.
-Unsupported metrics stay unavailable rather than inheriting whole-GPU load.
+So on Windows the sources are combined. `nvidia-smi pmon` is authoritative for
+NVIDIA. The PDH "GPU Engine" counters cover everything else, but neither GPU
+here publishes an `engtype_Compute` instance: compute work is reported on the
+3D engine, which is also what every game drives. A 3D reading therefore counts
+only for a process that is a compute client — one holding an NVIDIA compute
+context, or with an OpenCL/CUDA runtime mapped.
+
+Linux uses `nvidia-smi pmon` for the NVIDIA proprietary driver and DRM fdinfo
+(see gpu_drm) for AMD and Intel.
+
+Vulkan and DirectML compute are not covered; see COMPUTE_RUNTIME_MODULES for
+why adding their runtimes would do more harm than good.
 
 Everything here is best-effort: any failure returns empty so a scan never breaks.
 The parsers are pure and unit-tested; the subprocess/WinAPI wrappers are thin.
@@ -130,27 +137,19 @@ def _run(args: list[str], timeout: float) -> str:
         return ""
 
 
-def _sample_pdh(compute_ctx: set[int]) -> dict[int, float]:
-    """Per-process GPU utilization from the PDH GPU Engine counters.
+def _sample_pdh() -> tuple[dict[int, float], dict[int, float]]:
+    """(Compute-engine, 3D-engine) utilization per process from PDH.
 
     Two samples, not one: a utilization counter is a RATE, and PDH's first
     sample is always 0.000000 — with `-sc 1` every value read zero, which on
     its own was enough to keep the GPU signal silent everywhere.
 
-    Compute-engine instances are authoritative. Where the driver publishes none
-    (NVIDIA under WDDM), 3D-engine load is used instead, but only for processes
-    that hold a GPU compute context — a game drives the same engine and must
-    not be scored as compute.
+    What the 3D reading means is the caller's decision; see merge_gpu_util.
     """
     out = _run(["typeperf", r"\GPU Engine(*)\Utilization Percentage", "-sc", "2"],
                timeout=20.0)
-    util = parse_gpu_engine_counters(out, ("Compute",))
-    if compute_ctx:
-        graphics = parse_gpu_engine_counters(out, ("3D",))
-        for pid in compute_ctx:
-            if pid not in util and graphics.get(pid):
-                util[pid] = graphics[pid]
-    return util
+    return (parse_gpu_engine_counters(out, ("Compute",)),
+            parse_gpu_engine_counters(out, ("3D",)))
 
 
 def _sample_nvidia_ctx() -> set[int]:
@@ -233,26 +232,120 @@ def _sample_linux_nvidia() -> tuple[dict[int, float], set[int], set[int]]:
     return util, set(), _sample_nvidia_ctx()
 
 
-def _sample_windows(compute_ctx: set[int]) -> dict[int, float]:
-    """Per-process GPU utilization on Windows.
+def _sample_windows(compute_ctx: set[int]
+                         ) -> tuple[dict[int, float], set[int]]:
+    """(utilisation, compute-client PIDs found through the PDH path).
 
-    `nvidia-smi pmon` first, PDH second. That is the reverse of what this file
-    used to say, and the reason is measurement: with a real OpenCL job holding
-    the GPU at 99% (nvidia-smi agreeing), the PDH GPU Engine counters reported
-    one non-zero instance on the whole machine — System/Copy at 0.01% — while
-    pmon reported the job at `sm 98%`. PDH stays as the vendor-neutral fallback
-    for Intel and AMD, where nvidia-smi does not exist.
+    pmon is authoritative for NVIDIA. When it answers AND there is no other
+    GPU in the machine, PDH is skipped: `typeperf -sc 2` costs a couple of
+    seconds a sample and reports nothing for NVIDIA compute.
+
+    It used to be skipped whenever pmon answered at all, which left a hole
+    measured on a hybrid laptop (RTX 3050 + Iris Xe): an OpenCL job on the
+    Intel GPU ran at 98.7% on the PDH 3D engine, appeared in neither pmon nor
+    this sampler, and so was completely invisible. A miner only had to pick
+    the integrated GPU.
     """
-    util: dict[int, float] = {}
     text = _run(["nvidia-smi", "pmon", "-s", "u", "-c", "1"], timeout=20.0)
-    if pmon_is_usable(text):
-        # pmon answered, so skip PDH entirely: `typeperf -sc 2` costs a couple
-        # of seconds every sample and reports nothing useful for NVIDIA. An
-        # empty map here means "nothing is computing", which is an answer.
-        return parse_nvidia_pmon(text)
-    for pid, value in _sample_pdh(compute_ctx).items():
-        util.setdefault(pid, value)
-    return util
+    nvidia = parse_nvidia_pmon(text) if pmon_is_usable(text) else None
+    if nvidia is not None and not other_gpu_present():
+        return nvidia, set()
+    compute, graphics = _sample_pdh()
+    clients = {pid for pid, value in graphics.items()
+               if value >= PDH_3D_FLOOR
+               and (pid in compute_ctx or has_compute_runtime(pid))}
+    return merge_gpu_util(nvidia or {}, compute, graphics, clients), clients
+
+
+# A process below this on the 3D engine is not worth the module lookup; idle
+# desktop apps sit at a few percent.
+PDH_3D_FLOOR = 15.0
+
+# Runtime libraries that make a process a GPU *compute* client. On Intel (and,
+# by the same WDDM design, AMD) there is no "Compute" engine in the vendor-
+# neutral counters: OpenCL work is reported on the 3D engine, which is also
+# what a game or a browser drives. What tells them apart is cheap to read —
+# the compute job has an OpenCL runtime mapped, measured on a real job
+# (opencl.dll, igdrcl64.dll) against Brave, Edge and Explorer (none).
+#
+# Vulkan and DirectML are deliberately absent. vulkan-1.dll is mapped by every
+# Chromium GPU process and most games, and DirectML by ordinary creative and
+# camera software, so either would turn desktop graphics into "compute". A
+# miner using Vulkan compute is therefore still not seen here.
+COMPUTE_RUNTIME_MODULES = frozenset({
+    "opencl.dll", "igdrcl64.dll", "igdrcl32.dll", "intelocl64.dll",
+    "amdocl64.dll", "amdocl.dll", "amdocl12cl64.dll",
+    "nvopencl64.dll", "nvopencl32.dll", "nvcuda.dll", "nvcuda64.dll",
+    "libopencl.so", "libopencl.so.1",
+})
+
+
+def has_compute_runtime(pid: int, modules=None) -> bool:
+    """True if the process has an OpenCL or CUDA runtime mapped.
+
+    `modules` is injectable for tests. A process we are not allowed to
+    inspect returns False: unknown is not evidence.
+    """
+    if modules is None:
+        try:
+            import psutil
+            modules = [m.path for m in psutil.Process(pid).memory_maps()]
+        except Exception:  # noqa: BLE001 - denied, exited, or unsupported
+            return False
+    for path in modules:
+        base = str(path).replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if base in COMPUTE_RUNTIME_MODULES:
+            return True
+    return False
+
+
+def merge_gpu_util(nvidia: dict[int, float], compute: dict[int, float],
+                   graphics: dict[int, float], clients: set[int]
+                   ) -> dict[int, float]:
+    """Combine the sources into one {pid: percent}. Pure.
+
+    A Compute-engine reading always counts. A 3D-engine reading counts only
+    for a compute client, because the same engine carries every game.
+    """
+    out = dict(nvidia)
+    for pid, value in compute.items():
+        out[pid] = max(out.get(pid, 0.0), value)
+    for pid in clients:
+        value = graphics.get(pid)
+        if value:
+            out[pid] = max(out.get(pid, 0.0), value)
+    return out
+
+
+_OTHER_GPU: bool | None = None
+
+
+def adapters_include_non_nvidia(names: list[str]) -> bool:
+    """True if any display adapter is a real non-NVIDIA GPU. Pure."""
+    for name in names:
+        low = name.strip().lower()
+        if not low or "nvidia" in low:
+            continue
+        # software and remote adapters do no compute worth sampling
+        if any(k in low for k in ("microsoft basic", "remote display",
+                                  "virtual", "parsec", "citrix", "vmware")):
+            continue
+        return True
+    return False
+
+
+def other_gpu_present() -> bool:
+    """Whether a non-NVIDIA GPU exists, asked once and remembered: adapters do
+    not change while the program runs, and the answer decides whether every
+    sample pays for PDH."""
+    global _OTHER_GPU
+    if _OTHER_GPU is None:
+        text = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                     "(Get-CimInstance Win32_VideoController).Name"], timeout=20.0)
+        names = [ln for ln in text.splitlines() if ln.strip()]
+        # No answer at all: assume there might be one, so nothing is skipped.
+        _OTHER_GPU = adapters_include_non_nvidia(names) if names else True
+    return _OTHER_GPU
 
 
 def window_owner_pids() -> set[int]:
@@ -286,8 +379,19 @@ def sample() -> tuple[dict[int, float], set[int], set[int]]:
 
     Safe to call on a background thread; returns empties on any failure."""
     if sys.platform.startswith("linux"):
-        return _sample_linux_nvidia()
+        util, windows, ctx = _sample_linux_nvidia()
+        try:
+            from . import gpu_drm
+            drm_util, drm_clients = gpu_drm.sample()
+        except Exception:  # noqa: BLE001 - AMD/Intel telemetry is best-effort
+            drm_util, drm_clients = {}, set()
+        for pid, value in drm_util.items():
+            util[pid] = max(util.get(pid, 0.0), value)
+        return util, windows, ctx | drm_clients
     if not IS_WINDOWS:
         return {}, set(), set()
     ctx = _sample_nvidia_ctx()
-    return _sample_windows(ctx), window_owner_pids(), ctx
+    util, clients = _sample_windows(ctx)
+    # A compute client found through PDH holds a compute context as surely as
+    # one nvidia-smi lists, and the engine treats both the same way.
+    return util, window_owner_pids(), ctx | clients

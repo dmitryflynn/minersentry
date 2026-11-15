@@ -58,7 +58,7 @@ desktop and stays quiet on a cloud host; see [Profiles](#profiles-desktop-and-cl
 | Signal | What it measures |
 |---|---|
 | **cpu** | Sustained, steady **core saturation** (a high *floor*, not a bursty peak). Measured per-core, so a one-thread miner on a 20-core box is still caught. |
-| **gpu** | Sustained **GPU compute-engine** utilization by a headless process — catches GPU-only miners that CPU accounting can't see. Per-process compute load comes from `nvidia-smi pmon` where NVIDIA is present, falling back to the Windows PDH "GPU Engine" counters for other vendors. That order is from measurement, not preference: with a real OpenCL job holding this laptop's RTX 3050 at 99%, PDH reported one non-zero instance on the whole machine (System/Copy, 0.01%) while pmon reported the job at 98%. A CUDA/OpenCL compute context raises confidence. Windowed apps (games/creative) and an allowlist (Blender, OBS, DaVinci, ffmpeg…) are dampened. |
+| **gpu** | Sustained **GPU compute-engine** utilization by a headless process — catches GPU-only miners that CPU accounting can't see. Per-process compute load comes from `nvidia-smi pmon` where NVIDIA is present, falling back to the Windows PDH "GPU Engine" counters for other vendors. That order is from measurement, not preference: with a real OpenCL job holding this laptop's RTX 3050 at 99%, PDH reported one non-zero instance on the whole machine (System/Copy, 0.01%) while pmon reported the job at 98%. On Intel — and by the same driver model AMD — there is no compute engine in those counters at all: the same job on this laptop's Iris Xe showed up at 98.7% on the **3D engine**, which is also what every game drives. So the two sources are combined, and a 3D-engine reading counts only for a process that is a compute client: one holding an NVIDIA compute context or with an OpenCL/CUDA runtime mapped. Before that, a miner only had to pick the integrated GPU to be invisible. Vulkan and DirectML compute are still not seen; their runtimes are mapped by every browser GPU process, most games and ordinary creative software, so counting them would turn desktop graphics into compute. Windowed apps (games/creative) and an allowlist (Blender, OBS, DaVinci, ffmpeg…) are dampened. |
 | **memory** | Read-only scan of each process's committed memory for miner fingerprints: `stratum+tcp`, `xmrig`, `RandomX`, stratum login/submit JSON, pool names, and a ~2 GiB RandomX dataset. Strings are matched as both 8-bit text and UTF-16 (how .NET miners hold them). Finds miners injected into `svchost`, `explorer`, `dllhost` and the other usual hosts, which are never trust-dampened. |
 | **network** | Established TCP connections to stratum-typical pool ports, and — via bundled threat intel — connections to a **resolved known mining-pool IP on *any* port** (e.g. a pool on 443). Only pool stratum endpoints are listed, never pool websites, and any address in a shared CDN range (Cloudflare, Fastly) is dropped, since unrelated sites share it. A persisted connection scores higher than a transient one. |
 | **name** | Known miner binary names and execution from suspicious directories (Temp, ProgramData, roaming on Windows; /tmp, /dev/shm, /var/tmp on Linux). |
@@ -366,8 +366,12 @@ A few things worth knowing about what it reads:
 CPU and GPU both pinned is what a normal training job looks like, so that pair
 never convicts. It needs a miner name, miner strings or a pool connection on top.
 
-So far this has been validated on Linux with full-GPU passthrough. MIG, AMD
-and mixed graphics/compute haven't been tested yet. Reports welcome.
+So far this has been validated on Linux with full-GPU passthrough on NVIDIA.
+AMD and Intel GPUs are read from DRM fdinfo (`/proc/<pid>/fdinfo`), where the
+kernel publishes per-client engine time; that path is written against the
+kernel's documented format and its arithmetic is tested, but it has not been run
+against real AMD or Intel hardware on Linux. MIG hasn't been tested either.
+Reports welcome.
 
 ### GPU-only scan
 
