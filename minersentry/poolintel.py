@@ -25,6 +25,7 @@ import ipaddress
 import socket
 import subprocess
 import sys
+import time
 
 # Stratum endpoints of well-known pools (Monero-heavy, since RandomX CPU mining
 # is the common cryptojacking case, plus a few multi-coin pools). minexmr shut
@@ -146,11 +147,33 @@ def is_pool_hostname(hostname: str) -> bool:
     return any(k in h for k in POOL_HOST_KEYWORDS)
 
 
+# Hostnames MinerSentry itself looked up, with when. Resolving a pool domain
+# puts it in the OS resolver cache, and the DNS scan reads that cache — so
+# without this record the tool reports its own lookups as evidence that
+# something on the machine contacted a pool. Verified: a getaddrinfo() call
+# for a pool-shaped name appears in `Get-DnsClientCache` immediately, even
+# when the name does not resolve.
+_OUR_LOOKUPS: dict[str, float] = {}
+
+
+def our_lookups() -> dict[str, float]:
+    """Hostnames this process resolved, lowercased, with a timestamp."""
+    return dict(_OUR_LOOKUPS)
+
+
+def note_our_lookup(hostname: str) -> None:
+    """Record that we are about to resolve `hostname`, so the DNS scan can
+    tell our own cache entries from the machine's."""
+    if hostname:
+        _OUR_LOOKUPS[hostname.strip().lower().rstrip(".")] = time.time()
+
+
 def resolve_pool_ips(domains: frozenset[str] = KNOWN_POOL_DOMAINS) -> set[str]:
     """Resolve the known pool endpoints to their current IPs (best-effort),
     leaving out any IP that belongs to shared hosting."""
     ips: set[str] = set()
     for dom in domains:
+        note_our_lookup(dom)
         try:
             for info in socket.getaddrinfo(dom, None):
                 ip = info[4][0]
