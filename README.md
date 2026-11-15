@@ -523,6 +523,16 @@ policy, and `hosts` entries that point antivirus or update domains at nowhere.
 Where the exclusion list needs Administrator to read, it says so instead of
 reporting that nothing is excluded.
 
+The same check lists **known-abused kernel drivers** that are running. XMRig
+loads the signed WinRing0 driver to write the MSRs that speed RandomX up, and
+miner campaigns bring other signed-but-vulnerable drivers along to switch
+antivirus off from the kernel. This part is a name list, which sits against the
+grain of the rest of the tool and is said plainly: it knows only the drivers on
+it, and a renamed file walks past. Every driver on it also has an innocent
+owner — RTCore64 *is* MSI Afterburner — so one sitting where its installer put
+it is a low note that raises no banner. The same driver loaded from a temp or
+user directory is a finding, because no installer puts a driver there.
+
 The two scans share one pass so the correlation can actually happen: the
 autostart findings' paths are handed to the defence check, and an exclusion
 that covers one of them is reported against it. A serious finding raises a

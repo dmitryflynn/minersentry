@@ -19,6 +19,8 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 
+from . import drivers as drivers_mod
+
 IS_WINDOWS = sys.platform == "win32"
 
 # Domains worth noticing in a hosts file: if these are redirected, something
@@ -215,8 +217,37 @@ def scan(cfg=None, flagged_paths: tuple[str, ...] = ()) -> list[TamperFinding]:
             "hosts-blackhole", f"{host} -> {ip}", _hosts_path(), 70,
             ["a security or update domain is redirected to nowhere"]))
 
+    findings += driver_findings(drivers_mod.loaded())
+
     findings.sort(key=lambda f: f.score, reverse=True)
     return findings
+
+
+def driver_findings(loaded) -> list[TamperFinding]:
+    """Known-abused kernel drivers that are running, as findings. Pure.
+
+    `loaded` is None when the driver list could not be read, which is reported
+    rather than passed off as "no abused drivers" -- off Windows there is
+    nothing to read and nothing is said.
+    """
+    if loaded is None:
+        if not IS_WINDOWS:
+            return []
+        return [TamperFinding(
+            "drivers-unreadable", "the loaded kernel drivers could not be listed",
+            "Win32_SystemDriver", 0,
+            ["so known-abused drivers were not checked"])]
+    out: list[TamperFinding] = []
+    for a in drivers_mod.abused(loaded):
+        base = a.driver.path.replace("/", "\\").rsplit("\\", 1)[-1]
+        labels = [f"abused for: {a.abused_for}",
+                  f"also ships legitimately with {a.shipped_by}"]
+        if a.dropped:
+            labels.insert(0, "loaded from a directory no installer puts a driver in")
+        out.append(TamperFinding(
+            "abused-driver", f"{base} is loaded (service {a.driver.name})",
+            a.driver.path, a.score, labels))
+    return out
 
 
 def summarize(findings: list[TamperFinding]) -> list[dict]:
