@@ -119,3 +119,47 @@ def test_close_ends_the_background_refresh_loops(monkeypatch):
     while threading.active_count() > before and _time.time() < deadline:
         _time.sleep(0.05)
     assert threading.active_count() <= before, "a refresh loop outlived close()"
+
+
+def _engine_with_cpu_history(ages_and_values):
+    import time as _time
+    from minersentry.engine import Engine
+    from minersentry.config import Config
+    e = Engine(cfg=Config(pool_intel_enabled=False, gpu_enabled=False))
+    now = _time.time()
+    for age, value in ages_and_values:
+        e._cpu_hist[4242].append((now - age, value))
+    return e
+
+
+def test_slow_passes_do_not_starve_the_cpu_signal():
+    """Measured: with twelve memory-sweep targets, passes went from every 2.5s
+    to every 7-10s. The 20s window then never held four samples, and a process
+    pinned at a full core for 65 seconds read "gathering samples" for the whole
+    scan. How long a process has been busy must not depend on how quickly this
+    program got round to looking."""
+    from minersentry.scoring import score_cpu
+    e = _engine_with_cpu_history([(32.6, 100.0), (22.0, 100.0), (13.4, 100.0),
+                                  (7.4, 100.0), (2.4, 100.0)])
+    recent = e._cpu_stats(4242)
+    assert len(recent) >= e.cfg.cpu_min_samples
+    assert score_cpu(recent, e.ncpu, e.cfg).score > 0
+
+
+def test_a_normal_cadence_still_uses_the_whole_window():
+    e = _engine_with_cpu_history([(age, 50.0) for age in
+                                  (19, 16.5, 14, 11.5, 9, 6.5, 4, 1.5)])
+    assert len(e._cpu_stats(4242)) == 8
+
+
+def test_stale_samples_are_not_resurrected():
+    """A process that stopped minutes ago must not be judged on what it did
+    then just because nothing newer exists."""
+    e = _engine_with_cpu_history([(400, 100.0), (390, 100.0), (380, 100.0),
+                                  (370, 100.0)])
+    assert e._cpu_stats(4242) == []
+
+
+def test_samples_inside_the_window_are_never_dropped_by_the_fallback():
+    e = _engine_with_cpu_history([(300, 100.0), (15, 20.0), (5, 30.0)])
+    assert e._cpu_stats(4242) == [20.0, 30.0]
