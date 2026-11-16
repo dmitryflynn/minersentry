@@ -89,6 +89,13 @@ def _own_code_roots() -> tuple[str, ...]:
     return tuple(roots)
 
 
+# How far past `sustained_seconds` the CPU window may reach back when passes
+# are slow. Four windows: long enough for the slowest cadence measured (one
+# pass per ~10s needs 40s for four samples), short enough that a process which
+# stopped a couple of minutes ago is not still judged on what it did then.
+CPU_WINDOW_STRETCH = 4.0
+
+
 class ProcInfo:
     __slots__ = ("pid", "name", "exe", "username", "cpu", "cpu_mean", "cpu_min",
                  "mem_mb", "threads", "signals", "verdict", "score", "mem_result",
@@ -320,9 +327,31 @@ class Engine:
         return (r.scanned, r.score, labels, r.error, r.bytes_scanned)
 
     def _cpu_stats(self, pid: int) -> list[float]:
+        """The CPU samples the signal is judged on.
+
+        Normally those inside the sustained window. But the window is in
+        seconds and the samples arrive once per pass, so it silently assumes a
+        pass takes about `scan_interval`. It does not while a memory sweep is
+        running: measured with twelve sweep targets, passes went from every
+        2.5s to every 7-10s, the 20s window never held `cpu_min_samples`, and
+        a process pinned at a full core for 65 seconds read "gathering
+        samples" for the whole scan.
+
+        So when the window is short of samples only because passes are slow,
+        the most recent `cpu_min_samples` are used instead, as long as they
+        are not stale. How long a process has been busy must not depend on
+        how quickly this program got round to looking.
+        """
         now = time.time()
-        return [c for t, c in self._cpu_hist[pid]
-                if now - t <= self.cfg.sustained_seconds]
+        cfg = self.cfg
+        hist = self._cpu_hist[pid]
+        recent = [c for t, c in hist if now - t <= cfg.sustained_seconds]
+        if len(recent) >= cfg.cpu_min_samples:
+            return recent
+        stale_after = cfg.sustained_seconds * CPU_WINDOW_STRETCH
+        tail = [c for t, c in list(hist)[-cfg.cpu_min_samples:]
+                if now - t <= stale_after]
+        return tail if len(tail) > len(recent) else recent
 
     def _build_signals(self, info: ProcInfo, raddrs: list[tuple[str, int]],
                        now: float) -> list[Signal]:
