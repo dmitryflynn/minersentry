@@ -307,7 +307,7 @@ def test_the_banner_appears_for_a_finding_and_goes_away_again(tk_root):
 def test_the_banner_shows_the_worst_finding_and_counts_the_rest(tk_root):
     app, _ = _banner_app(tk_root)
     MinerSentryApp._show_tamper(app, [
-        TamperFinding(kind="a", detail="lesser thing", where="w", score=30),
+        TamperFinding(kind="a", detail="lesser thing", where="w", score=45),
         TamperFinding(kind="b", detail="the worst thing", where="w", score=90),
         TamperFinding(kind="c", detail="middling", where="w", score=50)])
     tk_root.update()
@@ -377,3 +377,23 @@ def test_the_tamper_scan_accepts_what_the_gui_hands_it():
     assert isinstance(findings, list)
     for f in findings:
         assert isinstance(f.score, int) and f.detail and f.kind
+
+
+def test_a_low_note_is_logged_but_neither_bannered_nor_counted(tk_root):
+    """A known-abused driver sitting where its installer put it scores below
+    the banner line on purpose. It must not raise the banner on its own, and
+    must not inflate the "+N more" count beside a real finding."""
+    from minersentry import gui as gui_mod
+    note = TamperFinding(kind="abused-driver", detail="RTCore64.sys is loaded",
+                         where="w", score=gui_mod.BANNER_MIN_SCORE - 10)
+    app, events = _banner_app(tk_root)
+    MinerSentryApp._show_tamper(app, [note])
+    tk_root.update()
+    assert not app.tamper_banner.winfo_manager(), "a low note raised the banner"
+    assert any("RTCore64" in e for e in events), "but it must still be logged"
+
+    real = TamperFinding(kind="b", detail="protection is off", where="w", score=80)
+    MinerSentryApp._show_tamper(app, [note, real])
+    tk_root.update()
+    text = app.tamper_lbl.cget("text")
+    assert "protection is off" in text and "more" not in text

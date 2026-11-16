@@ -75,6 +75,8 @@ ACCENT = "#2f81f7"
 GREEN = "#3fb950"
 AMBER = "#d29922"
 RED = "#f85149"
+# Host findings below this are listed in the panel and the log, not bannered.
+BANNER_MIN_SCORE = 40
 
 VERDICT_COLOR = {
     "Clean": GREEN,
@@ -715,13 +717,18 @@ class MinerSentryApp:
             self._add_event(f"defences {f.score}: {f.kind} — {f.detail}")
         for f in (f for f in weakened if f.score == 0):
             self._add_event(f"defences: {f.detail}")
-        if not real:
+        # The banner is for findings that mean something on their own. A
+        # known-abused driver sitting where its installer put it scores below
+        # this on purpose: RTCore64 IS MSI Afterburner, and a red banner for
+        # someone who installed a fan-curve tool teaches them to ignore it.
+        serious = [f for f in real if f.score >= BANNER_MIN_SCORE]
+        if not serious:
             self._hide_tamper_banner()
             return
-        worst = max(real, key=lambda f: f.score)
+        worst = max(serious, key=lambda f: f.score)
         self.tamper_lbl.configure(
             text=f"  Defences weakened: {worst.detail}"
-                 + (f"  (+{len(real) - 1} more)" if len(real) > 1 else ""))
+                 + (f"  (+{len(serious) - 1} more)" if len(serious) > 1 else ""))
         # winfo_manager(), not winfo_ismapped(): the question is whether the
         # banner is PACKED, and ismapped answers whether it is currently drawn.
         # While the window is minimised or not yet drawn, ismapped is 0 for a
