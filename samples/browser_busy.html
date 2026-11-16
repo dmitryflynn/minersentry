@@ -1,0 +1,20 @@
+<!doctype html>
+<!--
+  The negative control for browser_load.html: a tab that keeps one core busy
+  and holds nothing a miner would. A heavy web app looks like this, and
+  MinerSentry must leave it alone.
+
+  Open with ?seconds=60 to stop on its own.
+-->
+<html>
+<head><meta charset="utf-8"><title>MinerSentry busy tab (benign)</title></head>
+<body>
+<p>Benign CPU load for testing. This one carries no miner text at all.</p>
+<script>
+  var seconds = Number(new URLSearchParams(location.search).get('seconds') || 0);
+  var src = 'var x=1;function spin(){var t=Date.now();while(Date.now()-t<200){x=(x*1103515245+12345)%2147483647;}setTimeout(spin,0);}spin();';
+  var worker = new Worker(URL.createObjectURL(new Blob([src], {type: 'text/javascript'})));
+  if (seconds > 0) setTimeout(function () { worker.terminate(); window.close(); }, seconds * 1000);
+</script>
+</body>
+</html>
