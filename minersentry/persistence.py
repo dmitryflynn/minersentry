@@ -1497,12 +1497,31 @@ def _split_hive(location: str):
     return hives.get(head.upper()), head.upper(), path
 
 
+# Kinds whose display name the collector builds as "<subkey> -> <value>"; the
+# value name is the fixed suffix. For every other registry kind the entry name
+# IS the value name, chosen by whoever wrote it, and may contain " -> " itself.
+_SUBKEY_VALUE_KINDS = {"ifeo-debugger": "Debugger", "active-setup": "StubPath"}
+
+
+def registry_value_name(entry: PersistEntry) -> str:
+    """The registry value an entry stands for. Pure.
+
+    Splitting every name on " -> " meant a Run value named `evil -> OneDrive`
+    was removed by deleting the value `OneDrive` beside it: the legitimate
+    entry went and the miner's stayed.
+    """
+    suffix = _SUBKEY_VALUE_KINDS.get(entry.kind)
+    if suffix and entry.name.endswith(" -> " + suffix):
+        return suffix
+    return entry.name
+
+
 def _remove_registry_value(entry: PersistEntry) -> "quarantine.Result":
     import winreg as wr
     hive, hive_name, path = _split_hive(entry.location)
     if hive is None:
         return quarantine.Result(False, f"Unrecognised registry location: {entry.location}")
-    value_name = entry.name.split(" -> ")[-1] if " -> " in entry.name else entry.name
+    value_name = registry_value_name(entry)
     try:
         with wr.OpenKey(hive, path, 0, wr.KEY_READ | wr.KEY_SET_VALUE) as key:
             try:
