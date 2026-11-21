@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ntpath
 import os
+import re
 import sys
 import threading
 import time
@@ -95,6 +96,38 @@ def _own_code_roots() -> tuple[str, ...]:
 # pass per ~10s needs 40s for four samples), short enough that a process which
 # stopped a couple of minutes ago is not still judged on what it did then.
 CPU_WINDOW_STRETCH = 4.0
+
+
+# python, python3, python3.13, pythonw, python3.13t, pypy3 ...
+_PYTHON_IMAGE = re.compile(r"(?:python|pypy)(?:\d+(?:\.\d+)*t?)?w?")
+
+
+def _python_script(argv: list) -> str:
+    """The script file a Python command line runs, or "" for none.
+
+    Interpreter options are skipped (and the value of `-W` / `-X` / `--check-
+    hash-based-pycs`). `-c`, `-m` and `-` run no file of ours, so a cluster
+    containing either of those letters means no script. Pure.
+    """
+    i = 1
+    while i < len(argv):
+        arg = argv[i] or ""
+        if arg == "-" or arg == "--":
+            return argv[i + 1] if arg == "--" and i + 1 < len(argv) else ""
+        if arg.startswith("--"):
+            i += 2 if arg == "--check-hash-based-pycs" else 1
+            continue
+        if arg.startswith("-"):
+            flags = arg[1:]
+            if flags[:1] in ("W", "X"):
+                i += 1 if len(flags) > 1 else 2
+                continue
+            if "c" in flags or "m" in flags:
+                return ""
+            i += 1
+            continue
+        return arg
+    return ""
 
 
 class ProcInfo:
@@ -504,26 +537,36 @@ class Engine:
         return score_cmdline(cmdline_mod.score_of(hits, self.cfg.cmdline_generic_cap),
                              cmdline_mod.labels(hits), self.cfg)
 
-    def _runs_our_code(self, argv: list) -> bool:
-        """True if these arguments execute a file inside MinerSentry's own tree.
+    def _runs_our_code(self, argv: list, exe: str = "", cwd: str = "") -> bool:
+        """True if this is a Python interpreter running a script inside
+        MinerSentry's own tree.
 
-        Verified by resolved PATH, never by a name: a miner that merely puts
-        "minersentry" in its command line gains nothing, because the path has
-        to land inside the installed package (or its checkout) — somewhere it
-        would already need write access to reach.
+        Verified by resolved PATH, never by a name, and only for the SCRIPT an
+        interpreter runs. Accepting any argument let any process vanish from
+        the scan by naming one of our files: `xmrig.exe ... <pkg>\\engine.py`
+        needs no write access to anything. So `exe` (the real image, not
+        argv[0], which the process controls) must be a Python interpreter, and
+        the script, resolved against the TARGET's working directory rather
+        than ours, must land in our tree. Without `exe` nothing qualifies.
         """
-        for arg in argv[1:]:
-            if not arg or arg.startswith("-"):
-                continue
-            try:
-                resolved = os.path.normcase(os.path.realpath(arg))
-            except (OSError, ValueError):
-                continue
-            for root in self._own_code_roots:
-                # a directory root ends in a separator; a file root is exact
-                if (resolved.startswith(root) if root.endswith(os.sep)
-                        else resolved == root):
-                    return True
+        if not exe or not _PYTHON_IMAGE.fullmatch(name_stem(ntpath.basename(exe))):
+            return False
+        script = _python_script(argv)
+        if not script:
+            return False
+        if not os.path.isabs(script):
+            if not cwd:
+                return False
+            script = os.path.join(cwd, script)
+        try:
+            resolved = os.path.normcase(os.path.realpath(script))
+        except (OSError, ValueError):
+            return False
+        for root in self._own_code_roots:
+            # a directory root ends in a separator; a file root is exact
+            if (resolved.startswith(root) if root.endswith(os.sep)
+                    else resolved == root):
+                return True
         return False
 
     def _read_cmdline(self, proc: psutil.Process) -> list:
@@ -539,8 +582,17 @@ class Engine:
         # Recognising our OWN tooling is not part of the cmdline signal and
         # must not switch off with it: a second process running MinerSentry
         # holds the marker table in memory and convicts itself otherwise.
-        if self._own_code_roots and self._runs_our_code(argv):
-            self._own_tooling.add(proc.pid)
+        if self._own_code_roots:
+            try:
+                exe = proc.exe()
+            except Exception:  # noqa: BLE001 - unknown image: not ours
+                exe = ""
+            try:
+                cwd = proc.cwd()
+            except Exception:  # noqa: BLE001 - absolute scripts still work
+                cwd = ""
+            if self._runs_our_code(argv, exe, cwd):
+                self._own_tooling.add(proc.pid)
         if is_browser_content_process(argv):
             self._renderers.add(proc.pid)
         if not self.cfg.cmdline_enabled:
