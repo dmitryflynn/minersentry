@@ -20,7 +20,6 @@ and always records to the detection log.
 from __future__ import annotations
 
 import argparse
-import ctypes
 import os
 import shlex
 import subprocess
@@ -33,6 +32,7 @@ from . import tray as tray_mod
 from .audit import AuditLog
 from .config import Config
 from .engine import Engine
+from .quarantine import is_elevated
 from . import gpu as gpu_mod
 
 TASK_NAME = "MinerSentry"
@@ -105,18 +105,6 @@ def notify(title: str, body: str, cfg: Config | None = None) -> str:
 
 
 # -- the watcher ------------------------------------------------------------
-def is_elevated() -> bool:
-    if sys.platform == "win32":
-        try:
-            return bool(ctypes.windll.shell32.IsUserAnAdmin())
-        except Exception:  # noqa: BLE001
-            return False
-    try:
-        return os.geteuid() == 0
-    except AttributeError:
-        return False
-
-
 def should_alert(verdict: str, min_verdict: str) -> bool:
     """Is `verdict` at least as serious as `min_verdict`? Pure."""
     rank = {"Clean": 0, "Suspicious": 1, "Likely Miner": 2}

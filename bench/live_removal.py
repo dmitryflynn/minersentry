@@ -10,7 +10,6 @@ entry is gone from the authoritative source, runs the real undo, and checks it
 came back. It mutates the machine it runs on and cleans up after itself.
 
     python bench/live_removal.py            # -> bench/live_removal.md
-    python bench/live_removal.py --elevated-note
 
 Run it from an Administrator shell to include the service case; without
 elevation that one is skipped rather than half-run.

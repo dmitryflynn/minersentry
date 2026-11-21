@@ -140,7 +140,6 @@ class Config:
 
     # -- hidden-compute / power-gap (system-level banner, not a per-proc score)
     power_enabled: bool = True
-    power_meter_enabled: bool = False  # true package power (rare hardware)
     # Cores of unexplained CPU ABOVE this machine's learned baseline. Every busy
     # system has some (interrupts, short-lived processes, kernel work) and it
     # scales with load, so the gap is judged against a learned ratio of busy CPU.

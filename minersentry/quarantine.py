@@ -186,14 +186,6 @@ def unblock_ip(ip: str) -> Result:
     return Result(True, f"Removed the block on {ip}.")
 
 
-def list_blocks() -> list[str]:
-    """Addresses currently blocked by rules this tool created."""
-    return sorted({r["ip"] for r in history(500)
-                   if r.get("action") == "block_ip" and r.get("ip")} -
-                  {r["ip"] for r in history(500)
-                   if r.get("action") == "unblock_ip" and r.get("ip")})
-
-
 # -- binary quarantine -----------------------------------------------------
 def quarantine_file(path: str, kill_first: bool = False,
                     kind: str = "") -> Result:
