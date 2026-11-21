@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import ntpath
 import re
 
+from . import trust
 from .config import Config
 
 
@@ -165,7 +166,9 @@ def score_name(name: str, exe: str, cfg: Config) -> Signal:
                 score = max(score, score + 18 if score else cfg.name_score_susp_dir)
                 bits.append(f"runs from {hint.strip(chr(92))}")
                 break
-        if not exe_l.startswith(cfg.trusted_dirs) and len(stem) <= 3:
+        # Whole path components, not a string prefix: C:\Program Files2 is
+        # not Program Files, and any user can create it.
+        if len(stem) <= 3 and not trust.in_trusted_dir(exe, cfg.trusted_dirs):
             score = max(score, cfg.name_score_short)
             bits.append("very short name outside standard dirs")
     return Signal("name", min(100, score), ", ".join(bits) or "unremarkable name/path")
