@@ -892,6 +892,11 @@ class Engine:
             self._perf_ratio.pop(dead, None)
         for dead in set(self._cmd_hits) - live_pids:
             self._cmd_hits.pop(dead, None)
+        # Without this a dead PID's container outlived it: a leak in the
+        # service, and a reused PID (no longer in _ctime, so not detected as
+        # reuse) was reported in a container it was never in.
+        for dead in set(self._container) - live_pids:
+            self._container.pop(dead, None)
         self._own_tooling &= live_pids
         self._warm &= live_pids
         # Prune GPU history in place under the lock (reassigning the dict would
