@@ -121,6 +121,30 @@ def _under(path: str, dirs: tuple[str, ...]) -> bool:
     return False
 
 
+def _in_drop_location(path: str, hints: tuple[str, ...]) -> bool:
+    r"""True if any drop-location hint (`\temp\`, `/tmp/` ...) is in `path`.
+
+    Matched against the path as Windows will actually resolve it, not as
+    written. The hints use backslashes, and a raw substring test missed
+    `C:/Users/x/AppData/Local/Temp/m.exe` and `...\Temp.\m.exe` (Win32 drops
+    a trailing dot or space from each component), both of which open the
+    file in Temp. A signed miner there then went on to WinVerifyTrust and
+    earned the trust this check exists to withhold.
+    """
+    if not hints:
+        return False
+    forms = {path.lower()}
+    win = "\\" in path or (len(path) > 1 and path[1] == ":")
+    if win:
+        p = ntpath.normpath(path.replace("/", "\\")).lower()
+        forms.add(p)
+        forms.add("\\".join(part if part in (".", "..") else part.rstrip(" .")
+                            for part in p.split("\\")))
+    else:
+        forms.add(posixpath.normpath(path))
+    return any(h and h.lower() in f for h in hints for f in forms)
+
+
 def in_trusted_dir(exe: str, trusted_dirs: tuple[str, ...]) -> bool:
     """True if `exe` lives under a system directory. Pure path logic, no
     signature check, so callers can use it on every process every pass."""
@@ -150,7 +174,7 @@ def is_trusted(exe: str, trusted_dirs: tuple[str, ...],
         return _cache[ck]
     if _under(exe, trusted_dirs):
         result = True
-    elif any(h in key for h in untrusted_hints):
+    elif _in_drop_location(exe, untrusted_hints):
         result = False
     else:
         result = False

@@ -72,3 +72,42 @@ def test_signed_defender_in_programdata_keeps_trust(monkeypatch):
     exe = r"C:\ProgramData\Microsoft\Windows Defender\Platform\4.18\MsMpEng.exe"
     assert trust.is_trusted(exe, TRUSTED, hints) is True
     assert trust.is_trusted(r"C:\Users\x\AppData\Roaming\svc\miner.exe", TRUSTED, hints) is False
+
+
+SIG_UNTRUSTED_WIN = ("\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\",
+                     "\\appdata\\roaming\\", "\\$recycle.bin\\", "\\windows\\fonts\\")
+
+
+@pytest.mark.parametrize("exe", [
+    "C:/Users/x/AppData/Local/Temp/miner.exe",           # forward slashes
+    r"C:\Users\x\AppData\Local\Temp.\miner.exe",         # Win32 drops the dot
+    r"C:\Users\x\AppData\Local\Temp \miner.exe",         # ... and the space
+    r"C:\Users\x\AppData\Roaming.\svc\miner.exe",
+    r"C:\Tools\..\Users\x\AppData\Local\Temp\miner.exe",
+    r"C:/Users/x/AppData\Local/Temp/miner.exe",          # mixed
+])
+def test_a_drop_location_spelled_differently_earns_no_trust(monkeypatch, exe):
+    """Windows opens every one of these in Temp/Roaming; a signed miner there
+    must not reach WinVerifyTrust (#64)."""
+    monkeypatch.setattr(trust, "_winverifytrust", lambda p: True, raising=False)
+    monkeypatch.setattr(trust.os.path, "exists", lambda p: True)
+    monkeypatch.setattr(trust, "IS_WINDOWS", True)
+    trust._cache.clear()
+    assert trust.is_trusted(exe, TRUSTED, SIG_UNTRUSTED_WIN) is False
+
+
+def test_an_ordinary_folder_with_a_dotted_name_keeps_its_signature(monkeypatch):
+    monkeypatch.setattr(trust, "_winverifytrust", lambda p: True, raising=False)
+    monkeypatch.setattr(trust.os.path, "exists", lambda p: True)
+    monkeypatch.setattr(trust, "IS_WINDOWS", True)
+    trust._cache.clear()
+    assert trust.is_trusted("D:/tools/temperature.app/signed.exe", TRUSTED,
+                            SIG_UNTRUSTED_WIN) is True
+    assert trust.is_trusted(r"D:\tools\v1.2.\signed.exe", TRUSTED,
+                            SIG_UNTRUSTED_WIN) is True
+
+
+def test_posix_drop_location_is_normalised(monkeypatch):
+    trust._cache.clear()
+    assert trust._in_drop_location("/usr/../tmp/x", ("/tmp/",)) is True
+    assert trust._in_drop_location("/srv//tmp-builds/x", ("/tmp/",)) is False
