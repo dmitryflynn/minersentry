@@ -638,6 +638,34 @@ def listed_task_names(tasks: list[PersistEntry]) -> set[str]:
     return out
 
 
+def decode_task_xml(data: bytes) -> str:
+    """Decode a task definition by its byte-order mark. Pure.
+
+    The scheduler writes the files under System32\\Tasks as UTF-16 LE with a
+    BOM. Read as UTF-8 they began '\\ufffd\\ufffd<\\x00?\\x00...', failed the
+    "starts with <" check, and every real task file was skipped, so the
+    hidden-task scan could never report anything.
+    """
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", errors="replace")
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data[3:].decode("utf-8", errors="replace")
+    # UTF-16 without a BOM: ASCII markup leaves every other byte zero
+    head = data[:64]
+    if len(head) >= 4 and not any(head[1::2]) and all(head[0::2]):
+        return data.decode("utf-16-le", errors="replace")
+    return data.decode("utf-8", errors="replace")
+
+
+def read_task_file(path: str, limit: int = 1024 * 1024) -> str:
+    """A task XML file's text, or "" if it cannot be read."""
+    try:
+        with open(path, "rb") as f:
+            return decode_task_xml(f.read(limit))
+    except OSError:
+        return ""
+
+
 def _collect_task_files(visible_names: set[str], root: str | None = None
                         ) -> list[PersistEntry]:
     """Scheduled tasks read from their XML on disk (needs Administrator).
@@ -650,7 +678,7 @@ def _collect_task_files(visible_names: set[str], root: str | None = None
     for dirpath, _dirs, files in os.walk(root):
         for fname in files:
             path = os.path.join(dirpath, fname)
-            text = _read(path)
+            text = read_task_file(path)
             if not text.lstrip().startswith("<"):
                 continue
             name = task_name_from_path(path, root)
@@ -1581,6 +1609,18 @@ def _remove_task(entry: PersistEntry) -> "quarantine.Result":
                               capture_output=True, text=True, timeout=30,
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         xml = dump.stdout if dump.returncode == 0 else ""
+        if "<Task" not in xml and entry.file:
+            # The scheduler will not export a task it hides, which is exactly
+            # a hidden-task entry; the definition is still in its file.
+            xml = read_task_file(entry.file)
+        if "<Task" not in xml:
+            # Deleting now would be irreversible while the message and the
+            # journal promise an undo.
+            return quarantine.Result(
+                False, f"Could not save a copy of the task {name} (the "
+                       f"scheduler would not export it and its file could not "
+                       f"be read), so it was not deleted. Run elevated, or "
+                       f"delete it by hand after exporting it.")
         r = subprocess.run(["schtasks", "/delete", "/tn", name, "/f"],
                            capture_output=True, text=True, timeout=30,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
