@@ -20,7 +20,6 @@ import psutil
 from . import __app_name__, __version__
 from .audit import AuditLog
 from .engine import Engine, ProcInfo
-from . import gpu as gpu_mod
 from . import persistence as persist_mod
 from . import dnscache as dns_mod
 from . import probe as probe_mod
@@ -93,7 +92,6 @@ class MinerSentryApp:
         self.deep_running = False  # a background deep-scan thread is active
         self.probe_running = False
         self.elevated = quarantine_mod.is_elevated()
-        self._gpu_stop = threading.Event()
 
         self._build_ui()
         for w in self.engine.cfg.load_warnings:   # e.g. a tampered per-user config
@@ -108,20 +106,8 @@ class MinerSentryApp:
             self.root.after(int(self.engine.cfg.deep_auto_interval * 1000), self._auto_deep)
         # Background GPU-compute sampler (independent of the pause toggle).
         if self.engine.cfg.gpu_enabled:
-            threading.Thread(target=self._gpu_loop, daemon=True).start()
-
-    def _gpu_loop(self) -> None:
-        interval = self.engine.cfg.gpu_sample_interval
-        while not self._gpu_stop.is_set():
-            try:
-                util, windows, ctx = gpu_mod.sample()
-                self.engine.set_gpu_util(util, windows, ctx)
-            except Exception as e:  # noqa: BLE001
-                self.q.put(("event", f"gpu sampler: {type(e).__name__}: {e}"))
-            waited = 0.0
-            while waited < interval and not self._gpu_stop.is_set():
-                time.sleep(0.2)
-                waited += 0.2
+            self.engine.start_gpu_sampler(
+                on_error=lambda msg: self.q.put(("event", msg)))
 
     # -- UI construction ----------------------------------------------------
     def _build_ui(self) -> None:

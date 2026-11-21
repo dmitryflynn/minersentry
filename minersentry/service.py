@@ -33,7 +33,6 @@ from .audit import AuditLog
 from .config import Config
 from .engine import Engine
 from .quarantine import is_elevated
-from . import gpu as gpu_mod
 
 TASK_NAME = "MinerSentry"
 SYSTEMD_UNIT = "minersentry.service"
@@ -123,6 +122,8 @@ def run(cfg: Config | None = None, once: bool = False,
     engine.start_procevents()
     engine.start_pool_intel()
     engine.start_connection_ages()
+    if cfg.gpu_enabled:
+        engine.start_gpu_sampler(on_error=log.event)
     for w in cfg.load_warnings:
         log.event("config: " + w)
     if not is_elevated():
@@ -134,19 +135,11 @@ def run(cfg: Config | None = None, once: bool = False,
     seen_lookups: set[str] = set()
     alerts = 0
     next_deep = 0.0
-    next_gpu = 0.0
     next_persist = 0.0
     next_tamper = 0.0            # check on the first pass: no blind window
     installed_at_start = status().startswith("installed")
     while True:
         now = time.time()
-        if cfg.gpu_enabled and now >= next_gpu:
-            try:
-                util, windows, ctxs = gpu_mod.sample()
-                engine.set_gpu_util(util, windows, ctxs)
-            except Exception as e:  # noqa: BLE001
-                log.event(f"gpu sampler: {type(e).__name__}: {e}")
-            next_gpu = now + max(2.0, cfg.gpu_sample_interval)
         if cfg.persistence_enabled and cfg.persistence_interval > 0 and now >= next_persist:
             next_persist = now + cfg.persistence_interval
             try:

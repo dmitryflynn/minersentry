@@ -314,7 +314,10 @@ def merge_gpu_util(nvidia: dict[int, float], compute: dict[int, float],
         value = graphics.get(pid)
         if value:
             out[pid] = max(out.get(pid, 0.0), value)
-    return out
+    # The PDH parser sums a process across engine instances, so a job spread
+    # over several 3D engines read 163% on the Iris Xe. A percentage that
+    # exceeds 100 is not a stronger signal, only a wrong one.
+    return {pid: min(100.0, value) for pid, value in out.items()}
 
 
 _OTHER_GPU: bool | None = None
