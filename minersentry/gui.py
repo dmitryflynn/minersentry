@@ -92,6 +92,9 @@ class MinerSentryApp:
         self.scan_interval = self.engine.cfg.scan_interval
         self.deep_running = False  # a background deep-scan thread is active
         self.probe_running = False
+        # PID -> create time of processes this window suspended, so they can
+        # be resumed later and are not hidden as idle meanwhile.
+        self._suspended: dict[int, float | None] = {}
         self.elevated = quarantine_mod.is_elevated()
         self._gpu_stop = threading.Event()
 
@@ -428,10 +431,8 @@ class MinerSentryApp:
         existing = set(self.tree.get_children())
         wanted = []
         for r in results:
-            # Hide the long tail of idle, clean processes to keep focus.
-            if r.score == 0 and r.cpu < 2.0 and r.gpu < 2.0:
-                continue
-            wanted.append(r)
+            if self._shown(r):
+                wanted.append(r)
 
         wanted_ids = {str(r.pid) for r in wanted}
         for iid in existing - wanted_ids:
@@ -473,6 +474,14 @@ class MinerSentryApp:
         self.cpu_lbl.configure(text=f"system CPU {total_cpu:.0f}%  •  {self.engine.ncpu} logical cores")
         tag = f"{len(miners)} likely miner(s), {len(susp)} suspicious"
         self._set_status(f"Scanned {len(results)} processes in {dt:.1f}s — {tag}")
+
+    def _shown(self, r: ProcInfo) -> bool:
+        """Hide the long tail of idle, clean processes to keep focus — but
+        never one this window suspended: frozen, it uses no CPU, and hiding
+        it left no row to select and resume."""
+        if r.pid in self._suspended:
+            return True
+        return not (r.score == 0 and r.cpu < 2.0 and r.gpu < 2.0)
 
     def _on_select(self, _event) -> None:
         sel = self.tree.selection()
@@ -815,27 +824,59 @@ class MinerSentryApp:
         pid = int(sel[0])
         return pid, self.rows.get(pid)
 
+    def _same_process(self, pid: int, row) -> bool:
+        """Does `pid` still belong to the process `row` showed? The row can be
+        seconds old and a dialog can stay open indefinitely, so the PID may
+        have been reused by something unrelated."""
+        try:
+            return (row is not None and row.ctime is not None
+                    and abs(psutil.Process(pid).create_time() - row.ctime) <= 0.01)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return False
+
     def suspend_selected(self) -> None:
-        """Freeze a process instead of killing it: it stops, evidence survives."""
+        """Freeze a process instead of killing it: it stops, evidence survives.
+        On a process this window suspended, offer to resume it instead."""
         pid, row = self._selected()
         if pid is None:
             return
         name = row.name if row else str(pid)
+        if pid in self._suspended:
+            self._resume(pid, name)
+            return
         if not messagebox.askyesno(
                 "Suspend process",
                 f"Suspend {name} (PID {pid})?\n\n"
                 f"It stops running but is not killed, so it can still be inspected. "
-                f"Use Resume to undo."):
+                f"Press Suspend again on it to resume."):
+            return
+        if not self._same_process(pid, row):
+            messagebox.showwarning(
+                "Process changed",
+                f"PID {pid} no longer belongs to {name}; nothing was suspended.")
             return
         r = quarantine_mod.suspend(pid)
         self._set_status(r.message)
         self._add_event(("suspended: " if r.ok else "suspend failed: ") + r.message)
-        if r.ok and messagebox.askyesno("Suspended", r.message + "\n\nResume it now?"):
-            back = quarantine_mod.resume(pid)
-            self._set_status(back.message)
-            self._add_event("resumed: " + back.message)
-        elif not r.ok:
+        if not r.ok:
             messagebox.showerror("Suspend", r.message)
+            return
+        self._suspended[pid] = row.ctime
+        if messagebox.askyesno("Suspended", r.message + "\n\nResume it now?"):
+            self._resume(pid, name, ask=False)
+
+    def _resume(self, pid: int, name: str, ask: bool = True) -> None:
+        if ask and not messagebox.askyesno(
+                "Resume process", f"Resume {name} (PID {pid})? It was suspended "
+                                  f"from this window."):
+            return
+        back = quarantine_mod.resume(pid)
+        self._set_status(back.message)
+        self._add_event(("resumed: " if back.ok else "resume failed: ") + back.message)
+        if back.ok or "gone" in back.message:
+            self._suspended.pop(pid, None)
+        if not back.ok:
+            messagebox.showerror("Resume", back.message)
 
     def quarantine_selected(self) -> None:
         """Move the selected process's binary somewhere it cannot launch."""
