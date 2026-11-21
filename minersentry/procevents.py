@@ -83,8 +83,17 @@ POLL_WITHIN = 1
 # per-user quota on those, and enough orphans take the machine to "Quota
 # violation", after which nothing can subscribe at all. That is exactly what
 # happened here while this was being written.
+#
+# Output is UTF-8 on both ends. Left to the defaults, PowerShell writes a
+# redirected stdout in the OEM code page (cp437) while Python decodes it in
+# the ANSI one (cp1252), and the first byte cp1252 has no character for (a
+# u-umlaut is 0x81 in cp437) raised UnicodeDecodeError in the reader thread. The
+# thread died, the watcher went on reporting itself available, and nothing
+# was recorded for the rest of the session: one process with an umlaut in
+# its path or arguments was enough to blind it.
 _HELPER = r"""
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $parent = {parent}
 $query = "SELECT * FROM __InstanceCreationEvent WITHIN {within} " +
          "WHERE TargetInstance ISA 'Win32_Process'"
@@ -217,6 +226,7 @@ class Watcher:
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL, text=True, bufsize=1,
+                encoding="utf-8", errors="replace",
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except (OSError, ValueError) as e:
             self.mode = "unavailable"
@@ -245,7 +255,17 @@ class Watcher:
         proc = self._proc
         if proc is None or proc.stdout is None:
             return
-        for line in proc.stdout:
+        try:
+            self._read_lines(proc.stdout)
+        except Exception as e:  # noqa: BLE001 - say so; never die silently
+            # A reader that has stopped must not leave the watcher claiming
+            # coverage: nothing more will be recorded.
+            if not self._stop.is_set():
+                self.mode = "unavailable"
+                self.error = f"event reader stopped: {type(e).__name__}: {e}"[:200]
+
+    def _read_lines(self, lines) -> None:
+        for line in lines:
             if self._stop.is_set():
                 return
             parsed = parse_event_line(line)

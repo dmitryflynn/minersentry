@@ -641,3 +641,92 @@ def test_the_helper_cleans_itself_up_when_its_parent_is_killed():
                 psutil.Process(pid).kill()
             except psutil.Error:
                 pass
+
+
+# == the helper's output encoding ============================================
+def test_the_helper_and_the_reader_agree_on_utf8(monkeypatch):
+    """Left to the defaults, PowerShell wrote the pipe in cp437 and Python read
+    it as cp1252. A u-umlaut is 0x81 in cp437, which cp1252 cannot decode, so
+    one process with an umlaut in its path or arguments raised in the reader
+    thread and the watcher recorded nothing for the rest of the session."""
+    monkeypatch.setattr(PE, "IS_WINDOWS", True)
+    seen = {}
+
+    class FakeProc:
+        stdout = iter([_line(ready=True) + "\n"])
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            pass
+
+        def poll(self):
+            return 0
+
+    def fake_popen(args, **kwargs):
+        seen["args"], seen["kwargs"] = args, kwargs
+        return FakeProc()
+    monkeypatch.setattr(PE.subprocess, "Popen", fake_popen)
+    watcher = PE.Watcher(CFG)
+    assert watcher.start() is True
+    watcher.stop()
+    assert seen["kwargs"].get("encoding") == "utf-8"
+    assert seen["kwargs"].get("errors") == "replace"
+    assert "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8" in seen["args"][-1]
+
+
+def test_a_reader_that_fails_says_so_instead_of_claiming_coverage(monkeypatch):
+    """Whatever stops the reader, the watcher must stop reporting itself
+    available: nothing more is going to be recorded."""
+    monkeypatch.setattr(PE, "IS_WINDOWS", True)
+
+    def lines():
+        yield _line(ready=True) + "\n"
+        time.sleep(0.3)
+        raise UnicodeDecodeError("charmap", b"\x81", 0, 1, "undefined")
+
+    class FakeProc:
+        stdout = lines()
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            pass
+
+        def poll(self):
+            return 0
+    monkeypatch.setattr(PE.subprocess, "Popen", lambda *a, **k: FakeProc())
+    watcher = PE.Watcher(CFG)
+    assert watcher.start() is True
+    deadline = time.time() + 5
+    while watcher.available and time.time() < deadline:
+        time.sleep(0.05)
+    assert not watcher.available
+    assert "UnicodeDecodeError" in watcher.error
+    watcher.stop()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="WMI events are Windows-only")
+@pytest.mark.live
+@pytest.mark.skipif(os.environ.get("MINERSENTRY_LIVE_PROCEVENTS") != "1",
+                    reason="set MINERSENTRY_LIVE_PROCEVENTS=1 to run")
+def test_a_non_ascii_command_line_does_not_blind_the_watcher():
+    """Measured: before the fix the reader died on this process and the
+    following one was never recorded."""
+    watcher = PE.Watcher(CFG)
+    if not watcher.start():
+        pytest.skip(f"no event source here: {watcher.error}")
+    try:
+        time.sleep(2.0)
+        for arg in ("Jürgen-umlaut-marker", "plain-ascii-marker"):
+            subprocess.Popen([sys.executable, "-c", "import time; time.sleep(3)",
+                              arg]).wait(timeout=20)
+        time.sleep(4.0)
+        cmdlines = [e.cmdline for e in watcher.drain()]
+        assert watcher.available
+        assert any("Jürgen-umlaut-marker" in c for c in cmdlines)
+        assert any("plain-ascii-marker" in c for c in cmdlines)
+    finally:
+        watcher.stop()
