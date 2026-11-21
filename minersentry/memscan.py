@@ -30,13 +30,20 @@ STRING_MARKERS = {
     b"cryptonight": ("CryptoNight algorithm name", 10),
     b"\"method\":\"login\"": ("stratum login handshake", 40),
     b"\"method\":\"submit\"": ("stratum share submission", 45),
+    # A bare `"job_id"` is a JSON key any application with a job queue holds,
+    # so it is kept but treated as generic: it can add to a score and cannot
+    # lift one past the cap. The stratum login and submit strings, which are
+    # specific, still do.
     b"\"job_id\"": ("stratum job payload", 30),
     b"nicehash": ("NiceHash pool reference", 30),
     b"minexmr": ("MineXMR pool reference", 35),
     b"supportxmr": ("SupportXMR pool reference", 35),
     b"donate.ssl": ("miner donation endpoint", 35),
     b"nbminer": ("NBMiner identifier", 40),
-    b"t-rex": ("T-Rex miner identifier", 30),
+    # Not bare "t-rex": that is the name of Chromium's offline dinosaur game
+    # and occurs in node.exe, which is an interpreter and never dampened.
+    # Harmless while the scan rarely reached a heap; not once it does (#39).
+    b"t-rex nvidia": ("T-Rex miner identifier", 30),
     b"phoenixminer": ("PhoenixMiner identifier", 40),
     b"lolminer": ("lolMiner identifier", 40),
     b"ethminer": ("ethminer identifier", 35),
@@ -45,7 +52,8 @@ STRING_MARKERS = {
 # Markers that also show up in crypto libraries, benchmarks and ML stacks. They
 # are scored, but on their own they can't lift the memory score past the
 # generic cap (see MemScanResult.score); only protocol/brand strings can.
-GENERIC_STRING_MARKERS = frozenset({b"randomx", b"rx/0", b"cryptonight"})
+GENERIC_STRING_MARKERS = frozenset({b"randomx", b"rx/0", b"cryptonight",
+                                    b"\"job_id\""})
 
 # Binary constants. Keccak/SHA-3 round constant[0] and Blake2b IV word[0] are
 # used by RandomX / CryptoNight pipelines; finding them in a non-crypto app is
@@ -145,6 +153,63 @@ if IS_WINDOWS:
 # Keep per-process work bounded so a full-system deep scan stays responsive.
 MAX_REGION_READ = 4 * 1024 * 1024          # read at most 4 MiB per region
 MAX_BYTES_PER_PROC = 192 * 1024 * 1024     # stop a process after 192 MiB
+MAX_OTHER_BYTES = 64 * 1024 * 1024         # images and mapped files, separately
+READ_CHUNK = 8 * 1024 * 1024               # one ReadProcessMemory at most
+CHUNK_OVERLAP = 64                         # so a marker cannot straddle a seam
+
+
+class ReadBudget:
+    """How much of a process may be read, kept in two pots.
+
+    One budget used to cover everything readable, in address order, while
+    being SIZED from the process's private bytes. So mapped DLL images and
+    data files spent it before the heap was reached: a 29 MiB renderer has
+    66 MiB readable, a 37 MiB budget ran out in the images, and a page's
+    stratum login, job payload and pool URL -- all sitting in the heap -- were
+    never read. The promise that a small process "is covered completely" was
+    not being kept for any process whose images come first.
+
+    Private memory (heap, stacks, anything not backed by a file) is where a
+    program's own runtime data lives and is what the main budget is sized
+    for, so it gets that budget to itself. Images and mapped files get a
+    separate allowance: a miner's own binary still carries its strings in its
+    image, so they are worth reading, but they must not crowd out the heap.
+    """
+
+    def __init__(self, private: int, other: int) -> None:
+        self.private = max(0, private)
+        self.other = max(0, other)
+
+    def left(self, is_private: bool) -> int:
+        return self.private if is_private else self.other
+
+    def spend(self, is_private: bool, n: int) -> None:
+        if is_private:
+            self.private -= n
+        else:
+            self.other -= n
+
+    @property
+    def exhausted(self) -> bool:
+        return self.private <= 0 and self.other <= 0
+
+
+def chunks(offset: int, length: int, chunk: int = READ_CHUNK,
+           overlap: int = CHUNK_OVERLAP):
+    """Split one read into pieces of at most `chunk`, overlapping slightly.
+
+    Yields (offset, size, fresh) where `fresh` is how many of those bytes have
+    not been seen in an earlier piece. A single read used to be as large as
+    the per-region cap, and that cap is the whole process for a small one: a
+    1 GiB cap meant allocating and copying a 1 GiB buffer per region, and a
+    66 MiB process took 100 seconds to read.
+    """
+    done = 0
+    while done < length:
+        back = overlap if done else 0
+        size = min(chunk, length - done)
+        yield offset + done - back, size + back, size
+        done += size
 LARGE_DATASET_BYTES = 2 * 1024 * 1024 * 1024 - (64 * 1024 * 1024)  # ~2 GiB
 
 
@@ -234,8 +299,13 @@ def sample_offsets(region_size: int, max_total: int, samples: int) -> list[tuple
 def scan_process(pid: int, budget_bytes: int = MAX_BYTES_PER_PROC,
                  max_region_read: int = MAX_REGION_READ,
                  large_dataset_bytes: int = LARGE_DATASET_BYTES,
-                 full_walk: bool = True, region_samples: int = 4) -> MemScanResult:
+                 full_walk: bool = True, region_samples: int = 4,
+                 other_budget_bytes: int = MAX_OTHER_BYTES) -> MemScanResult:
     """Walk readable committed memory of `pid`, looking for miner fingerprints.
+
+    `budget_bytes` is for private memory; `other_budget_bytes` is a separate
+    allowance for images and mapped files. See ReadBudget for why they are
+    not one number.
 
     Dispatches to the Windows (ReadProcessMemory) or Linux (/proc) backend.
     Budgets (per-process cap, per-region read, large-dataset threshold) are
@@ -250,10 +320,10 @@ def scan_process(pid: int, budget_bytes: int = MAX_BYTES_PER_PROC,
     """
     if IS_WINDOWS:
         return _scan_windows(pid, budget_bytes, max_region_read, large_dataset_bytes,
-                             full_walk, region_samples)
+                             full_walk, region_samples, other_budget_bytes)
     if IS_LINUX:
         return _scan_linux(pid, budget_bytes, max_region_read, large_dataset_bytes,
-                           region_samples)
+                           region_samples, other_budget_bytes)
     r = MemScanResult(pid=pid)
     r.error = "memory scan unsupported on this platform"
     return r
@@ -261,7 +331,8 @@ def scan_process(pid: int, budget_bytes: int = MAX_BYTES_PER_PROC,
 
 def _scan_windows(pid: int, budget_bytes: int, max_region_read: int,
                   large_dataset_bytes: int, full_walk: bool = True,
-                  region_samples: int = 4) -> MemScanResult:
+                  region_samples: int = 4,
+                  other_budget_bytes: int = MAX_OTHER_BYTES) -> MemScanResult:
     result = MemScanResult(pid=pid)
     if pid <= 4:
         result.error = "system process"
@@ -277,8 +348,10 @@ def _scan_windows(pid: int, budget_bytes: int, max_region_read: int,
     try:
         mbi = MEMORY_BASIC_INFORMATION()
         addr = 0
-        buf = ctypes.create_string_buffer(max_region_read)
+        buf = ctypes.create_string_buffer(
+            min(max_region_read, READ_CHUNK) + CHUNK_OVERLAP)
         read = ctypes.c_size_t(0)
+        budget = ReadBudget(budget_bytes, other_budget_bytes)
         # Walk EVERY region: region sizes are cheap to query, and the ~2 GiB
         # dataset must be noticed even after the read budget is spent (it used
         # to be missed whenever 48 MiB ran out before the walk reached it).
@@ -298,27 +371,38 @@ def _scan_windows(pid: int, budget_bytes: int, max_region_read: int,
             if committed and region_size >= large_dataset_bytes:
                 result.large_page_dataset = True
 
-            if committed and readable and not guarded and result.bytes_scanned < budget_bytes:
+            is_private = mbi.Type == MEM_PRIVATE
+            if committed and readable and not guarded and budget.left(is_private) > 0:
                 for off, want in sample_offsets(region_size, max_region_read, region_samples):
-                    left = budget_bytes - result.bytes_scanned
-                    if left <= 0:
+                    want = min(want, budget.left(is_private))
+                    if want <= 0:
                         break
-                    to_read = min(want, left)
-                    read.value = 0
-                    ok = _k32.ReadProcessMemory(handle, ctypes.c_void_p(base + off),
-                                                buf, to_read, ctypes.byref(read))
-                    n = min(read.value, to_read)
-                    if not ok or n < to_read:
+                    failed = got = False
+                    for at, size, fresh in chunks(off, want):
+                        read.value = 0
+                        ok = _k32.ReadProcessMemory(
+                            handle, ctypes.c_void_p(base + at), buf, size,
+                            ctypes.byref(read))
+                        n = min(read.value, size)
+                        if not ok or n < size:
+                            failed = True
+                        if n:
+                            got = True
+                            _search_chunk(buf.raw[:n], result, seen, unbacked_code)
+                            counted = min(fresh, n)
+                            result.bytes_scanned += counted
+                            budget.spend(is_private, counted)
+                        if n < size:
+                            break       # the rest of this read is unreadable
+                    if failed:
                         result.regions_failed += 1
-                    if n:
-                        _search_chunk(buf.raw[:n], result, seen, unbacked_code)
-                        result.bytes_scanned += n
+                    if got:
                         result.regions_scanned += 1
 
             next_addr = base + region_size
             if next_addr <= addr:
                 break
-            if result.bytes_scanned >= budget_bytes and (
+            if budget.exhausted and (
                     result.large_page_dataset or not full_walk):
                 break  # nothing left to learn from the rest of the walk
             addr = next_addr
@@ -358,7 +442,8 @@ def maps_has_large_dataset(regions: list[tuple[int, int, str, str]],
 
 
 def _scan_linux(pid: int, budget_bytes: int, max_region_read: int,
-                large_dataset_bytes: int, region_samples: int = 4) -> MemScanResult:
+                large_dataset_bytes: int, region_samples: int = 4,
+                other_budget_bytes: int = MAX_OTHER_BYTES) -> MemScanResult:
     result = MemScanResult(pid=pid)
     if pid <= 0:
         result.error = "invalid pid"
@@ -388,30 +473,45 @@ def _scan_linux(pid: int, budget_bytes: int, max_region_read: int,
         result.coverage_status = "partial"
         result.error = f"mem read unavailable: {e}"
         return result
+    budget = ReadBudget(budget_bytes, other_budget_bytes)
     try:
         for start, end, perms, _path in regions:  # noqa: B007 - path used below
-            if result.bytes_scanned >= budget_bytes:
+            if budget.exhausted:
                 break  # budget spent; large_dataset flag already set from maps
             if "r" not in perms:
                 continue
             # anonymous (no pathname) and executable: code with no file behind it
             unbacked_code = "x" in perms and not _path
+            # [heap], [stack] and unnamed mappings are the process's own data;
+            # anything with a real path is a file somebody mapped.
+            is_private = not _path or _path.startswith("[")
+            if budget.left(is_private) <= 0:
+                continue
             for off, want in sample_offsets(end - start, max_region_read, region_samples):
-                left = budget_bytes - result.bytes_scanned
-                if left <= 0:
+                want = min(want, budget.left(is_private))
+                if want <= 0:
                     break
-                to_read = min(want, left)
-                try:
-                    mem.seek(start + off)
-                    data = mem.read(to_read)
-                except (OSError, ValueError, OverflowError):
+                failed = got = False
+                for at, size, fresh in chunks(off, want):
+                    try:
+                        mem.seek(start + at)
+                        data = mem.read(size)
+                    except (OSError, ValueError, OverflowError):
+                        failed = True
+                        break
+                    if len(data) < size:
+                        failed = True
+                    if data:
+                        got = True
+                        _search_chunk(data, result, seen, unbacked_code)
+                        counted = min(fresh, len(data))
+                        result.bytes_scanned += counted
+                        budget.spend(is_private, counted)
+                    if len(data) < size:
+                        break
+                if failed:
                     result.regions_failed += 1
-                    continue
-                if len(data) < to_read:
-                    result.regions_failed += 1
-                if data:
-                    _search_chunk(data, result, seen, unbacked_code)
-                    result.bytes_scanned += len(data)
+                if got:
                     result.regions_scanned += 1
         result.scanned = True
         result.coverage_status = "partial" if result.regions_failed else "bounded"

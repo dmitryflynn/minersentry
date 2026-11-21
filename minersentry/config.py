@@ -358,6 +358,14 @@ class Config:
     # A process at or below this size is scanned COMPLETELY rather than sampled
     # (a miner's own footprint is small; its 2 GiB dataset is judged by size).
     mem_full_scan_max_bytes: int = 128 * 1024 * 1024
+    # Images and mapped files are read against their own allowance, separate
+    # from the budget for private memory, so DLLs cannot use up the read
+    # before the heap is reached.
+    mem_image_budget_bytes: int = 64 * 1024 * 1024
+    # A browser content process that is holding a core is read completely up
+    # to this size instead of sampled. About 20 MiB/s on a background thread,
+    # and only for a tab that has already earned the attention.
+    mem_busy_tab_full_scan_max_bytes: int = 768 * 1024 * 1024
     # Miner strings live early in the heap/data; the ~2 GiB RandomX dataset is
     # detected from region *size* (VirtualQueryEx) without reading it. So a
     # modest per-process read budget keeps deep scans fast without missing hits.

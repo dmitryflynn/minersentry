@@ -26,7 +26,8 @@ from . import memscan, perfcounters, poolintel, power, trust
 from .audit import AuditLog
 from .config import Config
 from .scoring import (
-    Signal, combine, is_miner_name, name_stem, score_cpu, score_dataset,
+    Signal, combine, is_browser_content_process, is_miner_name, name_stem,
+    score_cpu, score_dataset,
     score_cmdline, score_gpu, score_memory, score_name, score_network, score_perf,
     score_stealth,
     score_swarm,
@@ -225,6 +226,8 @@ class Engine:
         # passwords and tokens). Arguments don't change for a PID's lifetime,
         # so this is resolved once per PID.
         self._cmd_hits: dict[int, list] = {}
+        # Browser content processes (a tab's renderer), from their own argv.
+        self._renderers: set[int] = set()
         # Per-PID (sibling count, aggregate cores) for processes sharing one
         # executable, recomputed each pass on the scan thread.
         self._swarm: dict[int, tuple[int, float]] = {}
@@ -257,6 +260,7 @@ class Engine:
         self._meta.pop(pid, None)
         self._perf_ratio.pop(pid, None)
         self._cmd_hits.pop(pid, None)
+        self._renderers.discard(pid)
         self._container.pop(pid, None)
         self._own_tooling.discard(pid)
         self._warm.discard(pid)
@@ -389,6 +393,17 @@ class Engine:
         # Neither an injection host nor an interpreter gets its evidence
         # dampened: the signed binary is the vehicle, not the thing we judge.
         injection_host = stem in cfg.injection_hosts or stem in cfg.interpreter_hosts
+        # A browser content process runs a page's code, not the browser's. When
+        # one is also holding a core, what is in its memory is the page's doing
+        # and the browser's signature says nothing about it. Only then: an idle
+        # tab showing an article about miners carries the same words, and must
+        # stay as quiet as it always was.
+        busy_tab = info.pid in self._renderers and cpu_sig.score > 0
+        if busy_tab:
+            injection_host = True
+            if mem_sig.score:
+                mem_sig = Signal("memory", mem_sig.score, mem_sig.detail
+                                 + " (in a browser tab that is holding a core)")
         if (cfg.trusted_dampen < 1.0 and (mem_sig.score or name_sig.score)
                 and not injection_host and self._trusted(info)):
             if mem_sig.score:
@@ -527,6 +542,8 @@ class Engine:
         # holds the marker table in memory and convicts itself otherwise.
         if self._own_code_roots and self._runs_our_code(argv):
             self._own_tooling.add(proc.pid)
+        if is_browser_content_process(argv):
+            self._renderers.add(proc.pid)
         if not self.cfg.cmdline_enabled:
             return []
         hits = cmdline_mod.indicators(argv, self.cfg)
@@ -644,20 +661,35 @@ class Engine:
         if self.gpu_only and pid not in self.gpu_scope:
             raise ValueError(f"PID {pid} is outside the GPU-only scan scope")
         ctime = self._live_ctime(pid)
+        # A browser is normally sampled, because reading all of it is slow and
+        # there is nothing to suggest it is worth it. A content process that
+        # has been holding a core IS worth it: sampling 37 MiB of one missed
+        # every stratum string a page was holding in a real test.
+        full_max = self.cfg.mem_full_scan_max_bytes
+        if pid in self._renderers and self._holds_a_core(pid):
+            full_max = max(full_max, self.cfg.mem_busy_tab_full_scan_max_bytes)
         budget, region_cap = memscan.budget_for(
             self._proc_private(pid), self.cfg.mem_max_bytes_per_proc,
-            self.cfg.mem_max_region_read, self.cfg.mem_full_scan_max_bytes)
+            self.cfg.mem_max_region_read, full_max)
         r = memscan.scan_process(
             pid, budget_bytes=budget,
             max_region_read=region_cap,
             large_dataset_bytes=self.cfg.mem_large_dataset_bytes,
             full_walk=pid in self._big_mem_pids,
-            region_samples=self.cfg.mem_region_samples)
+            region_samples=self.cfg.mem_region_samples,
+            other_budget_bytes=self.cfg.mem_image_budget_bytes)
         # Deep scans run on a background thread and take seconds. Only keep the
         # result if the PID still belongs to the process we scanned.
         if self._same_process(pid, ctime):
             self._mem_cache[pid] = r
         return r
+
+    def _holds_a_core(self, pid: int) -> bool:
+        """Whether this process's CPU signal is currently non-zero."""
+        try:
+            return score_cpu(self._cpu_stats(pid), self._ncpu, self.cfg).score > 0
+        except Exception:  # noqa: BLE001
+            return False
 
     def _proc_private(self, pid: int) -> int:
         """Committed private bytes (Windows) or RSS (Linux), 0 if unknown."""

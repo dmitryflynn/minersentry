@@ -47,6 +47,23 @@ def is_miner_name(name: str, cfg: Config) -> bool:
     return False
 
 
+def is_browser_content_process(argv: list[str]) -> bool:
+    """True for a browser process that runs a page: a Chromium renderer, or a
+    Firefox content process. Pure.
+
+    These are told apart from the browser itself by their own command line,
+    which the browser sets and a page cannot: Chromium passes
+    `--type=renderer`, Firefox passes `-contentproc` and ends with `tab`.
+    Electron apps match too, correctly — their renderers run web content the
+    same way.
+    """
+    if not argv:
+        return False
+    if any(a == "--type=renderer" for a in argv):
+        return True
+    return "-contentproc" in argv and argv[-1] == "tab"
+
+
 def score_cpu(recent: list[float], ncpu: int, cfg: Config) -> Signal:
     """Score sustained, steady core saturation from raw per-core CPU samples.
 
