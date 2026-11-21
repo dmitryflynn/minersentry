@@ -13,3 +13,6 @@ bench/fp_results.*
 .venv/
 miner-test.json
 .DS_Store
+
+# Claude Code agent worktrees and local settings
+.claude/

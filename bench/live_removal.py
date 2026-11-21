@@ -148,7 +148,26 @@ def main() -> int:
     if failures:
         print(f"\n{len(failures)} failing:\n")
         print(output[-4000:])
-    return 1 if failures else 0
+    return exit_status(code, rows)
+
+
+def exit_status(pytest_code: int, rows: list) -> int:
+    """Non-zero unless pytest itself succeeded AND something was verified.
+
+    This used to be decided from the parsed rows alone, with pytest's own
+    exit code thrown away. So a run where the test file failed to import,
+    or where collection broke, produced no rows, no failures, and exit 0 --
+    a verification report that verified nothing and said it passed. Exit 5
+    (no tests collected) is a failure here too: this script exists to run
+    those tests.
+    """
+    if pytest_code != 0:
+        return 1
+    if not rows:
+        return 1
+    if any(r[1] in ("FAILED", "ERROR") for r in rows):
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
