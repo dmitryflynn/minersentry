@@ -10,7 +10,7 @@ new feature.
 git clone https://github.com/dmitryflynn/minersentry
 cd minersentry
 pip install -e ".[dev]"
-python -m pytest            # ~380 tests, about a minute
+python -m pytest            # ~750 tests, a few minutes
 python main.py              # the GUI
 ```
 
