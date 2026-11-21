@@ -128,7 +128,7 @@ def _wait_for_decoys(procs: list[subprocess.Popen], tmpdir: str, want: int,
         time.sleep(0.05)
 
 
-def _spawn_decoys(names: tuple[str, ...], detach: bool = False
+def _spawn_decoys(names: tuple[str, ...]
                   ) -> tuple[list[subprocess.Popen], str | None, str | None]:
     """Spawn one harmless waiting process per decoy name, all at once.
 
@@ -142,11 +142,11 @@ def _spawn_decoys(names: tuple[str, ...], detach: bool = False
 
     Each decoy is launched directly, so we hold a handle to it and can prove it
     started and stop it again on any platform. Detaching through the shell
-    (`detach=True`) hides that MinerSentry is the parent, but then the decoys
-    can only be found by resolving their executable path, which some systems
-    refuse — leaving decoys that cannot be confirmed or killed. Being certain
-    of the decoys matters more than hiding their parentage, so detaching is off
-    by default and the parent tell is documented instead.
+    would hide that MinerSentry is the parent, but then the decoys could only
+    be found by resolving their executable path, which some systems refuse —
+    leaving decoys that cannot be confirmed or killed. Being certain of the
+    decoys matters more than hiding their parentage, so they are never
+    detached and the parent tell is documented instead.
     """
     tmpdir = tempfile.mkdtemp(prefix=secrets.token_hex(4) + "-")
     creation = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
@@ -257,7 +257,7 @@ def _why_not_started(procs: list[subprocess.Popen], src: str,
 
 
 def _decoys_under(tmpdir: str) -> list[psutil.Process]:
-    """Live processes running from `tmpdir` (our detached decoys)."""
+    """Live processes running from `tmpdir`, found by executable path."""
     root = os.path.normcase(os.path.realpath(tmpdir))
     out = []
     for p in psutil.process_iter(["exe"]):
@@ -286,7 +286,7 @@ def _stop_decoys(procs: list[subprocess.Popen], tmpdir: str | None = None) -> No
                 d.wait(timeout=2)
             except Exception:  # noqa: BLE001
                 pass
-    if tmpdir:                  # detached decoys have no Popen handle
+    if tmpdir:                  # anything left running from the folder, handle or not
         live = decoy_processes([], tmpdir)
         for p in live:
             try:

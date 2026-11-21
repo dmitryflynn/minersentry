@@ -222,7 +222,6 @@ class Engine:
         # executable, recomputed each pass on the scan thread.
         self._swarm: dict[int, tuple[int, float]] = {}
         self.audit = audit or AuditLog()
-        self.last_scan_errors = 0  # memory OpenProcess failures last deep pass
         for p in (() if gpu_only else psutil.process_iter()):  # prime CPU baselines
             try:
                 p.cpu_percent(None)
@@ -764,11 +763,8 @@ class Engine:
             self._parent_names = _parent_name_map(procs, self._expected_parent)
 
         if deep:
-            self.last_scan_errors = 0
             for pid in self.deep_scan_targets():
-                r = self.deep_probe(pid)
-                if r.error and "OpenProcess" in (r.error or ""):
-                    self.last_scan_errors += 1
+                self.deep_probe(pid)
 
         # Build the TCP connection map ONCE for the whole pass (one syscall),
         # instead of calling net_connections per process (~1500x faster).

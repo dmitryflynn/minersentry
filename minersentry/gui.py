@@ -46,13 +46,6 @@ def _describe_removal(record: dict) -> str:
     return f"{when or '(no timestamp)':<19}  {what}"
 
 
-def _is_elevated() -> bool:
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:  # noqa: BLE001
-        return False
-
-
 def _relaunch_as_admin() -> bool:
     """Relaunch MinerSentry elevated via the UAC prompt. Returns True on launch."""
     try:
@@ -78,13 +71,6 @@ RED = "#f85149"
 # Host findings below this are listed in the panel and the log, not bannered.
 BANNER_MIN_SCORE = 40
 
-VERDICT_COLOR = {
-    "Clean": GREEN,
-    "Suspicious": AMBER,
-    "Likely Miner": RED,
-}
-
-
 class MinerSentryApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -106,7 +92,7 @@ class MinerSentryApp:
         self.scan_interval = self.engine.cfg.scan_interval
         self.deep_running = False  # a background deep-scan thread is active
         self.probe_running = False
-        self.elevated = _is_elevated()
+        self.elevated = quarantine_mod.is_elevated()
         self._gpu_stop = threading.Event()
 
         self._build_ui()
