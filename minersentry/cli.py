@@ -27,6 +27,17 @@ from . import dnscache as dns_mod
 from . import tamper as tamper_mod
 
 
+def _sweep(e: Engine, targets: list[int]) -> None:
+    """Memory-probe each target. One failure costs that PID only: with
+    --gpu-only the scope is refreshed while this runs, and scan_memory raises
+    for a PID that has left it, which used to end the whole sweep."""
+    for pid in targets:
+        try:
+            e.deep_probe(pid)
+        except Exception:  # noqa: BLE001
+            continue
+
+
 def run_session(duration: float, cfg: Config | None = None,
                 interval: float | None = None, deep: bool = True,
                 gpu_sample: bool = False, force_pids: set[int] | None = None,
@@ -101,7 +112,7 @@ def run_session(duration: float, cfg: Config | None = None,
                 last_deep = time.time()
                 targets = e.deep_scan_targets(force=force_pids)
                 deep_thread = threading.Thread(
-                    target=lambda: [e.deep_probe(pid) for pid in targets], daemon=True)
+                    target=_sweep, args=(e, targets), daemon=True)
                 deep_thread.start()
         results = e.scan_once(deep=False)
         _record(elapsed)
@@ -270,14 +281,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     args = ap.parse_args(argv)
 
+    def _done(ok: bool, message: str, **extra) -> int:
+        """Report an autostart action. With --json the answer is one object
+        on stdout; these used to print sentences whatever --json said."""
+        if args.json:
+            print(json.dumps({"ok": ok, "message": message, **extra}, indent=2))
+        else:
+            print(message, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+
     if args.autostart_undo:
         records = persist_mod.removals()
         if not records:
-            print("Nothing to undo.", file=sys.stderr)
-            return 1
+            return _done(False, "Nothing to undo.")
         r = persist_mod.undo_removal(records[-1])
-        print(r.message, file=sys.stdout if r.ok else sys.stderr)
-        return 0 if r.ok else 1
+        return _done(r.ok, r.message)
 
     if args.autostart_remove:
         cfg = Config.load(args.config)
@@ -285,19 +303,23 @@ def main(argv: list[str] | None = None) -> int:
         found = [e for e in persist_mod.scan(cfg)
                  if wanted in e.name.lower()]
         if not found:
-            print(f"No reported autostart entry matches {args.autostart_remove!r}. "
-                  f"Run --autostart-only to see what was found.", file=sys.stderr)
-            return 1
+            return _done(False, f"No reported autostart entry matches "
+                                f"{args.autostart_remove!r}. Run --autostart-only "
+                                f"to see what was found.")
         if len(found) > 1:
+            if args.json:
+                return _done(False, "That matches more than one entry; be more specific.",
+                             matches=[{"name": e.name, "kind": e.kind,
+                                       "location": e.location} for e in found])
             print("That matches more than one entry; be more specific:", file=sys.stderr)
             for e in found:
                 print(f"  {e.name}  ({e.kind}, {e.location})", file=sys.stderr)
             return 1
         r = persist_mod.remove_entry(found[0])
-        print(r.message, file=sys.stdout if r.ok else sys.stderr)
-        if r.ok:
+        rc = _done(r.ok, r.message)
+        if r.ok and not args.json:
             print("Undo it with: minersentry-scan --autostart-undo")
-        return 0 if r.ok else 1
+        return rc
 
     if args.autostart_only:
         cfg = Config.load(args.config)
