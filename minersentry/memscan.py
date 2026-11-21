@@ -104,9 +104,12 @@ class MemScanResult:
 
     @property
     def score(self) -> int:
+        # Strings only. A ~2 GiB region is scored once, as the engine's own
+        # `dataset` signal. Adding 30 here as well counted it twice, so the
+        # dataset+memory conviction pair (meant to need resident miner
+        # STRINGS next to the dataset) fired on one 30-point string: an idle
+        # process with a big heap and a single "nicehash" read Likely Miner.
         s = sum(h.weight for h in self.hits)
-        if self.large_page_dataset:
-            s += 30
         # Large mappings, algorithm names and crypto constants also occur in ML.
         has_miner_string = any(h.where == "string" and not h.generic for h in self.hits)
         return min(100 if has_miner_string else GENERIC_SCORE_CAP, s)
