@@ -136,6 +136,7 @@ def run(cfg: Config | None = None, once: bool = False,
     engine.start_connection_ages()
     if cfg.gpu_enabled:
         engine.start_gpu_sampler(on_error=log.event)
+    engine.start_cadence()
     for w in cfg.load_warnings:
         log.event("config: " + w)
     if not is_elevated():

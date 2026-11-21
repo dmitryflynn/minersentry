@@ -164,6 +164,35 @@ class Config:
     net_use_connection_age: bool = True
     net_age_refresh_seconds: float = 120.0
 
+    # -- share-submission cadence (corroborating only; see cadence.py) -------
+    # Per-connection byte counters sampled over minutes, looking for small
+    # uploads on a 30-120 s beat with little coming back. Heartbeats look the
+    # same, so this never enters the weighted blend and convicts only beside a
+    # miner-specific artifact. Linux: `ss` tcp_info. Windows: EStats, which
+    # needs Administrator; unelevated it reports itself unavailable.
+    cadence_enabled: bool = True
+    cadence_sample_interval: float = 5.0   # seconds between counter samples
+    cadence_history_seconds: float = 900.0  # per-connection history kept
+    cadence_min_samples: int = 12
+    cadence_min_window: float = 300.0      # seconds of history before judging
+    cadence_min_bursts: int = 5
+    cadence_burst_min_bytes: int = 64      # smaller runs are pings, ignored
+    cadence_burst_max_bytes: int = 2048    # a share submission is a few hundred
+    cadence_small_fraction: float = 0.8    # of bursts that must be small
+    cadence_max_active_fraction: float = 0.5  # of intervals with any upload
+    cadence_min_interval: float = 20.0
+    cadence_max_interval: float = 150.0
+    # Share finds are random, so gaps are roughly exponential (cv ~1): a strict
+    # periodicity test would miss real miners and keep only timers.
+    cadence_max_cv: float = 1.2
+    cadence_max_gap: float = 360.0         # longest silence inside the window
+    cadence_max_in_rate: float = 512.0     # bytes/s inbound: more is a stream
+    cadence_include_loopback: bool = False
+    cadence_max_connections: int = 512     # tracked at once
+    # Never above the weakest network score (it is clamped to net_score_weak),
+    # and at corrob_nonzero_score so a beat counts as a corroborating signal.
+    cadence_score: int = 25
+
     # -- background monitoring / alerts --------------------------------------
     # A command run on each new detection (it receives title and body as two
     # arguments). Empty means use the platform's own notification.
@@ -299,6 +328,13 @@ class Config:
         ("swarm", 40, "network", 50, 85),
         ("swarm", 40, "dataset", 60, 85),
         ("swarm", 40, "probe", 60, 88),
+        # A share-submission beat on one of the process's connections. It
+        # looks like a heartbeat, so it pairs only with miner-specific
+        # evidence, never with load, and each floor matches (never exceeds)
+        # the floor of the same pair with a network signal in its place.
+        ("cadence", 25, "memory", 60, 80),
+        ("cadence", 25, "cmdline", 40, 85),
+        ("cadence", 25, "stealth", 50, 85),
         # A connection to a RESOLVED known-pool IP (network >= 88) is near
         # conclusive — legit software has no reason to talk to supportxmr — so a
         # minimal behavioral corroborator convicts.
@@ -514,7 +550,8 @@ _VERDICTS = {"Likely Miner", "Suspicious", "Clean"}
 _NOT_SETTABLE = {"load_warnings"}
 _SCORE_NAMES = {"suspicious_cap", "hard_memory", "hard_name", "hard_probe",
                 "corrob_nonzero_score", "desktop_name_floor"}
-_UNIT_NAMES = {"trusted_dampen", "gpu_window_dampen", "hidden_baseline_alpha"}
+_UNIT_NAMES = {"trusted_dampen", "gpu_window_dampen", "hidden_baseline_alpha",
+               "cadence_small_fraction", "cadence_max_active_fraction"}
 
 
 def _is_num(v) -> bool:

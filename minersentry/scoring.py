@@ -277,6 +277,30 @@ def score_cmdline(score: int, labels: list[str], cfg: Config) -> Signal:
     return Signal("cmdline", min(100, score), "; ".join(labels[:4]))
 
 
+def score_cadence(result, available: bool, cfg: Config,
+                  where: str = "") -> Signal:
+    """Score a share-submission beat on one of the process's connections.
+
+    `result` is the strongest `cadence.CadenceResult` among the process's
+    tracked connections (None if none has history yet). Heartbeats and
+    telemetry share this shape, so the score is small and fixed: it is clamped
+    to the weakest network score, it is not in the weighted blend, and the only
+    conviction rules it takes part in pair it with miner-specific evidence.
+    """
+    if not cfg.cadence_enabled:
+        return Signal("cadence", 0, "share-cadence watch off")
+    if not available:
+        return Signal("cadence", 0, "share cadence not observable here")
+    if result is None:
+        return Signal("cadence", 0, "no tracked connection history")
+    if not result.beat:
+        return Signal("cadence", 0, result.describe())
+    score = max(0, min(cfg.cadence_score, cfg.net_score_weak))
+    return Signal("cadence", score,
+                  result.describe() + (f" to {where}" if where else "")
+                  + " (corroborating only: heartbeats look the same)")
+
+
 def combine(signals: list[Signal], cfg: Config) -> tuple[int, str]:
     """Blend signal scores into a final (score, verdict).
 

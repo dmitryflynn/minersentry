@@ -58,6 +58,7 @@ def run_session(duration: float, cfg: Config | None = None,
     e.start_connection_ages()
     if gpu_sample or gpu_only:
         e.start_gpu_sampler()
+    e.start_cadence()
     # Processes that start and exit inside one pass are invisible to the poll;
     # this records them. Started here rather than in Engine() because it
     # spawns a helper process.
@@ -173,6 +174,9 @@ def summarize(e: Engine, results: list[ProcInfo], first_hit: dict[int, float],
             getattr(e, "transient", []),
             getattr(getattr(e, "cfg", None), "procevents_min_score", 45)),
         "transient_watch": getattr(e, "procevents_mode", "off"),
+        # Whether per-connection byte counters could be read at all (Windows
+        # needs Administrator), so a clean cadence signal is not over-read.
+        "cadence_watch": getattr(e, "cadence_mode", "off"),
         # Grouped, because the container is the unit an operator acts on: four
         # busy PIDs in one pod is one thing to go and look at, not four.
         "containers": containers_mod.summarize(
