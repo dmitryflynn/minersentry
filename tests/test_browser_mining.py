@@ -204,3 +204,29 @@ def test_the_image_allowance_reaches_the_scanner(monkeypatch):
                         memscan.MemScanResult(pid=pid))
     e.scan_memory(4242)
     assert seen["other_budget_bytes"] == e.cfg.mem_image_budget_bytes
+
+
+# == weak markers, now that the heap is actually read ======================
+def _hits(text: bytes):
+    r = memscan.MemScanResult(pid=1)
+    memscan._search_chunk(text, r, set())
+    return r
+
+
+def test_the_chromium_dinosaur_game_is_not_a_miner():
+    """"t-rex" is the name of Chromium's offline game and appears in node.exe,
+    an interpreter that is never dampened. Only the miner's own banner counts."""
+    assert _hits(b"...the T-Rex runner game...").score == 0
+    assert _hits(b"T-Rex NVIDIA GPU miner v0.26.8").score >= 30
+
+
+def test_a_bare_job_id_key_cannot_lift_the_memory_score():
+    """Any app with a job queue holds `"job_id"`. It may add to a score but
+    must not push it past the generic cap on its own."""
+    r = _hits(b'{"job_id":"42","status":"queued"} randomx rx/0')
+    assert r.score <= memscan.GENERIC_SCORE_CAP
+
+
+def test_a_real_stratum_payload_still_convicts():
+    r = _hits(b'{"id":1,"method":"login","params":{}} {"job_id":"ab","blob":"07"}')
+    assert r.score > memscan.GENERIC_SCORE_CAP

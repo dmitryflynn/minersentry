@@ -30,13 +30,20 @@ STRING_MARKERS = {
     b"cryptonight": ("CryptoNight algorithm name", 10),
     b"\"method\":\"login\"": ("stratum login handshake", 40),
     b"\"method\":\"submit\"": ("stratum share submission", 45),
+    # A bare `"job_id"` is a JSON key any application with a job queue holds,
+    # so it is kept but treated as generic: it can add to a score and cannot
+    # lift one past the cap. The stratum login and submit strings, which are
+    # specific, still do.
     b"\"job_id\"": ("stratum job payload", 30),
     b"nicehash": ("NiceHash pool reference", 30),
     b"minexmr": ("MineXMR pool reference", 35),
     b"supportxmr": ("SupportXMR pool reference", 35),
     b"donate.ssl": ("miner donation endpoint", 35),
     b"nbminer": ("NBMiner identifier", 40),
-    b"t-rex": ("T-Rex miner identifier", 30),
+    # Not bare "t-rex": that is the name of Chromium's offline dinosaur game
+    # and occurs in node.exe, which is an interpreter and never dampened.
+    # Harmless while the scan rarely reached a heap; not once it does (#39).
+    b"t-rex nvidia": ("T-Rex miner identifier", 30),
     b"phoenixminer": ("PhoenixMiner identifier", 40),
     b"lolminer": ("lolMiner identifier", 40),
     b"ethminer": ("ethminer identifier", 35),
@@ -45,7 +52,8 @@ STRING_MARKERS = {
 # Markers that also show up in crypto libraries, benchmarks and ML stacks. They
 # are scored, but on their own they can't lift the memory score past the
 # generic cap (see MemScanResult.score); only protocol/brand strings can.
-GENERIC_STRING_MARKERS = frozenset({b"randomx", b"rx/0", b"cryptonight"})
+GENERIC_STRING_MARKERS = frozenset({b"randomx", b"rx/0", b"cryptonight",
+                                    b"\"job_id\""})
 
 # Binary constants. Keccak/SHA-3 round constant[0] and Blake2b IV word[0] are
 # used by RandomX / CryptoNight pipelines; finding them in a non-crypto app is
