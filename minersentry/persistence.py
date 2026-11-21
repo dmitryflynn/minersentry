@@ -504,8 +504,7 @@ def _collect_windows(cfg: Config) -> list[PersistEntry]:
 
     tasks = _collect_tasks()
     out += tasks
-    visible = {os.path.basename(t.location).lower() for t in tasks}
-    visible |= {t.name.lower() for t in tasks}
+    visible = listed_task_names(tasks)
     for extra in (lambda: _collect_task_files(visible), _collect_service_dlls,
                   _collect_hijacks, _collect_wmi, _collect_bits,
                   _collect_load_points, _collect_lsa, _collect_gpo_scripts,
@@ -624,6 +623,20 @@ def tasks_root() -> str:
     return os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "Tasks")
 
 
+def listed_task_names(tasks: list[PersistEntry]) -> set[str]:
+    r"""The full scheduler names (`\Folder\Name`, lower-cased) of listed tasks.
+
+    Leaf names are deliberately not included. A hidden task is only "already
+    listed" if the listing has that exact task; sharing a leaf with some other
+    listed task is the easiest way there is to stay out of the report.
+    """
+    out = set()
+    for t in tasks:
+        name = t.location if t.location.startswith("\\") else "\\" + t.location
+        out.add(name.lower())
+    return out
+
+
 def _collect_task_files(visible_names: set[str], root: str | None = None
                         ) -> list[PersistEntry]:
     """Scheduled tasks read from their XML on disk (needs Administrator).
@@ -641,8 +654,10 @@ def _collect_task_files(visible_names: set[str], root: str | None = None
                 continue
             name = task_name_from_path(path, root)
             # A task the scheduler already listed is not reported twice: the
-            # file walk exists to find the ones it did NOT list.
-            if fname.lower() in visible_names or name.lower() in visible_names:
+            # file walk exists to find the ones it did NOT list. Compared by
+            # full name only: a leaf-name match let \Evil\X hide behind a
+            # listed \X.
+            if name.lower() in visible_names:
                 continue
             out += parse_task_xml(text, path, False, name)
     return out
