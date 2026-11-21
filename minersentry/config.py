@@ -427,12 +427,17 @@ class Config:
             cfg = _apply(cfg, _read(path, warnings), warnings, restricted=False, src=path)
         else:
             sys_path = system_config_path()
+            admin_set: set[str] = set()
             if _system_file_is_protected(sys_path, warnings):
                 cfg = _apply(cfg, _read(sys_path, warnings), warnings, restricted=False,
-                             src=sys_path)
+                             src=sys_path, applied=admin_set)
             user_path = user_config_path()
+            # Timing the administrator chose is a ceiling for the per-user
+            # file: it may scan more often, never less. Applied after the
+            # admin file, it used to overrule it outright.
+            ceilings = {k: getattr(cfg, k) for k in admin_set if k in _USER_BOUNDED}
             cfg = _apply(cfg, _read(user_path, warnings), warnings, restricted=True,
-                         src=user_path)
+                         src=user_path, ceilings=ceilings)
         cfg.load_warnings = warnings
         return cfg
 
@@ -543,6 +548,10 @@ def _validate(name: str, cur, v):
             return False, "expected text"
         if name == "profile" and v not in ("desktop", "cloud"):
             return False, "must be 'desktop' or 'cloud'"
+        if name == "notify_min_verdict" and v not in ("Likely Miner", "Suspicious"):
+            # An unknown name used to mean "Likely Miner" silently, so a
+            # lower-case "suspicious" switched off the alerts it asked for.
+            return False, "must be 'Likely Miner' or 'Suspicious'"
         return True, v
     if isinstance(cur, dict):            # weights
         if not isinstance(v, dict) or not v:
@@ -592,7 +601,8 @@ def _validate(name: str, cur, v):
 
 
 def _apply(cfg: "Config", data: dict, warnings: list[str], *, restricted: bool,
-           src: str) -> "Config":
+           src: str, applied: set[str] | None = None,
+           ceilings: dict | None = None) -> "Config":
     known = {f.name for f in fields(Config)} - _NOT_SETTABLE
     overrides = {}
     for k, v in data.items():
@@ -611,9 +621,18 @@ def _apply(cfg: "Config", data: dict, warnings: list[str], *, restricted: bool,
             if not lo <= val <= hi:
                 warnings.append(f"ignored '{k}' in {src}: per-user value must be in [{lo}, {hi}]")
                 continue
+            ceiling = (ceilings or {}).get(k)
+            # 0 turns deep_auto_interval off, so an admin 0 is no ceiling:
+            # switching it on from the per-user file is stricter.
+            if ceiling and val > ceiling:
+                warnings.append(f"ignored '{k}' in {src}: {val:g}s is slower than the "
+                                f"admin config's {ceiling:g}s")
+                continue
         if restricted and k in _USER_ADDITIVE:
             val = getattr(cfg, k) | val
         overrides[k] = val
+        if applied is not None:
+            applied.add(k)
     out = replace(cfg, **overrides) if overrides else cfg
     out.load_warnings = list(cfg.load_warnings)
     return out
