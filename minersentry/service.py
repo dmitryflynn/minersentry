@@ -59,6 +59,18 @@ def _toast_script(title: str, body: str) -> str:
     )
 
 
+def _split_command(cmd: str) -> list[str]:
+    """Split `notify_command` the way the platform's shell would.
+
+    shlex.split is POSIX-only: backslashes are escapes there, so an unquoted
+    C:\\tools\\alert.exe became C:toolsalert.exe and never started.
+    """
+    if sys.platform != "win32":
+        return shlex.split(cmd)
+    parts = shlex.split(cmd, posix=False)
+    return [p[1:-1] if len(p) >= 2 and p[0] == p[-1] == '"' else p for p in parts]
+
+
 def notify(title: str, body: str, cfg: Config | None = None) -> str:
     """Raise a desktop alert, best effort. Returns which channel was used.
 
@@ -69,7 +81,7 @@ def notify(title: str, body: str, cfg: Config | None = None) -> str:
     cmd = (cfg.notify_command or "").strip()
     if cmd:
         try:
-            subprocess.run(shlex.split(cmd) + [title, body], timeout=15,
+            subprocess.run(_split_command(cmd) + [title, body], timeout=15,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return "command"
         except Exception:  # noqa: BLE001 - alerting must never break monitoring
@@ -209,7 +221,11 @@ def run(cfg: Config | None = None, once: bool = False,
         # running, something removed it. Say so instead of dying quietly.
         if installed_at_start and cfg.tamper_check_interval > 0 and now >= next_tamper:
             next_tamper = now + cfg.tamper_check_interval
-            if not status().startswith("installed"):
+            # Only a definite "not installed" is a removal. status() answers
+            # "unknown: ..." when schtasks is slow or will not start, and
+            # treating that as deletion raised a false alarm and then
+            # stopped checking for the rest of the run.
+            if status().startswith("not installed"):
                 installed_at_start = False
                 log.event("tamper: MinerSentry's autostart entry was removed while running")
                 if alert:
