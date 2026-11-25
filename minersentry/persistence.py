@@ -601,7 +601,8 @@ def parse_task_xml(text: str, path: str, visible: bool,
     if not enabled:
         return []
     out: list[PersistEntry] = []
-    name = os.path.basename(path)
+    # ntpath: a Windows path or scheduler name, whatever platform parses it
+    name = ntpath.basename(task_name or path)
     for exec_node in (n for n in root.iter() if strip(n.tag) == "Exec"):
         command = arguments = ""
         for child in exec_node:
@@ -1162,7 +1163,42 @@ def _startup_folders() -> list[str]:
     return [f for f in folders if os.path.isdir(f)]
 
 
+_TASK_DUMP_NAME = re.compile(r"<!--\s*(\\.*?)\s*-->")
+_XML_DECL = re.compile(r"<\?xml[^>]*\?>")
+
+
+def parse_schtasks_xml(text: str) -> list[PersistEntry] | None:
+    r"""Parse `schtasks /query /xml` (every task, no /tn) into entries. Pure.
+
+    The dump is `<Tasks>`, then for each task a `<!-- \Folder\Name -->`
+    comment followed by that task's own XML document. Unlike the CSV listing
+    it carries every action of a task in full: the CSV cuts "Task To Run" at
+    about 253 characters and shows a task with several actions as the words
+    "Multiple actions", so either was enough to keep a command from being
+    scored. Returns None when the text is not a dump at all, so the caller
+    can tell "no tasks" from "could not read them".
+    """
+    parts = _TASK_DUMP_NAME.split(text or "")
+    if len(parts) < 3:
+        return None
+    out: list[PersistEntry] = []
+    for i in range(1, len(parts), 2):
+        body = _XML_DECL.sub("", parts[i + 1]).replace("</Tasks>", "").strip()
+        out += parse_task_xml(body, "", True, parts[i])
+    return out
+
+
 def _collect_tasks() -> list[PersistEntry]:
+    try:
+        r = subprocess.run(["schtasks", "/query", "/xml"],
+                           capture_output=True, text=True, timeout=60,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if r.returncode == 0:
+            entries = parse_schtasks_xml(r.stdout or "")
+            if entries is not None:
+                return entries
+    except Exception:  # noqa: BLE001 - fall back to the CSV listing
+        pass
     try:
         r = subprocess.run(["schtasks", "/query", "/fo", "csv", "/v"],
                            capture_output=True, text=True, timeout=60,
