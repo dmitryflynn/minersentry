@@ -347,12 +347,17 @@ class Engine:
         """
         now = time.time()
         cfg = self.cfg
-        hist = self._cpu_hist[pid]
+        # .get, not [pid]: _cpu_hist is a defaultdict, and indexing it INSERTS
+        # a key. This runs on the deep-scan thread too (through _holds_a_core),
+        # and an insert there while the scan thread iterates the dict raises
+        # "dictionary changed size during iteration". A snapshot also keeps the
+        # two reads below consistent if the scan thread appends meanwhile.
+        hist = list(self._cpu_hist.get(pid, ()))
         recent = [c for t, c in hist if now - t <= cfg.sustained_seconds]
         if len(recent) >= cfg.cpu_min_samples:
             return recent
         stale_after = cfg.sustained_seconds * CPU_WINDOW_STRETCH
-        tail = [c for t, c in list(hist)[-cfg.cpu_min_samples:]
+        tail = [c for t, c in hist[-cfg.cpu_min_samples:]
                 if now - t <= stale_after]
         return tail if len(tail) > len(recent) else recent
 
