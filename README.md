@@ -245,6 +245,18 @@ benign target under a signature-stripped copy of the interpreter in a temp dir
 (deleted on exit) so it reads as untrusted — exactly like a real miner, which
 is its own unsigned binary. Omit `--unsigned` to see the dampening instead.
 
+For in-browser mining there are two pages, both benign and neither making a
+network request. `samples/browser_load.html` keeps one core busy in a Web Worker
+and holds the text a web miner keeps in memory; `samples/browser_busy.html`
+keeps a core busy and holds nothing. Open each in a browser and scan: the first
+is flagged **Likely Miner** on its tab's process within about half a minute, the
+second stays **Clean**, because a tab that is merely busy is what a heavy web
+app looks like. A tab's memory is judged on its own only while that tab is
+holding a core — a browser content process runs the page's code, not the
+browser's, so the browser's signature says nothing about what is in it; but an
+idle tab showing an article about miners carries the same words and is left as
+quiet as it always was.
+
 With MinerSentry open, start the target, wait ~20 seconds for the CPU window to
 fill, then click **Deep scan (memory)** and **Run evasion probe**. (The target
 appears as `msentry_target.exe` when run with `--unsigned`.)
@@ -593,12 +605,19 @@ the GUI stuck showing "Scan error".
 
 ## Limitations (honest ones)
 
-- GPU-compute scoring prefers `nvidia-smi pmon` and falls back to the PDH "GPU
-  Engine" counters. On the NVIDIA laptop this was developed on, the PDH path
-  reports nothing for CUDA/OpenCL work even at 99% GPU load, so without
-  `nvidia-smi` on PATH the GPU signal is effectively blind there. Verified with
-  real OpenCL load (`samples/gpu_load.py`): 98% read, signal 80, and still
-  correctly **Clean** — headless compute alone is not mining.
+- GPU compute through Vulkan or DirectML is not seen. OpenCL and CUDA jobs are,
+  on NVIDIA, Intel and AMD; but the Vulkan and DirectML runtimes are mapped by
+  every browser GPU process, most games and ordinary creative software, so
+  treating them as a compute marker would turn desktop graphics into "compute".
+  On an NVIDIA GPU without `nvidia-smi` on PATH the GPU signal is blind: the
+  vendor-neutral counters report nothing for NVIDIA compute.
+- A mining tab is caught only while it behaves like one: the tab's process has
+  to be holding a core, and the page has to keep recognisable protocol text in
+  memory. A web miner that throttles hard, or whose strings are obfuscated in
+  the page, is not seen. The browser's own Task Manager (Shift+Esc in Chromium)
+  tells you which tab a flagged process is; MinerSentry cannot, because a
+  renderer's command line does not carry its URL. Browser extensions are not
+  inspected at all.
 - Autostart scanning reads what the current user can read. Another user's
   `HKCU` Run keys and some scheduled tasks need elevation, and shortcut targets
   are resolved through the shell, which may be unavailable in a locked-down

@@ -1,0 +1,30 @@
+<!doctype html>
+<!--
+  Benign stand-in for an in-browser miner, for testing MinerSentry.
+
+  It mines nothing and makes no network request. A Web Worker keeps one core
+  busy with arithmetic, and the page holds the kind of text a web miner keeps
+  in memory (a stratum-over-WebSocket login and job) so the memory scan has
+  something to find inside a browser renderer.
+
+  Open with ?seconds=60 to stop on its own.
+-->
+<html>
+<head><meta charset="utf-8"><title>MinerSentry browser load (benign)</title></head>
+<body>
+<p>Benign CPU load for testing. Nothing is mined and nothing is sent.</p>
+<script>
+  // Text a web miner holds while it runs. Kept reachable so it stays resident.
+  window.__held = [
+    'wss://ws.pool.example.invalid:443/stratum',
+    '{"id":1,"jsonrpc":"2.0","method":"login","params":{"login":"4AdUndXHHZ6cfufTMvppY6JwXNouMBzSkbLYfpAV5Usx3skxNgYeYTRj5UzqtReoS44qo9mtmXCqY45DJ852K5Jv2684Rge","pass":"x","agent":"webminer/1.0"}}',
+    '{"jsonrpc":"2.0","method":"job","params":{"blob":"0707d5efb9d505","job_id":"abc123","target":"b88d0600","algo":"cn/r"}}',
+    'cryptonight', 'randomx', 'stratum+tcp://', 'hashes_per_second', 'donate-level'
+  ];
+  var seconds = Number(new URLSearchParams(location.search).get('seconds') || 0);
+  var src = 'var x=1;function spin(){var t=Date.now();while(Date.now()-t<200){x=(x*1103515245+12345)%2147483647;}setTimeout(spin,0);}spin();';
+  var worker = new Worker(URL.createObjectURL(new Blob([src], {type: 'text/javascript'})));
+  if (seconds > 0) setTimeout(function () { worker.terminate(); window.close(); }, seconds * 1000);
+</script>
+</body>
+</html>
