@@ -276,8 +276,22 @@ COMPUTE_RUNTIME_MODULES = frozenset({
     "opencl.dll", "igdrcl64.dll", "igdrcl32.dll", "intelocl64.dll",
     "amdocl64.dll", "amdocl.dll", "amdocl12cl64.dll",
     "nvopencl64.dll", "nvopencl32.dll", "nvcuda.dll", "nvcuda64.dll",
-    "libopencl.so", "libopencl.so.1",
+    # Linux: compared with the version suffix removed (see _so_name), because
+    # /proc/<pid>/maps names the file actually mapped, the symlink TARGET:
+    # libOpenCL.so.1.0.0, libcuda.so.535.104.05. The loader dlopens the
+    # vendor ICD too (AMD, Intel NEO), which is listed for a process that
+    # skips the loader.
+    "libopencl.so", "libcuda.so", "libnvidia-opencl.so",
+    "libamdocl64.so", "libamdocl32.so", "libigdrcl.so", "libintelocl.so",
 })
+
+
+def _so_name(base: str) -> str:
+    """`libopencl.so.1.0.0` -> `libopencl.so`; anything else unchanged. Pure."""
+    head, sep, version = base.partition(".so.")
+    if sep and version and all(part.isdigit() for part in version.split(".")):
+        return head + ".so"
+    return base
 
 
 def has_compute_runtime(pid: int, modules=None) -> bool:
@@ -294,7 +308,7 @@ def has_compute_runtime(pid: int, modules=None) -> bool:
             return False
     for path in modules:
         base = str(path).replace("\\", "/").rsplit("/", 1)[-1].lower()
-        if base in COMPUTE_RUNTIME_MODULES:
+        if base in COMPUTE_RUNTIME_MODULES or _so_name(base) in COMPUTE_RUNTIME_MODULES:
             return True
     return False
 
