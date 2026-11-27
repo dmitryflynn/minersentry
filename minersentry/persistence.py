@@ -696,6 +696,46 @@ _HIJACK_KEYS = (
 )
 
 
+# Winlogon's own values, by value name: the program it should run.
+_WINLOGON_DEFAULTS = {"userinit": ("System32", "userinit.exe"),
+                      "shell": ("", "explorer.exe")}
+
+
+def winlogon_default(value_name: str, system_root: str | None = None) -> str:
+    """The stock value of Winlogon `Userinit` or `Shell`, or "". Pure."""
+    found = _WINLOGON_DEFAULTS.get(value_name.lower())
+    if not found:
+        return ""
+    if found[0]:
+        root = system_root or os.environ.get("SystemRoot", r"C:\Windows")
+        return ntpath.join(root, found[0], found[1]) + ","
+    return found[1]
+
+
+def is_winlogon_default(value_name: str, value: str,
+                        system_root: str | None = None) -> bool:
+    r"""True if a Winlogon Userinit/Shell value runs only the stock program. Pure.
+
+    The value is a comma-separated list that Winlogon runs in order, so each
+    element has to be the default. Checking only how the string ENDS let
+    `C:\Users\Public\x.exe,C:\Windows\system32\userinit.exe,` through, and
+    `C:\anywhere\userinit.exe` too. An element is the default when it is the
+    bare file name or that file in the directory Windows keeps it in.
+    """
+    found = _WINLOGON_DEFAULTS.get(value_name.lower())
+    if not found:
+        return False
+    root = system_root or os.environ.get("SystemRoot", r"C:\Windows")
+    subdir, fname = found
+    allowed = {fname.lower(),
+               ntpath.normcase(ntpath.join(root, subdir, fname)),
+               ntpath.normcase(ntpath.join("%systemroot%", subdir, fname)),
+               ntpath.normcase(ntpath.join("%windir%", subdir, fname))}
+    items = [i.strip().strip('"').strip() for i in value.split(",")]
+    items = [i for i in items if i]
+    return bool(items) and all(ntpath.normcase(i) in allowed for i in items)
+
+
 def _collect_hijacks() -> list[PersistEntry]:
     """Execution hijacks: IFEO debuggers, AppInit_DLLs, Winlogon Shell/Userinit."""
     import winreg as wr
@@ -726,12 +766,12 @@ def _collect_hijacks() -> list[PersistEntry]:
                 except OSError:
                     continue
                 value = (value or "").strip() if isinstance(value, str) else ""
-                # Userinit and Shell have known-good defaults; only deviations matter
-                default = {"userinit": "userinit.exe", "shell": "explorer.exe"}.get(
-                    value_name.lower())
                 if not value:
                     continue
-                if default and value.lower().rstrip(",").endswith(default):
+                # Userinit and Shell have known-good defaults; only deviations
+                # matter. Every element is checked, not the end of the string:
+                # a payload put BEFORE the default runs just the same.
+                if kind == "winlogon" and is_winlogon_default(value_name, value):
                     continue
                 out.append(PersistEntry(
                     kind=kind, location=f"{hive}\\{path}", name=value_name,
@@ -1424,8 +1464,10 @@ def remove_entry(entry: PersistEntry) -> "quarantine.Result":
     if kind in ("run-key", "ifeo-debugger", "appinit-dll", "winlogon",
                 "netsh-helper", "appcert-dll", "active-setup"):
         # All plain single-string values: deleting one removes the entry and
-        # nothing else. _remove_registry_value saves the value and its type
-        # first, so the journal can put it back.
+        # nothing else -- except Winlogon Userinit/Shell, which also hold the
+        # stock program and are reset to it instead of deleted.
+        # _remove_registry_value saves the value and its type first, so the
+        # journal can put it back.
         return _remove_registry_value(entry)
     if kind == "lsa-package":
         # REG_MULTI_SZ. Deleting the value would remove every package in the
@@ -1528,7 +1570,15 @@ def _remove_registry_value(entry: PersistEntry) -> "quarantine.Result":
                 value, value_type = wr.QueryValueEx(key, value_name)
             except FileNotFoundError:
                 return quarantine.Result(False, f"{value_name} is already gone.")
-            wr.DeleteValue(key, value_name)
+            # Winlogon Userinit/Shell must not be deleted: the stock program is
+            # in the same value as the payload, and with no Userinit the user's
+            # shell never starts. Put the default back instead.
+            default = (winlogon_default(value_name) if entry.kind == "winlogon"
+                       else "")
+            if default:
+                wr.SetValueEx(key, value_name, 0, value_type, default)
+            else:
+                wr.DeleteValue(key, value_name)
     except PermissionError:
         return quarantine.Result(
             False, f"Not allowed to change {hive_name}\\{path}. HKLM needs Administrator.")
@@ -1536,7 +1586,13 @@ def _remove_registry_value(entry: PersistEntry) -> "quarantine.Result":
         return quarantine.Result(False, f"Could not remove {value_name}: {e}")
     quarantine.record_action("remove_registry_value", hive=hive_name, path=path,
                              name=value_name, value=value, value_type=int(value_type),
-                             kind=entry.kind)
+                             kind=entry.kind,
+                             **({"replaced_with": default} if default else {}))
+    if default:
+        return quarantine.Result(
+            True, f"Reset {value_name} in {hive_name}\\{path} to its default "
+                  f"({default}).",
+            undo="restore from the actions journal")
     return quarantine.Result(
         True, f"Removed {value_name} from {hive_name}\\{path}.",
         undo="restore from the actions journal")
