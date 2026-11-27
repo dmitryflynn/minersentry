@@ -238,8 +238,11 @@ def test_live_tamper_scan_returns_well_formed_findings():
     way: the GitHub Windows runner excludes `C:\\` and `D:\\` from Defender
     entirely, and the scan reported both — correctly.
     """
+    # Every kind tamper.scan can emit. The two driver kinds arrived with #20
+    # and were missing here, so a machine with a known-abused driver loaded
+    # (or an unreadable driver list) failed this test on a correct finding.
     kinds = {"defender-exclusion", "defender-disabled", "hosts-blackhole",
-             "defender-unreadable"}
+             "defender-unreadable", "abused-driver", "drivers-unreadable"}
     for f in tamper.scan():
         assert f.kind in kinds, f.kind
         assert 0 <= f.score <= 100
