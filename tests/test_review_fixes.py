@@ -107,7 +107,7 @@ def test_tasks_already_listed_are_not_reported_twice(monkeypatch, tmp_path):
 def test_our_own_tooling_is_recognised_even_with_cmdline_disabled():
     engine = Engine(cfg=Config(pool_intel_enabled=False, cmdline_enabled=False))
     ours = SimpleNamespace(
-        pid=4321,
+        pid=4321, exe=lambda: sys.executable, cwd=lambda: "",
         cmdline=lambda: [sys.executable, str(P.os.path.join(
             P.os.path.dirname(P.os.path.dirname(P.os.path.abspath(P.__file__))),
             "bench", "run_bench.py"))])
