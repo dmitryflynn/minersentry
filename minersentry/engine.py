@@ -346,6 +346,14 @@ class Engine:
                 # Prefer the OS's own creation time over "when we first saw it".
                 hist = [self._conn_ages.get(key, now), 0]
                 self._conn_hist[key] = hist
+            else:
+                # The ages arrive from a background PowerShell call that
+                # finishes after the first pass, so a connection open at
+                # startup was stamped "now" and the real age, once known, was
+                # never used. Whenever the OS knows it to be older, believe it.
+                os_first = self._conn_ages.get(key)
+                if os_first is not None and os_first < hist[0]:
+                    hist[0] = os_first
             first, reconnects = hist[0], hist[1]
             persisted = ((now - first) >= self.cfg.net_persist_seconds
                          or reconnects >= self.cfg.net_reconnects_persist)
