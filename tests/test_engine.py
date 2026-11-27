@@ -163,3 +163,15 @@ def test_stale_samples_are_not_resurrected():
 def test_samples_inside_the_window_are_never_dropped_by_the_fallback():
     e = _engine_with_cpu_history([(300, 100.0), (15, 20.0), (5, 30.0)])
     assert e._cpu_stats(4242) == [20.0, 30.0]
+
+
+def test_reading_the_cpu_window_does_not_create_a_history():
+    """_cpu_stats runs on the deep-scan thread too. Indexing the defaultdict
+    there inserted a key while the scan thread could be iterating it."""
+    from minersentry.engine import Engine
+    from minersentry.config import Config
+    e = Engine(cfg=Config(pool_intel_enabled=False, gpu_enabled=False))
+    assert e._cpu_stats(999_999) == []
+    assert 999_999 not in e._cpu_hist
+    assert e._holds_a_core(999_998) is False
+    assert 999_998 not in e._cpu_hist
