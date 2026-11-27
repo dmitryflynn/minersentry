@@ -79,6 +79,7 @@ class MinerSentryApp:
         self.engine = Engine(audit=self.audit)
         self.engine.start_pool_intel()
         self.engine.start_connection_ages()
+        self.engine.start_cadence()
         # Processes that start and exit between two passes never appear in
         # the table, because by the time there is a row to put them on they
         # are gone. They go to the event log instead.

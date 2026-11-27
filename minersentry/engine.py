@@ -23,12 +23,13 @@ import psutil
 from . import cmdline as cmdline_mod
 from . import containers as containers_mod
 from . import procevents as procevents_mod
-from . import memscan, perfcounters, poolintel, power, trust
+from . import cadence as cadence_mod
+from . import memscan, perfcounters, poolintel, power, tcpstats, trust
 from .audit import AuditLog
 from .config import Config
 from .scoring import (
     Signal, combine, is_browser_content_process, is_miner_name, name_stem,
-    score_cpu, score_dataset,
+    score_cadence, score_cpu, score_dataset,
     score_cmdline, score_gpu, score_memory, score_name, score_network, score_perf,
     score_stealth,
     score_swarm,
@@ -264,6 +265,16 @@ class Engine:
         # Per-PID (sibling count, aggregate cores) for processes sharing one
         # executable, recomputed each pass on the scan thread.
         self._swarm: dict[int, tuple[int, float]] = {}
+        # Share-submission cadence. Byte-counter histories are keyed by the
+        # connection 4-tuple, written by the sampler thread (start_cadence /
+        # sample_cadence) and read by the scan thread, hence the lock. The
+        # scan thread publishes which connections to track each pass.
+        self._cadence_lock = threading.Lock()
+        self._cadence_hist: dict[tuple, deque] = {}
+        self._cadence_targets: set[tuple] = set()
+        self._cadence_collector = None
+        self._cadence_thread: threading.Thread | None = None
+        self._cadence_beats: set[int] = set()   # PIDs with a beat this pass
         self.audit = audit or AuditLog()
         for p in (() if gpu_only else psutil.process_iter()):  # prime CPU baselines
             try:
@@ -403,7 +414,7 @@ class Engine:
         return tail if len(tail) > len(recent) else recent
 
     def _build_signals(self, info: ProcInfo, raddrs: list[tuple[str, int]],
-                       now: float) -> list[Signal]:
+                       now: float, conns: list[tuple] | None = None) -> list[Signal]:
         cfg = self.cfg
         recent = self._cpu_stats(info.pid)
         cpu_sig = score_cpu(recent, self._ncpu, cfg)
@@ -469,7 +480,30 @@ class Engine:
             self._cmdline_signal(info.pid),
             score_swarm(*self._swarm.get(info.pid, (0, 0.0)), cfg),
             score_stealth(self._stealth_reasons(info), cfg),
+            self._cadence_signal(conns or []),
         ]
+
+    def _cadence_signal(self, conns: list[tuple]) -> Signal:
+        """The share-cadence signal for one process: the first of its tracked
+        connections that shows a beat, else the longest-observed one's reason."""
+        col = self._cadence_collector
+        available = bool(col is not None and col.available)
+        if not available or not conns:
+            return score_cadence(None, available, self.cfg)
+        with self._cadence_lock:
+            series = [(k, list(self._cadence_hist[k])) for k in conns
+                      if k in self._cadence_hist]
+        best = None
+        best_key = None
+        for key, hist in series:
+            r = cadence_mod.analyse(hist, self.cfg)
+            if r.beat:
+                best, best_key = r, key
+                break
+            if best is None or r.span > best.span:
+                best, best_key = r, key
+        where = f"{best_key[2]}:{best_key[3]}" if best_key else ""
+        return score_cadence(best, available, self.cfg, where)
 
     def _swarm_map(self, procs) -> dict[int, tuple[int, float]]:
         """Group this pass's processes by executable and give each member its
@@ -695,6 +729,8 @@ class Engine:
         for pid, (n, cores) in list(self._swarm.items()):   # swarm member, low CPU each
             if n >= self.cfg.swarm_min_procs and cores >= self.cfg.swarm_min_cores:
                 _add(pid)
+        for pid in list(self._cadence_beats):           # share-like beat, any CPU
+            _add(pid)
         # Cap only the auto-discovered additions so the list can't grow without
         # bound, while always keeping the busy and explicitly-forced targets.
         capped = targets[:max(protected, max(1, limit) * 3)]
@@ -703,6 +739,7 @@ class Engine:
         # behind a queue of busy browsers (each takes ~1 s to scan).
         forced = set(force or ())
         pool = {pid for pid, _ip, _port in list(self._conn_seen)}
+        pool |= set(self._cadence_beats)
         named = {pid for pid, meta in list(self._meta.items())
                  if is_miner_name(meta[0], self.cfg) or is_miner_name(meta[1], self.cfg)}
         named |= {pid for pid, hits in list(self._cmd_hits.items())
@@ -846,6 +883,8 @@ class Engine:
         which Tcl treats as fatal: an intermittent hard crash of the suite.
         """
         self._closing.set()
+        if self._cadence_collector is not None and self._cadence_thread is None:
+            self._cadence_collector.close()   # no sampler thread to do it
         if self._procevents is not None:
             self._procevents.stop()
             self._procevents = None
@@ -895,14 +934,21 @@ class Engine:
         # Build the TCP connection map ONCE for the whole pass (one syscall),
         # instead of calling net_connections per process (~1500x faster).
         conn_map: dict[int, list[tuple[str, int]]] = defaultdict(list)
+        # The same connections as normalised 4-tuples, for the cadence signal.
+        conn4: dict[int, list[tuple]] = defaultdict(list)
         try:
             for c in psutil.net_connections(kind="tcp"):
                 if self.gpu_only and c.pid not in self.gpu_scope:
                     continue
                 if c.pid and c.status == psutil.CONN_ESTABLISHED and c.raddr:
                     conn_map[c.pid].append((c.raddr.ip, c.raddr.port))
+                    if c.laddr:
+                        conn4[c.pid].append(tcpstats.conn_key(
+                            c.laddr.ip, c.laddr.port, c.raddr.ip, c.raddr.port))
         except (psutil.AccessDenied, OSError):
             pass
+        self._set_cadence_targets(conn4)
+        beats: set[int] = set()
         live_conns = {(pid, ip, port) for pid, lst in conn_map.items()
                       for ip, port in lst}
 
@@ -965,8 +1011,11 @@ class Engine:
                 continue      # another process running MinerSentry itself
 
             info.mem_result = self._mem_cache.get(p.pid)
-            info.signals = self._build_signals(info, conn_map.get(p.pid, []), now)
+            info.signals = self._build_signals(info, conn_map.get(p.pid, []), now,
+                                               conn4.get(p.pid, []))
             info.score, info.verdict = combine(info.signals, self.cfg)
+            if any(s.name == "cadence" and s.score > 0 for s in info.signals):
+                beats.add(p.pid)
 
             # Display-only fields (mem/threads) each cost a proc_info syscall, so
             # fetch them lazily only for non-idle rows the GUI actually shows.
@@ -1020,6 +1069,7 @@ class Engine:
         for dead in set(self._container) - live_pids:
             self._container.pop(dead, None)
         self._own_tooling &= live_pids
+        self._cadence_beats = beats
         self._warm &= live_pids
         # Prune GPU history in place under the lock (reassigning the dict would
         # race the sampler thread's defaultdict insert -> "changed size" errors).
@@ -1089,6 +1139,91 @@ class Engine:
                 score=info.score, verdict=info.verdict,
                 signals=[(s.name, s.score, s.detail) for s in info.signals],
                 container=info.container.label if info.container else "")
+
+    # -- share-submission cadence ------------------------------------------
+    def _set_cadence_targets(self, conn4: dict[int, list[tuple]]) -> None:
+        """Publish which connections the sampler should track: every
+        established connection of a scanned process (the network signal's
+        own view), loopback excluded unless configured, capped."""
+        cfg = self.cfg
+        if not cfg.cadence_enabled or self._cadence_collector is None:
+            return
+        targets: set[tuple] = set()
+        for pid, keys in conn4.items():
+            if pid == self._self_pid or pid in self._own_tooling:
+                continue
+            for key in keys:
+                if not cfg.cadence_include_loopback and tcpstats.is_loopback(key[2]):
+                    continue
+                targets.add(key)
+        if len(targets) > cfg.cadence_max_connections:
+            # Keep the ones with history first, so the cap never resets them.
+            with self._cadence_lock:
+                have = sorted(k for k in targets if k in self._cadence_hist)
+            rest = sorted(targets - set(have))
+            targets = set((have + rest)[:cfg.cadence_max_connections])
+        self._cadence_targets = targets
+
+    def sample_cadence(self, now: float | None = None) -> None:
+        """Take one counter sample of the tracked connections (sampler thread,
+        or a test calling it directly). Connections that closed are dropped."""
+        col = self._cadence_collector
+        if col is None or not col.available:
+            return
+        now = time.time() if now is None else now
+        targets = set(self._cadence_targets)
+        stats = col.sample(targets) if targets else {}
+        horizon = now - self.cfg.cadence_history_seconds
+        with self._cadence_lock:
+            for key in set(self._cadence_hist) - set(stats):
+                self._cadence_hist.pop(key, None)
+            for key, (bytes_out, bytes_in) in stats.items():
+                hist = self._cadence_hist.get(key)
+                if hist is None:
+                    hist = self._cadence_hist[key] = deque()
+                hist.append((now, bytes_out, bytes_in))
+                while hist and hist[0][0] < horizon:
+                    hist.popleft()
+
+    def start_cadence(self, collector=None, thread: bool = True) -> bool:
+        """Begin sampling per-connection byte counters. Returns whether the
+        collector is usable. Like start_procevents this is explicit, so a bare
+        Engine (every test, the benchmark) runs no `ss` and enables no EStats.
+        `collector` and `thread=False` are for tests."""
+        if not self.cfg.cadence_enabled:
+            return False
+        if self._cadence_collector is not None:
+            return self._cadence_collector.available
+        col = collector if collector is not None else tcpstats.make_collector()
+        self._cadence_collector = col
+        if not col.available:
+            self.audit.event("share-cadence watch unavailable: " + (col.error or "unknown"))
+            return False
+        self.audit.event(f"share-cadence watch: {col.mode}")
+        if not thread:
+            return True
+
+        def _loop():
+            try:
+                while not self._closing.is_set():
+                    try:
+                        self.sample_cadence()
+                    except Exception:  # noqa: BLE001 - telemetry must not crash
+                        pass
+                    self._closing.wait(max(1.0, self.cfg.cadence_sample_interval))
+            finally:
+                col.close()   # switch EStats collection back off
+
+        self._cadence_thread = threading.Thread(target=_loop, daemon=True)
+        self._cadence_thread.start()
+        return True
+
+    @property
+    def cadence_mode(self) -> str:
+        col = self._cadence_collector
+        if col is None:
+            return "off"
+        return col.mode if col.available else f"unavailable: {col.error}"
 
     def set_probe_drops(self, drops: dict[int, float]) -> None:
         self._probe_drops = dict(drops)

@@ -69,6 +69,7 @@ desktop and stays quiet on a cloud host; see [Profiles](#profiles-desktop-and-cl
 | **stealth** | Signs a process is hiding what it is: miner strings sitting in **unbacked executable memory** (code with no file behind it), an image that is gone from the path it started from, a `memfd`-backed binary, a kernel-thread name masquerade, or an unexpected parent for a process that has only one legitimate parent. Hiding is not mining, so this convicts only beside the work or a miner-specific artifact. |
 | **swarm** | Load summed **per executable**, not per process. Twenty copies of one unsigned binary at a quarter core each duck every per-process floor while mining five cores; judged together they don't. Only untrusted executables are grouped, so a browser's renderers are not a swarm, and like cpu/gpu it needs miner-specific corroboration to convict. |
 | **autostart** | Run keys, startup folders, services, scheduled tasks (Windows); cron, systemd units, shell profiles (Linux). Every other signal judges a process that is already running — this is the one that finds a miner *installed but not started*, which is how practically every real cryptojacker survives a reboot. Entries are scored with the same evidence as processes: command-line indicators, a known miner name, a drop location, an unsigned binary. |
+| **cadence** | **Share-submission cadence**: per-connection byte counters sampled every 5 s, looking for one connection that uploads small bursts (64 B to 2 KiB) on a 20-150 s beat, stays quiet in between, and gets little back. That shape survives TLS and port 443, where the port-based network signal sees nothing. It is also what a chat client's keepalive or a telemetry beacon looks like, so it **corroborates only**: a small fixed score (never above the weakest network score), not in the weighted blend, and it convicts only beside resident miner strings, mining arguments or concealment. See [Share-submission cadence](#share-submission-cadence). |
 | **perf** *(Linux)* | Per-process **cache-misses-per-instruction** via user-mode `perf_event_open`. RandomX's random reads across its ~2 GB dataset produce an order-of-magnitude higher miss rate than ordinary compute — a fingerprint of the algorithm visible even when the miner is CPU-capped. Degrades to a no-op where `perf_event_paranoid` forbids it. |
 
 Alongside the per-process signals, a **hidden-compute** banner flags work the
@@ -153,10 +154,55 @@ can't trip it:
   already say what the process is for, so the bar on the behavioral side is low:
   a miner throttled to a third of a core is still caught.
 - a process that **throttles under the evasion probe** while using the CPU
+- a **share-submission beat** on one of its connections **+** miner strings,
+  mining arguments or concealment (never + load alone: heartbeats look the same)
 - **GPU compute** saturation **+** miner strings / a known miner name / a pool connection
 
 GPU compute alone (like a lone CPU spike) caps at *Suspicious*, since headless
 ML/CUDA is a legitimate false-positive class — corroboration promotes it.
+
+### Share-submission cadence
+
+A miner keeps one connection open to its pool and writes a share to it every
+so often. The cadence signal watches the byte counters of every established
+connection a scanned process holds and asks whether one of them shows that
+beat. It needs about five minutes of history before it says anything, so a
+20-second `minersentry-scan` will only ever report "gathering samples".
+
+Where the counters come from:
+
+| Platform | Source | Needs |
+|---|---|---|
+| Linux | tcp_info via `ss -tni` (`bytes_sent`, or `bytes_acked` before kernel 4.19) | `ss` (iproute2). Counters are matched to processes through psutil, which can only attribute sockets in processes you can read: **your own processes unless you run as root**. Sockets in another network namespace (most containers) are not listed at all. |
+| Windows | `GetPerTcpConnectionEStats`, enabled per tracked connection | **Administrator.** Unelevated, enabling collection is refused and a read on a connection that was never enabled still succeeds and returns garbage, so the collector reports itself unavailable instead. Elevated, it switches collection on for the connections it tracks and off again when MinerSentry exits, and drops any reading whose `EnableCollection` flag is not 1. IPv4 only. |
+
+`--json` reports which of these is in use as `cadence_watch` (`ss tcp_info`,
+`EStats (Administrator)`, `unavailable: <reason>` or `off`), so a clean cadence
+signal on an unelevated Windows run is not read as evidence of anything.
+
+The elevated Windows path was built and tested against a mocked API and has
+**not yet been run on a real elevated machine**. An elevated run of the test
+suite exercises it (`tests/test_tcpstats.py::test_real_estats_elevated_counts_bytes`).
+
+What it does not do:
+
+- **It does not convict.** Any app that sends a few hundred bytes on a timer
+  matches. Tiny pings (under 64 bytes) are ignored, but a telemetry beacon is
+  indistinguishable from a share submission by size and timing alone.
+- **It is not a strict periodicity test.** Shares are found at random, so the
+  gaps between real submissions are roughly exponential. A test that wanted
+  clockwork would catch heartbeats and miss miners; this one tolerates jitter
+  and checks instead that the uploads are small, keep coming, and leave the
+  connection quiet in between.
+- **Proxies, DoH and tunnels.** It judges one TCP connection at a time. A miner
+  that talks to its pool through a local proxy, a VPN or a multiplexed tunnel
+  (HTTP/2, QUIC/UDP, DNS-over-HTTPS) hides its beat inside other traffic or off
+  TCP altogether, and loopback connections are skipped by default
+  (`cadence_include_loopback`).
+- **Padding.** A miner that pads its submissions past 2 KiB, batches them, or
+  adds cover traffic leaves the shape this looks for.
+
+Turn it off with `"cadence_enabled": false` in the admin config.
 
 ## The evasion probe (the novel part)
 
@@ -634,9 +680,10 @@ the GUI stuck showing "Scan error".
 - The hidden-compute gap catches rootkit-hidden *CPU* and VM/WSL load, but true
   per-process package power (RAPL) isn't exposed in Windows user mode without a
   driver, so that remains experimental/off by default.
-- Network detection is port + connection-persistence based; packet-level share/
-  job cadence timing and JA4 TLS fingerprinting (which need a capture driver) are
-  the next network step, not yet built.
+- Network detection is port + connection-persistence based, plus the
+  share-cadence signal where per-connection counters are readable (Linux;
+  Windows only as Administrator). JA4 TLS fingerprinting, which needs a capture
+  driver, is not built.
 - The CPU signal needs ~20 seconds of history to judge a steady floor; a process
   shows "gathering samples" until then.
 - Memory string matches alone aren't conclusive: security tools legitimately
