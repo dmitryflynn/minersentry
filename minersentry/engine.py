@@ -1051,6 +1051,38 @@ class Engine:
 
         threading.Thread(target=_loop, daemon=True).start()
 
+    def start_gpu_sampler(self, on_error=None) -> None:
+        """Sample per-process GPU use on a background thread.
+
+        Never inline in the scan loop. A sample costs about 0.2 s when only
+        nvidia-smi is consulted, but 5-10 s on a machine with a second GPU,
+        where the vendor-neutral counters have to be read as well (#18). The
+        command-line scan used to sample on every pass, so on a hybrid laptop
+        a 45-second scan got four passes, the GPU history never matured, and
+        the benchmark's GPU miner went from Likely Miner to Clean.
+
+        One sampler for every caller: the GUI, the watcher and the command
+        line each had their own copy, two of them inline. Stops on close().
+        Safe to call twice.
+        """
+        if getattr(self, "_gpu_thread", None) is not None:
+            return
+        from . import gpu as gpu_mod
+
+        def _loop():
+            while not self._closing.is_set():
+                try:
+                    util, windows, ctx = gpu_mod.sample()
+                    self.set_gpu_util(util, windows, ctx)
+                except Exception as e:  # noqa: BLE001 - telemetry, never fatal
+                    if on_error is not None:
+                        on_error(f"gpu sampler: {type(e).__name__}: {e}")
+                self._closing.wait(max(2.0, self.cfg.gpu_sample_interval))
+
+        self._gpu_thread = threading.Thread(target=_loop, daemon=True,
+                                            name="minersentry-gpu")
+        self._gpu_thread.start()
+
     def start_pool_intel(self) -> None:
         """Start a background thread that resolves the known mining-pool domains
         to IPs and refreshes them periodically. No-op if disabled; never started

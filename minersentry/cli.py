@@ -45,6 +45,8 @@ def run_session(duration: float, cfg: Config | None = None,
     e = Engine(cfg=cfg or Config.load(), gpu_only=gpu_only)
     e.start_pool_intel()
     e.start_connection_ages()
+    if gpu_sample or gpu_only:
+        e.start_gpu_sampler()
     # Processes that start and exit inside one pass are invisible to the poll;
     # this records them. Started here rather than in Engine() because it
     # spawns a helper process.
@@ -84,9 +86,6 @@ def run_session(duration: float, cfg: Config | None = None,
                     raise
                 print(f"warning: {error}; keeping the previous GPU scope",
                       file=sys.stderr)
-        if gpu_sample or gpu_only:
-            util, windows, ctx = gpu_mod.sample()
-            e.set_gpu_util(util, windows, ctx)
         if deep and elapsed >= deep_at and (deep_thread is None
                                             or not deep_thread.is_alive()):
             # Memory sweep on its own thread (like the GUI) so CPU sampling keeps

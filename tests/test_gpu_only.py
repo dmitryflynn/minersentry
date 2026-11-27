@@ -163,7 +163,14 @@ def test_session_refreshes_scope_before_deep_scan_and_implies_gpu(monkeypatch, s
     monkeypatch.setattr(e, 'deep_probe', lambda pid: scanned.append(pid) or MemScanResult(pid=pid))
     _, rows, _ = cli.run_session(4, interval=1, gpu_only=True, force_pids={42001})
     assert scanned == [42002]
-    assert len(sampled) == 4
+    # GPU-only implies sampling. It runs on the engine's own thread now, not
+    # once per pass: a sample costs 5-10 s on a hybrid-GPU machine.
+    import time as _real_time
+    deadline = _real_time.monotonic() + 5
+    while not sampled and _real_time.monotonic() < deadline:
+        _real_time.sleep(0.05)
+    assert sampled, "gpu_only did not start the GPU sampler"
+    e.close()
     assert rows == []
 
 
