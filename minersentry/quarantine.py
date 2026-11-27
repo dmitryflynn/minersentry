@@ -69,18 +69,26 @@ def record_action(action: str, **fields) -> None:
 
 
 def history(limit: int = 50) -> list[dict]:
-    """Recent actions, newest last. Used to offer an undo."""
+    """Recent actions, newest last. Used to offer an undo.
+
+    A damaged line costs that line only. A byte that is not UTF-8 used to
+    raise out of readlines(), and a line that parsed to something other than
+    an object reached callers that all do `record.get(...)` — either way
+    every undo stopped working.
+    """
     try:
-        with open(journal_path(), "r", encoding="utf-8") as f:
+        with open(journal_path(), "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()[-limit:]
     except OSError:
         return []
     out = []
     for line in lines:
         try:
-            out.append(json.loads(line))
+            record = json.loads(line)
         except ValueError:
             continue
+        if isinstance(record, dict):
+            out.append(record)
     return out
 
 
