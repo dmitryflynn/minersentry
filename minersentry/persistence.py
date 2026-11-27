@@ -1734,8 +1734,47 @@ def _disable_service(entry: PersistEntry) -> "quarantine.Result":
         undo="restore its start type from the actions journal")
 
 
+def _removal_key(record: dict) -> dict | None:
+    """What identifies a registry, task or service removal in the journal.
+
+    The timestamp is part of it so an undo cancels the record it reversed and
+    not an earlier or later removal of the same value. Names are lowered
+    because the registry, the scheduler and the SCM all ignore case.
+    """
+    action = record.get("action")
+    ts = record.get("ts")
+    if action == "remove_registry_value":
+        return {"action": action, "ts": ts,
+                "hive": str(record.get("hive", "")).upper(),
+                "path": str(record.get("path", "")).lower(),
+                "name": str(record.get("name", "")).lower()}
+    if action == "remove_task":
+        return {"action": action, "ts": ts,
+                "task": str(record.get("task", "")).lower()}
+    if action == "disable_service":
+        return {"action": action, "ts": ts,
+                "service": str(record.get("service", "")).lower()}
+    return None
+
+
 def undo_removal(record: dict) -> "quarantine.Result":
-    """Reverse one removal, from its journal record."""
+    """Reverse one removal, from its journal record.
+
+    A successful undo of a registry, task or service removal is journalled as
+    `undo_removal` against the record it reversed, so `removals()` stops
+    offering it (#58); a startup-folder undo is journalled by `restore_file`.
+    Without that, "undo the last removal" repeated the same record forever,
+    rewriting the old value over whatever was there by then, and older
+    removals could not be reached. A failed undo records nothing.
+    """
+    result = _undo_removal(record)
+    key = _removal_key(record)
+    if result.ok and key is not None:
+        quarantine.record_action("undo_removal", undone=key)
+    return result
+
+
+def _undo_removal(record: dict) -> "quarantine.Result":
     action = record.get("action")
     try:
         if action == "quarantine_file":
@@ -1792,6 +1831,11 @@ def removals(limit: int = 200) -> list[dict]:
     `kind`. A process binary quarantined from the dashboard is undone through
     `quarantine.restore_file`, which is a different action with a different
     meaning, and it is not a removal of an autostart entry.
+
+    A removal that has been undone is left out: `restore_file` follows an
+    undone quarantine, and `undo_removal` an undone registry value, task or
+    service. The journal is read in order, so an entry removed again after
+    an undo is offered again.
     """
     actions = {"remove_registry_value", "remove_task", "disable_service"}
     out = []
@@ -1801,6 +1845,14 @@ def removals(limit: int = 200) -> list[dict]:
             out.append(record)
         elif action == "quarantine_file" and record.get("kind"):
             out.append(record)
+        elif action == "undo_removal":
+            # a registry, task or service removal already undone: drop the
+            # newest record it names, as restore_file does for a quarantine
+            undone = record.get("undone")
+            for i in range(len(out) - 1, -1, -1):
+                if _removal_key(out[i]) == undone:
+                    del out[i]
+                    break
         elif action == "restore_file":
             # already undone: drop the quarantine it reversed, so an undo
             # never offers the same record twice
