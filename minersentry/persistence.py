@@ -27,6 +27,7 @@ import sys
 from dataclasses import dataclass, field
 
 from . import cmdline as cmdline_mod
+from . import powershell
 from . import quarantine
 from . import trust
 from .config import Config
@@ -535,17 +536,29 @@ def _resolve_shortcuts(links: list[PersistEntry]) -> None:
     A shortcut in the Startup folder runs its target, so scoring the .lnk file
     itself says nothing. Resolving it needs the shell, so all links are
     resolved together rather than one subprocess each.
+
+    The paths reach the script through an environment variable, one per
+    line, and are never pasted into its text. They used to be, inside single
+    quotes, and a file name is not safe there: PowerShell also closes a
+    single-quoted string on a typographic quote (U+2018 to U+201B), so one
+    shortcut called `it’s.lnk` was a syntax error that left every shortcut
+    unresolved, and a crafted name ran its own code in this script. Paths
+    with a plain `'` were skipped for the same reason (issue #59). A Windows
+    file name cannot contain a newline, so the list splits unambiguously.
     """
     if not links or not IS_WINDOWS:
         return
-    script = ("$s=New-Object -ComObject WScript.Shell; " +
-              "@(" + ",".join(f"'{e.command}'" for e in links if "'" not in e.command) +
-              ") | ForEach-Object { try { $l=$s.CreateShortcut($_); "
+    paths = [e.command for e in links if e.command and "\n" not in e.command]
+    if not paths:
+        return
+    script = ("$s = New-Object -ComObject WScript.Shell\n"
+              "$env:MINERSENTRY_SHORTCUTS -split \"`n\" | "
+              "Where-Object { $_ } | ForEach-Object { try { "
+              "$l = $s.CreateShortcut($_); "
               "\"$_`t$($l.TargetPath)`t$($l.Arguments)\" } catch {} }")
     try:
-        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                           capture_output=True, text=True, timeout=45,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        r = powershell.run(script, timeout=45,
+                           env={"MINERSENTRY_SHORTCUTS": "\n".join(paths)})
     except Exception:  # noqa: BLE001 - unresolved shortcuts are not a failure
         return
     targets = parse_shortcut_targets(r.stdout or "")
@@ -1189,10 +1202,7 @@ def _collect_bits() -> list[PersistEntry]:
     script = ("Get-BitsTransfer -AllUsers -ErrorAction SilentlyContinue | "
               "ForEach-Object { \"$($_.DisplayName)`t$($_.NotifyCmdLine)\" }")
     try:
-        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
-                            "-Command", script], capture_output=True, text=True,
-                           timeout=60,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        r = powershell.run(script, timeout=60)
     except Exception:  # noqa: BLE001
         return []
     if r.returncode != 0:
@@ -1210,9 +1220,7 @@ def _collect_wmi() -> list[PersistEntry]:
         r"-ErrorAction SilentlyContinue | ForEach-Object { "
         r'"$($_.Name)`t$($_.ScriptText)" }')
     try:
-        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                           capture_output=True, text=True, timeout=60,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        r = powershell.run(script, timeout=60)
     except Exception:  # noqa: BLE001
         return []
     if r.returncode != 0:

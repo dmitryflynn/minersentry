@@ -38,6 +38,7 @@ import sys
 from dataclasses import dataclass
 
 from . import persistence
+from . import powershell
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -139,12 +140,10 @@ def loaded(timeout: float = 30.0) -> list[LoadedDriver] | None:
     if not IS_WINDOWS:
         return None
     try:
-        proc = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-             "Get-CimInstance Win32_SystemDriver | "
-             "Select-Object Name,State,PathName | ConvertTo-Csv -NoTypeInformation"],
-            capture_output=True, text=True, timeout=timeout,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        proc = powershell.run(
+            "Get-CimInstance Win32_SystemDriver | "
+            "Select-Object Name,State,PathName | ConvertTo-Csv -NoTypeInformation",
+            timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0 or not proc.stdout.strip():

@@ -64,6 +64,7 @@ import sys
 from dataclasses import dataclass, field
 
 from . import poolintel
+from . import powershell
 from .config import Config
 
 IS_WINDOWS = sys.platform == "win32"
@@ -133,11 +134,19 @@ def _run(args: list[str], timeout: float = 30.0) -> str:
     return proc.stdout or ""
 
 
+def _run_powershell(script: str, timeout: float = 30.0) -> str:
+    try:
+        proc = powershell.run(script, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout or ""
+
+
 def read_cache() -> tuple[list[tuple[str, str]], str]:
     """Everything in the OS resolver cache, and where it came from."""
     if IS_WINDOWS:
-        text = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                     "Get-DnsClientCache | ConvertTo-Csv -NoTypeInformation"])
+        text = _run_powershell(
+            "Get-DnsClientCache | ConvertTo-Csv -NoTypeInformation")
         return parse_dns_client_cache(text), "Get-DnsClientCache"
     text = _run(["resolvectl", "show-cache"])
     if text:

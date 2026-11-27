@@ -36,6 +36,8 @@ import sys
 import warnings
 from ctypes import wintypes
 
+from . import powershell
+
 IS_WINDOWS = sys.platform == "win32"
 _PID_RE = re.compile(r"pid_(\d+)_")
 _CREATE_NO_WINDOW = 0x08000000
@@ -357,8 +359,12 @@ def other_gpu_present() -> bool:
     sample pays for PDH."""
     global _OTHER_GPU
     if _OTHER_GPU is None:
-        text = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                     "(Get-CimInstance Win32_VideoController).Name"], timeout=20.0)
+        try:
+            p = powershell.run("(Get-CimInstance Win32_VideoController).Name",
+                               timeout=20.0)
+            text = (p.stdout or "") if p.returncode == 0 else ""
+        except Exception:  # noqa: BLE001 - telemetry must never break a scan
+            text = ""
         names = [ln for ln in text.splitlines() if ln.strip()]
         # No answer at all: assume there might be one, so nothing is skipped.
         _OTHER_GPU = adapters_include_non_nvidia(names) if names else True
