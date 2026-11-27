@@ -181,3 +181,30 @@ def test_a_unc_share_covers_its_own_contents(stub):
     ex = r"\\server\share"
     assert stub([ex], [r"\\server\share\x\m.exe"])[ex].score == 95
     assert stub([ex], [r"\\server\shareX\m.exe"])[ex].score == 45
+
+
+# == hosts file: security domains on label boundaries ======================
+# The domain list was matched by substring, so "eset" was found in "reset" and
+# "preset", and any blackholed password-reset host was reported at 70 as a
+# security domain redirected to nowhere.
+@pytest.mark.parametrize("host", [
+    "reset.example.com", "preset.io", "passwordreset.microsoftonline.com",
+    "myavg.company.lan", "sophosdemo.net", "esetchina.cn", "dravast.org",
+    "notdefender.example",
+])
+def test_a_word_containing_a_vendor_name_is_not_a_security_domain(host):
+    assert tamper.blackholed_security_domains([("0.0.0.0", host)]) == []
+
+
+@pytest.mark.parametrize("host", [
+    "www.eset.com", "update.eset.com", "eset.sk", "avast.com", "x.avg.com",
+    "api.defender.microsoft.com", "windowsupdate.com",
+    "download.windowsupdate.microsoft.com", "update.microsoft.com",
+    "f-secure.com", "kaspersky-labs.com", "www.virustotal.com", "wdcp.microsoft.com",
+])
+def test_real_security_domains_are_still_caught(host):
+    assert tamper.blackholed_security_domains([("0.0.0.0", host)]) == [("0.0.0.0", host)]
+
+
+def test_a_security_domain_pointed_somewhere_real_is_not_blackholed():
+    assert tamper.blackholed_security_domains([("93.184.216.34", "www.eset.com")]) == []

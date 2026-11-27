@@ -64,10 +64,23 @@ def parse_hosts(text: str) -> list[tuple[str, str]]:
     return out
 
 
+# Each name must sit on label boundaries: a dot, or a hyphen as in
+# kaspersky-labs.com. A plain substring found "eset" in "reset" and "preset",
+# so a blackholed password-reset host was reported as a security domain.
+_SECURITY_DOMAIN_RE = re.compile(
+    r"(?:^|[.-])(?:" + "|".join(re.escape(d) for d in SECURITY_DOMAINS)
+    + r")(?:$|[.-])")
+
+
+def is_security_domain(host: str) -> bool:
+    """True if `host` names one of SECURITY_DOMAINS on label boundaries. Pure."""
+    return bool(_SECURITY_DOMAIN_RE.search(host.lower().rstrip(".")))
+
+
 def blackholed_security_domains(entries: list[tuple[str, str]]) -> list[tuple[str, str]]:
     """Entries that point a security or update domain at nowhere. Pure."""
     return [(ip, host) for ip, host in entries
-            if ip in BLACKHOLE_IPS and any(d in host for d in SECURITY_DOMAINS)]
+            if ip in BLACKHOLE_IPS and is_security_domain(host)]
 
 
 def looks_like_a_path(value: str) -> bool:
