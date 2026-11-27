@@ -58,8 +58,9 @@ delete.
 - **Signed does not mean trusted.** A signature earns nothing in Temp, Roaming,
   the Recycle Bin or Fonts, and interpreters and injection hosts (`python`,
   `node`, `svchost`, `explorer`, …) are never dampened at all.
-- **Response actions never run on their own.** Suspend, terminate, quarantine
-  and firewall rules are each confirmed, journalled, and reversible.
+- **Response actions never run on their own.** Suspend, quarantine, autostart
+  removal and firewall rules are each confirmed, journalled, and reversible.
+  Terminate is confirmed too, but it cannot be undone.
 - **The background service runs as SYSTEM or root** so a miner running as you
   cannot stop it. That is also the honest limit of its self-protection: against
   something that is already administrator, it has none.

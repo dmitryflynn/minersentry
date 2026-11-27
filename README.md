@@ -12,8 +12,10 @@ signal that detects a RandomX miner by its memory-hardness even when throttled.
 
 > Defensive security tool. The included `samples/fake_miner.py` is a **benign**
 > test target — it reproduces miner *behaviors* but mines nothing and connects
-> nowhere. MinerSentry only reads process state and never modifies the system
-> except an optional local detection log and a user-confirmed process terminate.
+> nowhere. MinerSentry reads process state, and changes the system only when you
+> confirm a response action (suspend, terminate, quarantine a binary, remove an
+> autostart entry) or install the background service. Apart from those it writes
+> only its own log and action journal.
 
 Catching a RandomX miner **throttled to 1% CPU** (no CPU spike to see, no pool
 connection) — flagged by its 2 GB dataset + resident strings:
@@ -195,7 +197,8 @@ else flagged. It has not been tested against real evasive malware.
 
 ## Run it
 
-Install (gives you the `minersentry` GUI and `minersentry-scan` CLI commands):
+Install (gives you the `minersentry` GUI, the `minersentry-scan` CLI and the
+`minersentry-service` background watcher):
 
 ```bash
 pipx install git+https://github.com/dmitryflynn/minersentry
@@ -275,6 +278,8 @@ appears as `msentry_target.exe` when run with `--unsigned`.)
   refuses if the PID now belongs to a different process than the row showed.
 - **Quarantine binary** — move the executable somewhere it cannot launch,
   recording where it came from so it can be put back.
+- **Undo a removal** — put back an autostart entry that was removed, newest
+  first.
 
 ## Headless scan & benchmark
 
@@ -416,7 +421,9 @@ miner but isn't doing anything.
 On your own PC an idle xmrig is still worth a look: it may be paused, or waiting
 for you to close Task Manager. On a shared GPU host people run oddly named jobs
 all day and every alert costs someone's time. Pick one with `--profile cloud`
-or `"profile": "cloud"` in `config.json`.
+or `"profile": "cloud"` in the admin `config.json` (the per-user file cannot
+set it, since `cloud` is the less suspicious of the two; see
+[Configuration](#configuration)).
 
 Name matching is the same in both. It knows the brands and their usual variants
 (`xmrig-notls`, `gminer64`, `nbminer_v42`) and checks the executable's basename
@@ -502,11 +509,13 @@ depends on remembering what was done:
 
 | Action | What it does | Undo |
 |---|---|---|
-| Suspend | freezes the process; it stops earning, stays inspectable | Resume |
-| Remove autostart | deletes the registry value, task, or startup file that revives it | Undo a removal |
-| Quarantine | moves the binary where it cannot launch, remembering its home | Restore |
-| Block address | one firewall rule by IP; the miner keeps failing to submit | Unblock |
+| Suspend | freezes the process; it stops earning, stays inspectable | Resume (the GUI offers it after suspending) |
+| Remove autostart | deletes the registry value, task, or startup file that revives it | **Undo a removal** in the GUI, or `minersentry-scan --autostart-undo` |
+| Quarantine | moves the binary where it cannot launch, remembering its home | move it back from `%LOCALAPPDATA%\MinerSentry\quarantine` (the journal records where it came from) |
 | Terminate | ends it, as before | none |
+
+Blocking a pool address with a firewall rule exists as `quarantine.block_ip` /
+`unblock_ip` in the Python API, but neither the GUI nor the CLI offers it yet.
 
 Autostart removals are verified by execution, not only by unit test. A test
 that monkeypatches `subprocess.run` or `winreg` proves the right command was
@@ -520,8 +529,8 @@ Administrator, and the system-wide DLL load points (AppCertDlls, LSA packages,
 netsh helpers, print monitors) are deliberately never planted on a working
 machine.
 
-Suspending your own processes needs no privileges. Firewall rules and moving a
-file out of a system directory need Administrator, and the actions say so rather
+Suspending your own processes needs no privileges. Moving a file out of a
+system directory needs Administrator (so would a firewall rule), and the actions say so rather
 than failing obscurely.
 
 ## Weakened defences
