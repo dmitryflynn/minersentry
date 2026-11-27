@@ -131,6 +131,16 @@ def test_scan_respects_the_off_switch():
 
 
 # == response actions ======================================================
+def _wait_status(pid, ok, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while True:
+        if ok(psutil.Process(pid).status()):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+
+
 def test_suspend_and_resume_a_real_process():
     import subprocess
     p = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(30)"])
@@ -138,11 +148,14 @@ def test_suspend_and_resume_a_real_process():
         time.sleep(0.6)
         r = quarantine.suspend(p.pid)
         assert r.ok, r.message
-        assert psutil.Process(p.pid).status() == psutil.STATUS_STOPPED
+        # SIGSTOP is delivered asynchronously on Linux: /proc can still say
+        # "running" for a moment after suspend() returns. Reading it once
+        # failed CI on a docs-only PR. Wait for the state instead.
+        assert _wait_status(p.pid, lambda s: s == psutil.STATUS_STOPPED)
         assert "resume" in r.undo
         back = quarantine.resume(p.pid)
         assert back.ok
-        assert psutil.Process(p.pid).status() != psutil.STATUS_STOPPED
+        assert _wait_status(p.pid, lambda s: s != psutil.STATUS_STOPPED)
     finally:
         p.kill()
 
