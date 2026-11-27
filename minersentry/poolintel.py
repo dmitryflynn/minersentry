@@ -23,9 +23,10 @@ from __future__ import annotations
 
 import ipaddress
 import socket
-import subprocess
 import sys
 import time
+
+from . import powershell
 
 # Stratum endpoints of well-known pools (Monero-heavy, since RandomX CPU mining
 # is the common cryptojacking case, plus a few multi-coin pools). minexmr shut
@@ -127,9 +128,7 @@ def sample_connection_ages(now: float, timeout: float = 20.0
               "@{n='AgeSeconds';e={[int]((Get-Date) - $_.CreationTime).TotalSeconds}} | "
               "ConvertTo-Csv -NoTypeInformation")
     try:
-        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                           capture_output=True, text=True, timeout=timeout,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        r = powershell.run(script, timeout=timeout)
     except Exception:  # noqa: BLE001 - telemetry must never break a scan
         return {}
     if r.returncode != 0:

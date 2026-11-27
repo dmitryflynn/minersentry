@@ -15,11 +15,11 @@ empty list when a key needs privileges we do not have.
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 from dataclasses import dataclass, field
 
 from . import drivers as drivers_mod
+from . import powershell
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -125,12 +125,9 @@ def _defender_exclusions() -> list[str]:
         pass
     if not paths:
         try:
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                 "Get-MpPreference -ErrorAction SilentlyContinue | "
-                 "Select-Object -ExpandProperty ExclusionPath"],
-                capture_output=True, text=True, timeout=60,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            r = powershell.run(
+                "Get-MpPreference -ErrorAction SilentlyContinue | "
+                "Select-Object -ExpandProperty ExclusionPath", timeout=60)
             if r.returncode == 0:
                 out = r.stdout or ""
                 paths = parse_mppreference(out)
