@@ -306,7 +306,10 @@ def score_entry(entry: PersistEntry, cfg: Config,
                 score += W_ROGUE_DRIVER
                 labels.append("kernel driver loaded from outside the driver "
                               "directories")
-        if len(name_stem(base)) <= 3 and not exe_l.startswith(cfg.trusted_dirs):
+        # in_trusted_dir matches whole path components: a raw startswith let
+        # C:\Program Files2\abc.exe count as Program Files (#70).
+        if len(name_stem(base)) <= 3 and not trust.in_trusted_dir(
+                entry.exe, cfg.trusted_dirs):
             labels.append("very short name")
 
     if entry.kind in RARE_KINDS:
