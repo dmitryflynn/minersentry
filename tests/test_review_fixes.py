@@ -96,7 +96,8 @@ def test_tasks_already_listed_are_not_reported_twice(monkeypatch, tmp_path):
     (root / "Microsoft").mkdir(parents=True)
     (root / "Known").write_text(TASK_XML, encoding="utf-8")
     (root / "Microsoft" / "Hidden").write_text(TASK_XML, encoding="utf-8")
-    found = P._collect_task_files({"known"}, root=str(root))
+    # the listing's own form of the name: \Folder\Name, as schtasks gives it
+    found = P._collect_task_files({"\\known"}, root=str(root))
     kinds = {e.kind for e in found}
     names = {e.name for e in found}
     assert "Known" not in names, "a listed task was reported a second time"
