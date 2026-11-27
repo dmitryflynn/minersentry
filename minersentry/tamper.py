@@ -14,12 +14,17 @@ empty list when a key needs privileges we do not have.
 
 from __future__ import annotations
 
+import ntpath
 import os
+import posixpath
+import re
 import sys
 from dataclasses import dataclass, field
 
 from . import drivers as drivers_mod
+from . import persistence
 from . import powershell
+from . import trust
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -59,10 +64,23 @@ def parse_hosts(text: str) -> list[tuple[str, str]]:
     return out
 
 
+# Each name must sit on label boundaries: a dot, or a hyphen as in
+# kaspersky-labs.com. A plain substring found "eset" in "reset" and "preset",
+# so a blackholed password-reset host was reported as a security domain.
+_SECURITY_DOMAIN_RE = re.compile(
+    r"(?:^|[.-])(?:" + "|".join(re.escape(d) for d in SECURITY_DOMAINS)
+    + r")(?:$|[.-])")
+
+
+def is_security_domain(host: str) -> bool:
+    """True if `host` names one of SECURITY_DOMAINS on label boundaries. Pure."""
+    return bool(_SECURITY_DOMAIN_RE.search(host.lower().rstrip(".")))
+
+
 def blackholed_security_domains(entries: list[tuple[str, str]]) -> list[tuple[str, str]]:
     """Entries that point a security or update domain at nowhere. Pure."""
     return [(ip, host) for ip, host in entries
-            if ip in BLACKHOLE_IPS and any(d in host for d in SECURITY_DOMAINS)]
+            if ip in BLACKHOLE_IPS and is_security_domain(host)]
 
 
 def looks_like_a_path(value: str) -> bool:
@@ -84,6 +102,105 @@ def parse_mppreference(text: str) -> list[str]:
     """Exclusion paths from `Get-MpPreference | Select -Expand ExclusionPath`."""
     return [line.strip() for line in text.splitlines()
             if looks_like_a_path(line)]
+
+
+def _is_windows_style(path: str) -> bool:
+    return "\\" in path or (len(path) > 1 and path[1] == ":")
+
+
+def normalise_exclusion(path: str, environ: dict | None = None) -> tuple[str, bool]:
+    r"""(normalised form, comparable) for a Defender exclusion. Pure.
+
+    Defender stores an exclusion as it was typed, so `C:/Tools/`, `c:\tools.`
+    and `%USERPROFILE%\Downloads` all have to become one spelling before they
+    can be compared with a flagged path. Variables are expanded with
+    `persistence.expand_win_vars`; one it cannot resolve is left in place, and
+    the exclusion is then marked not comparable, because a literal `%VAR%`
+    never names the folder it stands for. Windows paths are lowered,
+    separators unified, `.`/`..` collapsed and trailing separators, dots and
+    spaces removed from the last component -- the last two are what Win32
+    itself strips, so `C:\Tools.` is `C:\Tools` on disk. A drive root comes
+    out as `d:`.
+    """
+    p = persistence.expand_win_vars((path or "").strip(), environ)
+    comparable = bool(p) and not persistence._WIN_VAR.search(p)
+    if _is_windows_style(p):
+        p = ntpath.normpath(p.replace("/", "\\")).lower()
+        if not p.startswith("\\\\") or p.count("\\") > 2:
+            p = p.rstrip("\\")
+        head, sep, last = p.rpartition("\\")
+        trimmed = last.rstrip(" .")
+        if trimmed and trimmed != last:
+            p = head + sep + trimmed
+    elif p.startswith("/"):
+        p = posixpath.normpath(p).rstrip("/")
+    return p, comparable
+
+
+def is_whole_drive(norm: str) -> bool:
+    r"""True for a drive root, any letter (`d:`, after normalisation). Pure.
+
+    `C:\*` counts too: it excludes every entry in the root, which is the drive.
+    """
+    return len(norm) in (2, 4) and norm[0].isalpha() and norm[1] == ":" \
+        and norm[2:] in ("", "\\*")
+
+
+_DROP_HINTS = ("\\temp\\", "\\appdata\\", "\\programdata\\", "\\users\\public\\")
+
+
+def in_drop_location(norm: str) -> bool:
+    """True if a normalised exclusion is, or is inside, a drop location. Pure.
+
+    Matched on whole components: the hints used to be bare substrings tested
+    against a path whose trailing separator had been stripped, so
+    `C:\\Windows\\Temp` itself missed while `C:\\Users\\PublicX` hit.
+    """
+    if norm.startswith("/"):
+        return (norm + "/").startswith(("/tmp/", "/var/tmp/", "/dev/shm/"))
+    padded = norm + "\\"
+    return any(h in padded for h in _DROP_HINTS)
+
+
+def _wildcard_regex(norm: str) -> "re.Pattern[str]":
+    """`*` and `?` as Defender uses them, inside one path component only.
+
+    `fnmatch` is not used because it reads `[ab]` as a character class, and
+    brackets are ordinary characters in a Windows name; and its `*` crosses
+    separators, which would let `C:\\Users\\*\\x` cover `C:\\Users\\a\\b\\x`.
+    """
+    sep = "\\" if _is_windows_style(norm) else "/"
+    other = re.escape(sep)
+    body = "".join(f"[^{other}]*" if c == "*" else f"[^{other}]" if c == "?"
+                   else re.escape(c) for c in norm)
+    return re.compile(f"^{body}(?:{other}.*)?$", re.DOTALL)
+
+
+def exclusion_covers(norm: str, flagged: str) -> bool:
+    r"""True if the normalised exclusion `norm` covers the path `flagged`. Pure.
+
+    Whole components, as `trust._under` matches them (case, separators and a
+    traversal in `flagged` all handled there), so `C:\Tools` covers
+    `C:\Tools\x.exe` and `C:\Tools` itself but not `C:\ToolsX\miner.exe`.
+    Wildcard exclusions get the same treatment with `*`/`?` confined to a
+    single component.
+    """
+    if not norm or not flagged:
+        return False
+    # Only an absolute exclusion names a place. A bare `*` or `miner.exe`
+    # compared as a pattern would match every flagged path there is.
+    win = _is_windows_style(norm)
+    if win != _is_windows_style(flagged):
+        return False
+    if not (norm.startswith("\\\\") or norm[1:2] == ":" or norm.startswith("/")):
+        return False
+    if "*" not in norm and "?" not in norm:
+        return trust._under(flagged, (norm,))
+    if win:
+        target = ntpath.normpath(flagged.replace("/", "\\")).lower()
+    else:
+        target = posixpath.normpath(flagged)
+    return bool(_wildcard_regex(norm).match(target))
 
 
 def _read(path: str) -> str:
@@ -188,18 +305,18 @@ def scan(cfg=None, flagged_paths: tuple[str, ...] = ()) -> list[TamperFinding]:
             ["run as Administrator to check whether a folder is excluded"]))
 
     for path in exclusions:
-        lowered = path.lower().rstrip("\\/")
+        norm, comparable = normalise_exclusion(path)
         labels = ["a folder antivirus has been told to ignore"]
         score = 45
-        if any(lowered and lowered in p.lower() for p in flagged_paths):
+        if comparable and any(exclusion_covers(norm, p) for p in flagged_paths):
             score = 95
             labels.append("and MinerSentry has already flagged something inside it")
-        for hint in ("\\temp\\", "\\appdata\\", "\\programdata\\", "\\users\\public",
-                     "c:\\\\", "/tmp"):
-            if hint in lowered or lowered in ("c:\\", "c:"):
-                score = max(score, 70)
-                labels.append("covering a drop location, or the whole drive")
-                break
+        if is_whole_drive(norm):
+            score = max(score, 70)
+            labels.append("covering a whole drive")
+        elif in_drop_location(norm):
+            score = max(score, 70)
+            labels.append("covering a drop location")
         findings.append(TamperFinding("defender-exclusion", path,
                                       "Windows Defender exclusions", score, labels))
 
