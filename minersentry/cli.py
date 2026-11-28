@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -23,6 +24,7 @@ from . import gpu as gpu_mod
 from . import containers as containers_mod
 from . import procevents as procevents_mod
 from . import persistence as persist_mod
+from . import quarantine as quarantine_mod
 from . import dnscache as dns_mod
 from . import tamper as tamper_mod
 
@@ -123,6 +125,24 @@ def run_session(duration: float, cfg: Config | None = None,
         results = e.scan_once(deep=False)   # fold in the finished memory sweep
         _record(time.time() - start)
     return e, results, first_hit
+
+
+def match_quarantined(held: list[dict], wanted: str) -> list[dict]:
+    """Quarantined files that `wanted` names. Pure.
+
+    An exact original or stored path wins outright. Otherwise the file name
+    is compared, so `--restore svc.exe` works when only one file of that name
+    is held. Case-insensitive, as Windows paths are.
+    """
+    want = os.path.normcase(os.path.normpath(wanted.strip()))
+    exact = [h for h in held
+             if want in (os.path.normcase(os.path.normpath(h.get("original") or "")),
+                         os.path.normcase(os.path.normpath(h.get("stored") or "")))]
+    if exact:
+        return exact
+    leaf = os.path.basename(want)
+    return [h for h in held
+            if os.path.normcase(os.path.basename(h.get("original") or "")) == leaf]
 
 
 def _coverage(r: ProcInfo) -> dict | None:
@@ -281,6 +301,19 @@ def main(argv: list[str] | None = None) -> int:
                          "(reversible; recorded in the actions journal)")
     ap.add_argument("--autostart-undo", action="store_true",
                     help="undo the last autostart removal")
+    # Reversible responses that previously existed only in the Python API.
+    ap.add_argument("--block", metavar="IP",
+                    help="block outbound traffic to this address (needs "
+                         "Administrator/root; reversible with --unblock)")
+    ap.add_argument("--unblock", metavar="IP",
+                    help="remove a block this tool added")
+    ap.add_argument("--blocked", action="store_true",
+                    help="list the addresses this tool has blocked")
+    ap.add_argument("--quarantined", action="store_true",
+                    help="list the files in quarantine and where each came from")
+    ap.add_argument("--restore", metavar="FILE",
+                    help="put a quarantined file back; FILE is its original "
+                         "path, its file name, or its path in quarantine")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     args = ap.parse_args(argv)
 
@@ -292,6 +325,51 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(message, file=sys.stdout if ok else sys.stderr)
         return 0 if ok else 1
+
+    if args.blocked:
+        rows = quarantine_mod.blocked()
+        if args.json:
+            print(json.dumps({"blocked": rows}, indent=2))
+        elif rows:
+            for row in rows:
+                print(f"{row['ip']:<40} blocked {row['ts']}")
+        else:
+            print("No addresses are blocked.")
+        return 0
+
+    if args.quarantined:
+        rows = quarantine_mod.quarantined()
+        if args.json:
+            print(json.dumps({"quarantined": rows}, indent=2))
+        elif rows:
+            for row in rows:
+                print(row["original"])
+                print(f"    held as {row['stored']}")
+        else:
+            print("Nothing is in quarantine.")
+        return 0
+
+    if args.block:
+        r = quarantine_mod.block_ip(args.block.strip())
+        return _done(r.ok, r.message)
+
+    if args.unblock:
+        r = quarantine_mod.unblock_ip(args.unblock.strip())
+        return _done(r.ok, r.message)
+
+    if args.restore:
+        held = quarantine_mod.quarantined()
+        matches = match_quarantined(held, args.restore)
+        if not matches:
+            return _done(False, f"Nothing in quarantine matches {args.restore!r}. "
+                                f"Run --quarantined to see what is held.")
+        if len(matches) > 1:
+            return _done(False, "That matches more than one quarantined file; "
+                                "give the full original path:\n  " +
+                                "\n  ".join(m["original"] for m in matches),
+                         matches=[m["original"] for m in matches])
+        r = quarantine_mod.restore_file(matches[0]["stored"])
+        return _done(r.ok, r.message)
 
     if args.autostart_undo:
         records = persist_mod.removals()
