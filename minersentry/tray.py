@@ -98,13 +98,13 @@ class TrayIcon:
         """Show a balloon on the icon. False if there is no icon to show it on."""
         if not self._hwnd:
             return False
-        data = self._nid()
-        data.uFlags = NIF_INFO
-        data.szInfoTitle = title[:63]
-        data.szInfo = body[:255]
         try:
+            data = self._nid()
+            data.uFlags = NIF_INFO
+            data.szInfoTitle = fit_utf16(title, 63)
+            data.szInfo = fit_utf16(body, 255)
             return bool(ctypes.windll.shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(data)))
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 - the caller falls back to a toast
             return False
 
     # -- internals ---------------------------------------------------------
@@ -196,6 +196,29 @@ class TrayIcon:
             user32.PostMessageW(hwnd, 0, 0, 0)     # dismiss cleanly
         finally:
             user32.DestroyMenu(menu)
+
+
+def fit_utf16(text: str, units: int) -> str:
+    """The longest prefix of `text` that fits in `units` UTF-16 code units,
+    without splitting a surrogate pair. Pure.
+
+    The balloon fields are WCHAR arrays, so they count UTF-16 units, not
+    characters. Cutting at 255 characters let a process name made of emoji
+    (two units each) overflow the field. ctypes raised ValueError, and in the
+    watcher that escaped the loop and ended monitoring: a miner could stop
+    the watch by choosing its own name.
+    """
+    text = text.replace("\0", "")
+    if len(text.encode("utf-16-le")) // 2 <= units:
+        return text
+    out, used = [], 0
+    for ch in text:
+        need = 2 if ord(ch) > 0xFFFF else 1
+        if used + need > units:
+            break
+        out.append(ch)
+        used += need
+    return "".join(out)
 
 
 def _safely(fn) -> None:

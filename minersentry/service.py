@@ -235,7 +235,8 @@ def run(cfg: Config | None = None, once: bool = False,
             results = []
         # Transient processes: alert once each. The engine has already
         # journalled them, so this is only the notification.
-        for t in getattr(engine, "transient", []):
+        transient = list(getattr(engine, "transient", []))
+        for t in transient:
             key = (t.pid, t.ts)
             if key in alerted_transient:
                 continue
@@ -243,6 +244,9 @@ def run(cfg: Config | None = None, once: bool = False,
             if alert:
                 notify("MinerSentry: a miner-like process started and exited",
                        f"{t.summary} (score {t.score}/100)", cfg)
+        # The engine keeps the last 500; remembering more than it holds only
+        # grew this set for as long as the watcher ran, which is days.
+        alerted_transient &= {(t.pid, t.ts) for t in transient}
         for r in results:
             if not should_alert(r.verdict, cfg.notify_min_verdict):
                 continue

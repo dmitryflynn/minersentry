@@ -97,7 +97,7 @@ def parse_nvidia_compute_apps(text: str) -> set[int]:
         if not line or line.lower().startswith("pid"):
             continue
         first = line.split(",")[0].strip()
-        if first.isdigit():
+        if first.isdecimal():
             pids.add(int(first))
     return pids
 
@@ -291,7 +291,7 @@ COMPUTE_RUNTIME_MODULES = frozenset({
 def _so_name(base: str) -> str:
     """`libopencl.so.1.0.0` -> `libopencl.so`; anything else unchanged. Pure."""
     head, sep, version = base.partition(".so.")
-    if sep and version and all(part.isdigit() for part in version.split(".")):
+    if sep and version and all(part.isdecimal() for part in version.split(".")):
         return head + ".so"
     return base
 

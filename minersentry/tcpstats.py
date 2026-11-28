@@ -65,7 +65,7 @@ def is_loopback(ip: str) -> bool:
 def _split_addr(token: str) -> tuple[str, int] | None:
     """'10.0.0.5:443', '[2001:db8::1]:443' or old-style '2001:db8::1:443'."""
     host, sep, port = token.rpartition(":")
-    if not sep or not host or not port.isdigit():
+    if not sep or not host or not port.isdecimal():
         return None
     return norm_ip(host), int(port)
 
@@ -75,7 +75,7 @@ def _info_value(fields: list[str], name: str) -> int | None:
     for f in fields:
         if f.startswith(prefix):
             v = f[len(prefix):]
-            return int(v) if v.isdigit() else None
+            return int(v) if v.isdecimal() else None
     return None
 
 
@@ -108,8 +108,8 @@ def parse_ss(text: str) -> dict[ConnKey, tuple[int, int]]:
         cur = None
         toks = line.split()
         # Recv-Q and Send-Q are the first two numeric columns.
-        off = 0 if toks[0].isdigit() else 1
-        if len(toks) < off + 4 or not (toks[off].isdigit() and toks[off + 1].isdigit()):
+        off = 0 if toks[0].isdecimal() else 1
+        if len(toks) < off + 4 or not (toks[off].isdecimal() and toks[off + 1].isdecimal()):
             continue          # the column header, or something unrecognised
         local, remote = _split_addr(toks[off + 2]), _split_addr(toks[off + 3])
         if local and remote:
