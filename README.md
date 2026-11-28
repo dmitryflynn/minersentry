@@ -585,6 +585,14 @@ nothing and lists the candidates. The list of blocks is read back from the
 journal, not from the firewall, so a rule deleted by hand still shows until it
 is unblocked here.
 
+The journal sits in your profile, so anything running as you can write to it.
+That is harmless for an undo run with your normal rights, since a forged record
+can do nothing its writer couldn't. An undo run as Administrator is different. A
+MinerSentry running elevated signs what it journals, with a key in Program Files
+that only Administrators and SYSTEM can read. An elevated undo replays only
+records whose signature checks out. A quarantined file is hashed when it is
+moved, and it is not put back if it changed while it was held.
+
 Autostart removals are verified by execution, not only by unit test. A test
 that monkeypatches `subprocess.run` or `winreg` proves the right command was
 *built*; it cannot catch a well-formed command pointed at the wrong thing,

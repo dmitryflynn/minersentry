@@ -1790,6 +1790,11 @@ def undo_removal(record: dict) -> "quarantine.Result":
     rewriting the old value over whatever was there by then, and older
     removals could not be reached. A failed undo records nothing.
     """
+    if record.get("action") != "quarantine_file":
+        # restore_file checks its own record; the rest are checked here.
+        why = quarantine.replay_refusal(record)
+        if why:
+            return quarantine.Result(False, why)
     result = _undo_removal(record)
     key = _removal_key(record)
     if result.ok and key is not None:

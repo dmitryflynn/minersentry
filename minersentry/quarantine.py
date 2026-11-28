@@ -22,6 +22,8 @@ Nothing here runs automatically. The GUI asks first, every time.
 from __future__ import annotations
 
 import ctypes
+import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -53,8 +55,149 @@ class Result:
     undo: str = ""          # how to reverse it, in words
 
 
+# -- journal integrity -------------------------------------------------------
+# The journal lives under the user's profile, so anything running as that user
+# can write to it, malware included. Replaying a record is harmless when the
+# replay runs with the same rights as the writer: whatever it does, the writer
+# could have done itself. An ELEVATED replay is different. A forged
+# `remove_task` record carrying a task XML with a SYSTEM principal made an
+# administrator's `--autostart-undo` (which takes the newest record without
+# showing it) create a SYSTEM task: a UAC bypass. So records written by an
+# elevated session are signed with a key only administrators can read, and an
+# elevated session replays only records whose signature checks out.
+_KEY_BYTES = 32
+_key_cache: bytes | None = None
+
+
+def journal_key_path() -> str:
+    """Where the signing key lives: somewhere only an administrator can create
+    files. Not under %ProgramData% (users may create folders there), and the
+    Program Files location comes from HKLM, not the environment (#101)."""
+    if IS_WINDOWS:
+        from .config import program_files
+        return os.path.join(program_files(), "MinerSentry", "journal.key")
+    return "/var/lib/minersentry/journal.key"
+
+
+def _lock_down(path: str) -> bool:
+    """Make `path` readable and writable by Administrators and SYSTEM only.
+    By SID, so it works on a non-English install."""
+    if IS_WINDOWS:
+        try:
+            r = subprocess.run(["icacls", path, "/inheritance:r", "/grant:r",
+                                "*S-1-5-32-544:F", "*S-1-5-18:F"],
+                               capture_output=True, text=True, timeout=30,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return r.returncode == 0
+    try:
+        os.chmod(path, 0o600)
+        return True
+    except OSError:
+        return False
+
+
+def _posix_key_is_private(path: str) -> bool:
+    try:
+        st = os.stat(path)
+        parent = os.stat(os.path.dirname(path))
+    except OSError:
+        return False
+    return (st.st_uid == 0 and not st.st_mode & 0o077
+            and parent.st_uid == 0 and not parent.st_mode & 0o022)
+
+
+def _journal_key(create: bool = False) -> bytes | None:
+    """The signing key, or None when this process may not have it.
+
+    Only an elevated process reads or creates it. An unelevated one gets None
+    even if the file happens to be readable, so nothing it writes is signed.
+    """
+    global _key_cache
+    if not is_elevated():
+        return None
+    if _key_cache:
+        return _key_cache
+    path = journal_key_path()
+    try:
+        with open(path, "rb") as f:
+            key = f.read()
+    except OSError:
+        key = None
+    if key is not None and len(key) == _KEY_BYTES:
+        if IS_WINDOWS:
+            # Re-applied once per process: if the ACL was ever loosened, at
+            # least it stops being readable now.
+            _lock_down(path)
+        elif not _posix_key_is_private(path):
+            return None
+        _key_cache = key
+        return key
+    if not create:
+        return None
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        if os.path.exists(path):
+            os.remove(path)             # wrong length: unusable, replace it
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                     | getattr(os, "O_BINARY", 0), 0o600)
+        try:
+            # Locked before the key is written, so it is never readable.
+            if not _lock_down(path):
+                raise OSError("could not restrict the key file")
+            key = os.urandom(_KEY_BYTES)
+            if os.write(fd, key) != _KEY_BYTES:
+                raise OSError("short write")
+        finally:
+            os.close(fd)
+    except OSError:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+    if len(key) != _KEY_BYTES:
+        return None
+    _key_cache = key
+    return key
+
+
+def _signature(key: bytes, rec: dict) -> str:
+    body = {k: v for k, v in rec.items() if k != "sig"}
+    blob = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hmac.new(key, blob.encode("ascii"), hashlib.sha256).hexdigest()
+
+
+def is_trusted(rec: dict) -> bool:
+    """Was this record written by an elevated MinerSentry? Only answerable
+    from an elevated process; anywhere else it is False."""
+    sig = rec.get("sig")
+    if not isinstance(sig, str):
+        return False
+    key = _journal_key()
+    return bool(key) and hmac.compare_digest(sig, _signature(key, rec))
+
+
+def replay_refusal(rec: dict) -> str:
+    """Why an elevated process will not act on this record, or "" if it may.
+
+    An unelevated replay can do nothing the record's writer could not have
+    done itself, so it is always allowed.
+    """
+    if not is_elevated() or is_trusted(rec):
+        return ""
+    return ("That record was not written by MinerSentry running as "
+            "Administrator, so it is not replayed with Administrator rights: "
+            "anything running as you can write to the actions journal. Undo it "
+            "from a normal (non-elevated) MinerSentry, or by hand.")
+
+
 def _record(action: str, **fields) -> None:
     rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "action": action, **fields}
+    key = _journal_key(create=True)
+    if key:
+        rec["sig"] = _signature(key, rec)
     try:
         os.makedirs(os.path.dirname(journal_path()), exist_ok=True)
         with open(journal_path(), "a", encoding="utf-8") as f:
@@ -266,8 +409,7 @@ def quarantine_file(path: str, kill_first: bool = False,
     if not os.path.isfile(path):
         return Result(False, f"{path} is not a file.")
     target_dir = quarantine_dir()
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    dest = os.path.join(target_dir, f"{stamp}-{os.path.basename(path)}")
+    dest = _free_name(target_dir, os.path.basename(path))
     if kill_first:
         for p in processes_using(path):
             try:
@@ -280,34 +422,91 @@ def quarantine_file(path: str, kill_first: bool = False,
         return Result(False, f"{os.path.basename(path)} is still running as PID(s) "
                              f"{still}; suspend or stop it first (or ask to kill it).")
     try:
+        digest = _sha256(path)
         os.makedirs(target_dir, exist_ok=True)
         shutil.move(path, dest)
     except OSError as e:
         hint = "" if is_elevated() else " Moving a file out of a system directory needs Administrator."
         return Result(False, f"Could not quarantine {path}: {e}.{hint}")
-    _record("quarantine_file", original=path, stored=dest,
+    _record("quarantine_file", original=path, stored=dest, sha256=digest,
             **({"kind": kind} if kind else {}))
     return Result(True, f"Moved {os.path.basename(path)} to the quarantine folder.",
                   undo=f"restore_file({dest!r})")
 
 
+def _free_name(folder: str, name: str) -> str:
+    """A path in `folder` nothing is using yet.
+
+    The name used to be a timestamp to the second plus the file name, so two
+    files called `svc.exe` quarantined in the same second got the same path.
+    On Windows the second move failed; on Linux it silently replaced the first
+    file, which was then gone for good.
+    """
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = os.path.join(folder, f"{stamp}-{name}")
+    n = 1
+    while os.path.exists(dest):
+        n += 1
+        dest = os.path.join(folder, f"{stamp}-{n}-{name}")
+    return dest
+
+
+def _sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _inside(path: str, folder: str) -> bool:
+    try:
+        real = os.path.normcase(os.path.realpath(path))
+        base = os.path.normcase(os.path.realpath(folder))
+        return os.path.commonpath([real, base]) == base
+    except ValueError:              # different drives
+        return False
+
+
 def restore_file(stored: str) -> Result:
-    """Put a quarantined binary back where it came from."""
-    original = None
+    """Put a quarantined binary back where it came from.
+
+    The quarantine folder is under the user's profile, so the file can change
+    while it is held. An elevated restore that put back whatever was there
+    would let anything running as the user plant a binary in System32. The
+    content is checked against the hash taken when it was quarantined, again
+    after it lands, and it is moved back out if they differ.
+    """
+    found = None
     for rec in reversed(history(500)):
         if rec.get("action") == "quarantine_file" and rec.get("stored") == stored:
-            original = rec.get("original")
+            found = rec
             break
+    original = found.get("original") if found else None
     if not original:
         return Result(False, f"No record of {stored} being quarantined, so where it "
                              f"belongs is unknown. Move it back by hand.")
+    why = replay_refusal(found)
+    if why:
+        return Result(False, why)
+    if not _inside(stored, quarantine_dir()):
+        return Result(False, f"{stored} is not in the quarantine folder; not moving it.")
     if not os.path.isfile(stored):
         return Result(False, f"{stored} is no longer in the quarantine folder.")
     if os.path.exists(original):
         return Result(False, f"{original} exists again; not overwriting it.")
+    want = found.get("sha256")
     try:
+        if want and _sha256(stored) != want:
+            return Result(False, f"{os.path.basename(stored)} changed while it was in "
+                                 f"quarantine; not putting it back.")
         os.makedirs(os.path.dirname(original), exist_ok=True)
         shutil.move(stored, original)
+        if want and _sha256(original) != want:
+            # Swapped between the check and the move.
+            shutil.move(original, stored)
+            return Result(False, f"{os.path.basename(stored)} changed while it was "
+                                 f"being restored; it is back in quarantine.")
     except OSError as e:
         return Result(False, f"Could not restore: {e}")
     _record("restore_file", original=original, stored=stored)
