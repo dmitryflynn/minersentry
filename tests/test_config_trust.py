@@ -150,3 +150,37 @@ def test_frozen_instance_of_our_own_binary_is_skipped(monkeypatch, tmp_path):
     pids = {r.pid for r in e.scan_once()}
     assert 5003 not in pids          # the same installed binary: another instance of us
     assert 5004 in pids              # same name, different file: scanned
+
+
+# == Program Files comes from HKLM, not the environment =====================
+def test_a_user_level_programfiles_variable_cannot_move_the_admin_file(monkeypatch, tmp_path):
+    r"""A user-level %ProgramFiles% in HKCU\Environment overrides the system
+    one for every process that user starts. The admin config path and its
+    protection check both trusted it, so a file in a user folder counted as
+    admin-only and could relax detection."""
+    import sys
+    if sys.platform != "win32":
+        import pytest
+        pytest.skip("Program Files is a Windows location")
+    monkeypatch.setenv("ProgramFiles", str(tmp_path))
+    assert not config_module.program_files().lower().startswith(str(tmp_path).lower())
+    assert not config_module.system_config_path().lower().startswith(str(tmp_path).lower())
+    fake = tmp_path / "MinerSentry" / "config.json"
+    fake.parent.mkdir()
+    fake.write_text("{}")
+    monkeypatch.setattr(config_module, "_IS_WINDOWS", True)
+    warnings = []
+    assert not config_module._system_file_is_protected(str(fake), warnings)
+    assert warnings and "outside Program Files" in warnings[0]
+
+
+def test_program_files_falls_back_when_the_registry_cannot_be_read(monkeypatch):
+    import builtins
+    real_import = builtins.__import__
+
+    def no_winreg(name, *a, **k):
+        if name == "winreg":
+            raise ImportError(name)
+        return real_import(name, *a, **k)
+    monkeypatch.setattr(builtins, "__import__", no_winreg)
+    assert config_module.program_files() == r"C:\Program Files"
