@@ -257,11 +257,18 @@ def command_exe(command: str, isfile=os.path.isfile) -> str:
 
 
 def score_entry(entry: PersistEntry, cfg: Config,
-                is_trusted=trust.is_trusted, isfile=os.path.isfile) -> PersistEntry:
-    """Score one autostart entry.
+                is_trusted=trust.is_trusted, isfile=os.path.isfile,
+                environ: dict | None = None) -> PersistEntry:
+    r"""Score one autostart entry.
 
-    The filesystem checks are injected so this can be tested against installs
-    that are not on the machine running the tests.
+    The filesystem checks and the environment are injected so this can be
+    tested against installs that are not on the machine running the tests.
+
+    The executable is scored with its `%VAR%`s expanded (#50). Run keys, task
+    actions, Active Setup and IFEO values routinely store `%APPDATA%\x.exe`;
+    scored as written that names no file and matches no drop-location hint, so
+    it got no trust, unsigned or drop-location weight. The entry itself keeps
+    its command and exe as written, since that is what the user is shown.
     """
     score = 0
     labels: list[str] = []
@@ -272,33 +279,39 @@ def score_entry(entry: PersistEntry, cfg: Config,
         score += cmd_score
         labels += cmdline_mod.labels(hits, 3)
 
-    base = ntpath.basename(entry.exe or entry.name)
-    if is_miner_name(base, cfg) or is_miner_name(entry.exe, cfg):
+    exe = expand_win_vars(entry.exe or "", environ)
+    base = ntpath.basename(exe or entry.name)
+    if is_miner_name(base, cfg) or is_miner_name(exe, cfg):
         score += W_MINER_NAME
         labels.append("known miner binary name")
 
-    exe_l = (entry.exe or "").lower()
+    exe_l = exe.lower()
     if exe_l:
         # Trust is decided first: a SIGNED binary gets neither the drop-location
         # nor the unsigned weight. Defender genuinely lives in ProgramData, and
         # charging it for that put its own scheduled tasks one point under the
         # reporting threshold on a clean machine.
-        trusted = isfile(entry.exe) and is_trusted(
-            entry.exe, cfg.trusted_dirs, cfg.signature_untrusted_dirs)
+        trusted = isfile(exe) and is_trusted(
+            exe, cfg.trusted_dirs, cfg.signature_untrusted_dirs)
         if not trusted:
             for hint in cfg.suspicious_dir_hints:
                 if hint in exe_l:
                     score += W_DROP_DIR
                     labels.append(f"runs from {hint.strip(chr(92)) or hint}")
                     break
-            if isfile(entry.exe):
+            if isfile(exe):
                 score += W_UNSIGNED
                 labels.append("unsigned binary outside the system directories")
-            if is_rogue_driver(entry.exe):
+            if is_rogue_driver(exe):
                 score += W_ROGUE_DRIVER
                 labels.append("kernel driver loaded from outside the driver "
                               "directories")
-        if len(name_stem(base)) <= 3 and not exe_l.startswith(cfg.trusted_dirs):
+        # in_trusted_dir matches whole path components: a raw startswith let
+        # C:\Program Files2\abc.exe count as Program Files (#70). It gets the
+        # EXPANDED path like every other check here (#50): the as-written
+        # %ProgramFiles%\abc.exe is in a trusted directory too.
+        if len(name_stem(base)) <= 3 and not trust.in_trusted_dir(
+                exe, cfg.trusted_dirs):
             labels.append("very short name")
 
     if entry.kind in RARE_KINDS:
@@ -884,7 +897,9 @@ def resolve_system_dll(value: str, isfile=os.path.isfile,
     value = (value or "").strip().strip('"')
     if not value:
         return ""
-    value = os.path.expandvars(value)
+    # expand_win_vars, not os.path.expandvars: off Windows that only knows
+    # $VAR, so a %SystemRoot% path was left as written (#50).
+    value = expand_win_vars(value)
     if "\\" in value or "/" in value or (len(value) > 1 and value[1] == ":"):
         return value
     root = system_root or os.environ.get("SystemRoot", r"C:\Windows")
