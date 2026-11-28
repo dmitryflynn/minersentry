@@ -159,6 +159,7 @@ MAX_BYTES_PER_PROC = 192 * 1024 * 1024     # stop a process after 192 MiB
 MAX_OTHER_BYTES = 64 * 1024 * 1024         # images and mapped files, separately
 READ_CHUNK = 8 * 1024 * 1024               # one ReadProcessMemory at most
 CHUNK_OVERLAP = 64                         # so a marker cannot straddle a seam
+MIN_SAMPLE = 4096                          # smallest piece sample_offsets reads
 
 
 class ReadBudget:
@@ -284,7 +285,7 @@ def sample_offsets(region_size: int, max_total: int, samples: int) -> list[tuple
         return []
     if samples <= 1 or region_size <= max_total:
         return [(0, min(region_size, max_total))]
-    chunk = max(4096, max_total // samples)
+    chunk = max(MIN_SAMPLE, max_total // samples)
     if region_size <= chunk:
         return [(0, region_size)]
     span = region_size - chunk
@@ -351,8 +352,13 @@ def _scan_windows(pid: int, budget_bytes: int, max_region_read: int,
     try:
         mbi = MEMORY_BASIC_INFORMATION()
         addr = 0
-        buf = ctypes.create_string_buffer(
-            min(max_region_read, READ_CHUNK) + CHUNK_OVERLAP)
+        # sample_offsets() never reads less than 4 KiB at a time, so a small
+        # max_region_read must not shrink the buffer below that: a 1,000-byte
+        # setting made a 1,064-byte buffer that ReadProcessMemory was asked to
+        # fill with 4,160, writing past it into the interpreter's heap. Every
+        # read is also clamped to the buffer below.
+        buf_len = max(min(max_region_read, READ_CHUNK), MIN_SAMPLE) + CHUNK_OVERLAP
+        buf = ctypes.create_string_buffer(buf_len)
         read = ctypes.c_size_t(0)
         budget = ReadBudget(budget_bytes, other_budget_bytes)
         # Walk EVERY region: region sizes are cheap to query, and the ~2 GiB
@@ -382,6 +388,9 @@ def _scan_windows(pid: int, budget_bytes: int, max_region_read: int,
                         break
                     failed = got = False
                     for at, size, fresh in chunks(off, want):
+                        if size > buf_len:          # never true; never overflow
+                            size = buf_len
+                            fresh = min(fresh, size)
                         read.value = 0
                         ok = _k32.ReadProcessMemory(
                             handle, ctypes.c_void_p(base + at), buf, size,

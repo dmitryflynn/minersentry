@@ -226,3 +226,17 @@ def test_blockable_addresses_skips_listeners_loopback_and_duplicates():
              SimpleNamespace(raddr=addr("2001:db8::7")),
              SimpleNamespace(raddr=None)]
     assert gui.blockable_addresses(conns) == ["45.1.2.3", "2001:db8::7"]
+
+
+# == scan arguments that would skip the scan ================================
+@pytest.mark.parametrize("args", [["--duration", "nan"], ["--duration", "-5"],
+                                  ["--duration", "inf"], ["--interval", "0"],
+                                  ["--interval", "nan"], ["--duration", "abc"]])
+def test_a_duration_or_interval_that_cannot_run_a_scan_is_refused(args, capsys):
+    """`--duration nan` used to skip the loop and print an empty table, a scan
+    that never ran reported like a clean one."""
+    with pytest.raises(SystemExit) as stop:
+        cli.main(args)
+    assert stop.value.code == 2
+    err = capsys.readouterr().err
+    assert "seconds" in err or "number" in err

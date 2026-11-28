@@ -101,7 +101,7 @@ _MAX_THREADS = 128   # cap the counters opened per process (2 fds per thread)
 def thread_ids(pid: int) -> list[int]:
     """Thread IDs of `pid` from /proc/<pid>/task (main thread first)."""
     try:
-        tids = sorted(int(t) for t in os.listdir(f"/proc/{pid}/task") if t.isdigit())
+        tids = sorted(int(t) for t in os.listdir(f"/proc/{pid}/task") if t.isdecimal())
     except OSError:
         return []
     if pid in tids:

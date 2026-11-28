@@ -51,7 +51,7 @@ def parse_drm_fdinfo(text: str) -> tuple[str, str, dict[str, int]] | None:
         elif key.startswith("drm-engine-") and not key.startswith(
                 "drm-engine-capacity-"):
             number = value.split()[0] if value else ""
-            if number.isdigit():
+            if number.isdecimal():
                 engines[key[len("drm-engine-"):]] = int(number)
     if not driver or not client:
         return None
@@ -96,7 +96,7 @@ def read_clients(root: str = "/proc", readlink=os.readlink) -> dict:
     """{(pid, client): {engine: ns}} for every DRM file we are allowed to see."""
     out: dict = {}
     try:
-        pids = [name for name in os.listdir(root) if name.isdigit()]
+        pids = [name for name in os.listdir(root) if name.isdecimal()]
     except OSError:
         return out
     for name in pids:

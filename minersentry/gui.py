@@ -460,13 +460,17 @@ class MinerSentryApp:
         CPU to show and nothing to select. The event log is the honest
         place for them.
         """
-        for t in getattr(self.engine, "transient", []):
+        transient = list(getattr(self.engine, "transient", []))
+        for t in transient:
             key = (t.pid, t.ts)
             if key in self._shown_transient:
                 continue
             self._shown_transient.add(key)
             self._add_event(f"started and exited, score {t.score}: "
                             f"{t.summary}")
+        # Bounded like the engine's list; this used to grow for as long as
+        # the window stayed open.
+        self._shown_transient &= {(t.pid, t.ts) for t in transient}
 
     def _render(self, results: list[ProcInfo], deep: bool, dt: float) -> None:
         self.rows = {r.pid: r for r in results}
@@ -960,6 +964,13 @@ class MinerSentryApp:
         if pid is None:
             return
         name = row.name if row else f"PID {pid}"
+        if not self._same_process(pid, row):
+            # The row can be seconds old; a reused PID would block whatever
+            # unrelated process now holds the number's connections.
+            messagebox.showwarning("Process changed",
+                                   f"PID {pid} no longer belongs to {name}; "
+                                   f"nothing was blocked.")
+            return
         try:
             conns = psutil.Process(pid).net_connections(kind="inet")
         except (psutil.NoSuchProcess, psutil.AccessDenied) as e:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import threading
@@ -271,10 +272,29 @@ def _report_autostart(cfg: Config, as_json: bool) -> int:
     return 0
 
 
+def _seconds(minimum: float):
+    """An argparse type: a finite number of seconds, at least `minimum`.
+
+    `--duration nan` or a negative duration skipped the scan loop entirely
+    and printed an empty table: a scan that never ran, reported like a clean
+    one. `--interval 0` scanned in a busy loop.
+    """
+    def parse(text: str) -> float:
+        try:
+            value = float(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
+        if not math.isfinite(value) or value < minimum:
+            raise argparse.ArgumentTypeError(f"must be a number of seconds, at least {minimum:g}")
+        return value
+    return parse
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Headless MinerSentry scan.")
-    ap.add_argument("--duration", type=float, default=25.0, help="seconds to run")
-    ap.add_argument("--interval", type=float, default=None, help="seconds between passes")
+    ap.add_argument("--duration", type=_seconds(1), default=25.0, help="seconds to run")
+    ap.add_argument("--interval", type=_seconds(0.1), default=None,
+                    help="seconds between passes")
     ap.add_argument("--watch", type=str, default=None, help="only report processes whose name contains this")
     ap.add_argument("--pid", type=int, action="append", default=None,
                     help="target these PIDs (repeatable): force a memory scan of each "
