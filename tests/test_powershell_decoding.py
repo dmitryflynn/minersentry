@@ -86,8 +86,9 @@ def test_run_raises_what_subprocess_raises(monkeypatch):
 def test_every_collector_reads_powershell_through_the_helper():
     """So the decoding cannot drift again. Two exceptions, both deliberate:
     procevents streams a long-lived helper through Popen and sets UTF-8
-    itself, and the service toast discards its output."""
-    allowed = {"powershell.py", "procevents.py", "service.py"}
+    itself. The service toast used to be the second, and pasted its text
+    into the script; it goes through the helper now, text in `env`."""
+    allowed = {"powershell.py", "procevents.py"}
     direct = re.compile(r"""subprocess\.\w+\(\s*\[\s*["']powershell""")
     offenders = [p.name for p in PACKAGE.glob("*.py")
                  if p.name not in allowed

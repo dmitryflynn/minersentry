@@ -28,6 +28,7 @@ import time
 
 from . import dnscache as dns_mod
 from . import persistence as persist_mod
+from . import powershell
 from . import tray as tray_mod
 from .audit import AuditLog
 from .config import Config
@@ -39,23 +40,36 @@ SYSTEMD_UNIT = "minersentry.service"
 
 
 # -- alerting ---------------------------------------------------------------
-def _toast_script(title: str, body: str) -> str:
-    """PowerShell that raises a Windows toast. Pure, so it is unit-tested."""
-    # Single-quoted PowerShell strings: ' is escaped by doubling it.
-    t = title.replace("'", "''")
-    b = body.replace("'", "''")
-    return (
-        "[void][Windows.UI.Notifications.ToastNotificationManager,"
-        "Windows.UI.Notifications,ContentType=WindowsRuntime];"
-        "$x=[Windows.UI.Notifications.ToastNotificationManager]::"
-        "GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
-        "$n=$x.GetElementsByTagName('text');"
-        f"$n[0].AppendChild($x.CreateTextNode('{t}'))|Out-Null;"
-        f"$n[1].AppendChild($x.CreateTextNode('{b}'))|Out-Null;"
-        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("
-        "'Microsoft.WindowsPowerShell').Show("
-        "[Windows.UI.Notifications.ToastNotification]::new($x))"
-    )
+# The toast's text arrives in the environment and the script never changes.
+#
+# It used to be pasted into single-quoted strings with ' doubled. PowerShell
+# also ends a single-quoted string at the typographic quotes U+2018, U+2019,
+# U+201A and U+201B, so a process named  xmrig’;<command>;’.exe  closed the
+# string and ran <command>. The watcher runs as SYSTEM and the body carries
+# the detected process's name, which whoever planted the binary chooses: a
+# local privilege escalation. Same class as #93; same fix.
+TOAST_SCRIPT = (
+    "[void][Windows.UI.Notifications.ToastNotificationManager,"
+    "Windows.UI.Notifications,ContentType=WindowsRuntime];"
+    "$x=[Windows.UI.Notifications.ToastNotificationManager]::"
+    "GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
+    "$n=$x.GetElementsByTagName('text');"
+    "$n[0].AppendChild($x.CreateTextNode($env:MINERSENTRY_TOAST_TITLE))|Out-Null;"
+    "$n[1].AppendChild($x.CreateTextNode($env:MINERSENTRY_TOAST_BODY))|Out-Null;"
+    "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("
+    "'Microsoft.WindowsPowerShell').Show("
+    "[Windows.UI.Notifications.ToastNotification]::new($x))"
+)
+
+
+def _toast_env(title: str, body: str) -> dict[str, str]:
+    """The toast's text, as environment variables. Pure.
+
+    A NUL cannot be passed in an environment block, and nothing a person
+    reads needs one.
+    """
+    return {"MINERSENTRY_TOAST_TITLE": title.replace("\0", ""),
+            "MINERSENTRY_TOAST_BODY": body.replace("\0", "")}
 
 
 def _split_command(cmd: str) -> list[str]:
@@ -88,10 +102,7 @@ def notify(title: str, body: str, cfg: Config | None = None) -> str:
     if sys.platform == "win32":
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
-            r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
-                                "-Command", _toast_script(title, body)],
-                               timeout=20, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, creationflags=flags)
+            r = powershell.run(TOAST_SCRIPT, timeout=20, env=_toast_env(title, body))
             if r.returncode == 0:
                 return "toast"
         except Exception:  # noqa: BLE001
