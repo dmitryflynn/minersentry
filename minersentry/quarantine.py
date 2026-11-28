@@ -148,22 +148,80 @@ def _valid_ip(ip: str) -> bool:
         return False
 
 
+def unblockable_reason(ip: str) -> str:
+    """Why an address must not be blocked, or "" if it may be. Pure.
+
+    Loopback, unspecified, multicast and link-local addresses are refused:
+    blocking 127.0.0.1 or ::1 breaks local services (MinerSentry's own helper
+    included), and none of them is where a pool lives. Private LAN addresses
+    are allowed, because a miner's proxy often is one.
+    """
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return f"{ip!r} is not an IP address."
+    if addr.is_loopback:
+        return f"{ip} is a loopback address; blocking it breaks local services."
+    if addr.is_unspecified:
+        return f"{ip} is the unspecified address."
+    if addr.is_multicast:
+        return f"{ip} is a multicast address."
+    if addr.is_link_local:
+        return f"{ip} is a link-local address."
+    return ""
+
+
+def blocked() -> list[dict]:
+    """Addresses this tool currently has a firewall block on, oldest first.
+
+    Replayed from the journal: a block_ip adds, an unblock_ip removes. The
+    firewall itself is not consulted, so a rule someone deleted by hand still
+    shows here until it is unblocked; unblocking it then fails harmlessly.
+    """
+    current: dict[str, dict] = {}
+    for rec in history(500):
+        ip = rec.get("ip")
+        if not ip:
+            continue
+        if rec.get("action") == "block_ip":
+            current.setdefault(ip, {"ip": ip, "ts": rec.get("ts", "")})
+        elif rec.get("action") == "unblock_ip":
+            current.pop(ip, None)
+    return list(current.values())
+
+
+def _firewall_args(ip: str, add: bool) -> list[str]:
+    import ipaddress
+    rule = f"{FIREWALL_RULE_PREFIX} {ip}"
+    if IS_WINDOWS:
+        if add:
+            return ["netsh", "advfirewall", "firewall", "add", "rule",
+                    f"name={rule}", "dir=out", "action=block", f"remoteip={ip}"]
+        return ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule}"]
+    # iptables only handles IPv4; an IPv6 address needs ip6tables, which the
+    # old code never used, so blocking one always failed on Linux.
+    tool = "ip6tables" if ipaddress.ip_address(ip).version == 6 else "iptables"
+    return [tool, "-A" if add else "-D", "OUTPUT", "-d", ip, "-j", "DROP"]
+
+
 def block_ip(ip: str) -> Result:
     """Block one remote address outbound, by IP.
 
     The miner stays up and keeps failing to submit, which is both less
     disruptive than killing it and useful evidence that the address mattered.
+    Blocking an address that is already blocked adds no second rule: the
+    first unblock would otherwise remove one copy and leave the other.
     """
-    if not _valid_ip(ip):
-        return Result(False, f"{ip!r} is not an IP address.")
+    why = unblockable_reason(ip)
+    if why:
+        return Result(False, why)
+    if any(b["ip"] == ip for b in blocked()):
+        return Result(True, f"{ip} is already blocked.", undo=f"unblock_ip('{ip}')")
     if not is_elevated():
         return Result(False, "Blocking an address needs Administrator / root.")
     rule = f"{FIREWALL_RULE_PREFIX} {ip}"
-    if IS_WINDOWS:
-        args = ["netsh", "advfirewall", "firewall", "add", "rule",
-                f"name={rule}", "dir=out", "action=block", f"remoteip={ip}"]
-    else:
-        args = ["iptables", "-A", "OUTPUT", "-d", ip, "-j", "DROP"]
+    args = _firewall_args(ip, add=True)
     try:
         r = subprocess.run(args, capture_output=True, text=True, timeout=30)
     except Exception as e:  # noqa: BLE001
@@ -180,10 +238,7 @@ def unblock_ip(ip: str) -> Result:
     if not is_elevated():
         return Result(False, "Removing the rule needs Administrator / root.")
     rule = f"{FIREWALL_RULE_PREFIX} {ip}"
-    if IS_WINDOWS:
-        args = ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule}"]
-    else:
-        args = ["iptables", "-D", "OUTPUT", "-d", ip, "-j", "DROP"]
+    args = _firewall_args(ip, add=False)
     try:
         r = subprocess.run(args, capture_output=True, text=True, timeout=30)
     except Exception as e:  # noqa: BLE001
@@ -274,11 +329,19 @@ def processes_using(path: str) -> list[psutil.Process]:
 
 
 def quarantined() -> list[dict]:
-    """What is in quarantine now, with where each file came from."""
-    stored = {}
+    """What is in quarantine now, with where each file came from.
+
+    `kind` is set when the file came from an autostart removal; those are
+    undone through persistence.removals(), so a caller offering undos can
+    skip them here and not list the same file twice.
+    """
+    stored: dict[str, dict] = {}
     for rec in history(500):
         if rec.get("action") == "quarantine_file":
-            stored[rec.get("stored")] = rec.get("original")
+            stored[rec.get("stored")] = {"stored": rec.get("stored"),
+                                         "original": rec.get("original"),
+                                         "kind": rec.get("kind", ""),
+                                         "ts": rec.get("ts", "")}
         elif rec.get("action") == "restore_file":
             stored.pop(rec.get("stored"), None)
-    return [{"stored": s, "original": o} for s, o in stored.items() if s and os.path.isfile(s)]
+    return [r for s, r in stored.items() if s and os.path.isfile(s)]

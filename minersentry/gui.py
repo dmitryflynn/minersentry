@@ -45,6 +45,56 @@ def _describe_removal(record: dict) -> str:
     return f"{when or '(no timestamp)':<19}  {what}"
 
 
+def reversible_actions() -> list[dict]:
+    """Everything this tool did that can be put back, newest first.
+
+    Three sources, each with its own undo: autostart removals, binaries
+    quarantined from the dashboard, and firewall blocks. A file quarantined by
+    an autostart removal is undone as that removal, so it is listed once, not
+    twice (quarantined() marks it with a `kind`).
+    """
+    out: list[dict] = []
+    for record in persist_mod.removals():
+        out.append({"ts": str(record.get("ts", "")),
+                    "label": "autostart  " + _describe_removal(record),
+                    "undo": lambda r=record: persist_mod.undo_removal(r),
+                    "verb": "restored"})
+    for held in quarantine_mod.quarantined():
+        if held.get("kind"):
+            continue
+        record = {"ts": held.get("ts", ""), "action": "quarantine_file",
+                  "original": held.get("original", "")}
+        out.append({"ts": str(held.get("ts", "")),
+                    "label": "binary     " + _describe_removal(record),
+                    "undo": lambda h=held: quarantine_mod.restore_file(h["stored"]),
+                    "verb": "restored"})
+    for block in quarantine_mod.blocked():
+        when = str(block.get("ts", ""))[:19].replace("T", " ")
+        out.append({"ts": str(block.get("ts", "")),
+                    "label": f"firewall   {when or '(no timestamp)':<19}  "
+                             f"outbound block on {block['ip']}",
+                    "undo": lambda ip=block["ip"]: quarantine_mod.unblock_ip(ip),
+                    "verb": "unblocked"})
+    # The journal's timestamps sort as text (ISO 8601), newest first.
+    out.sort(key=lambda a: a["ts"], reverse=True)
+    return out
+
+
+def blockable_addresses(conns) -> list[str]:
+    """The distinct remote addresses in a process's connections that may be
+    blocked, in first-seen order. Pure apart from the connection objects."""
+    seen: list[str] = []
+    for c in conns:
+        raddr = getattr(c, "raddr", None)
+        ip = getattr(raddr, "ip", None) if raddr else None
+        if not ip or ip in seen:
+            continue
+        if quarantine_mod.unblockable_reason(ip):
+            continue
+        seen.append(ip)
+    return seen
+
+
 def _relaunch_as_admin() -> bool:
     """Relaunch MinerSentry elevated via the UAC prompt. Returns True on launch."""
     try:
@@ -163,13 +213,21 @@ class MinerSentryApp:
         self._btn(bar, "🪤  Run evasion probe", self.run_probe, "#bb8009").pack(side="left", padx=(8, 0))
         self._btn(bar, "🧷  Scan autostart", self.scan_autostart, "#1f6feb").pack(
             side="left", padx=(8, 0))
+        self._btn(bar, "↩  Undo an action", self.undo_removal, "#30363d").pack(
+            side="right")
+
+        # Actions on the selected process sit on their own row. Nine buttons
+        # on one row need about 1,400 px and the window opens at 1,120, so
+        # the last few were cut off.
+        bar = tk.Frame(self.root, bg=BG)
+        bar.pack(fill="x", padx=16, pady=(0, 8))
         self._btn(bar, "⏸  Suspend selected", self.suspend_selected, "#8957e5").pack(
-            side="left", padx=(8, 0))
+            side="left")
         self.btn_kill = self._btn(bar, "⛔  Terminate selected", self.kill_selected, RED)
         self.btn_kill.pack(side="left", padx=(8, 0))
         self._btn(bar, "🔒  Quarantine binary", self.quarantine_selected, "#9e6a03").pack(
             side="left", padx=(8, 0))
-        self._btn(bar, "↩  Undo a removal", self.undo_removal, "#30363d").pack(
+        self._btn(bar, "⊘  Block its address", self.block_selected, "#9e3b3b").pack(
             side="left", padx=(8, 0))
 
         # Weakened-defences banner (shown only when the tamper scan finds
@@ -725,21 +783,22 @@ class MinerSentryApp:
 
     # -- undoing a removal --------------------------------------------------
     def undo_removal(self) -> None:
-        """Put back an autostart entry that was removed.
+        """Put back anything this tool did that can be put back.
 
-        The removal dialog says the action is recorded so it can be undone.
-        It was true of the journal and false of this window: nothing here
-        called `undo_removal`, and the only way back was the command line.
+        Autostart removals, quarantined binaries and firewall blocks. The
+        last two existed only in the Python API: the README offered "Unblock"
+        and "Restore", and nothing in the window or on the command line could
+        do either.
         """
-        records = persist_mod.removals()
-        if not records:
-            messagebox.showinfo("Undo a removal",
-                                "Nothing has been removed yet, so there is "
-                                "nothing to put back.")
+        actions = reversible_actions()
+        if not actions:
+            messagebox.showinfo("Undo an action",
+                                "Nothing has been removed, quarantined or "
+                                "blocked, so there is nothing to put back.")
             return
 
         win = tk.Toplevel(self.root)
-        win.title("Undo a removal")
+        win.title("Undo an action")
         win.configure(bg=BG)
         win.transient(self.root)
         tk.Label(win, bg=BG, fg=FG, font=("Segoe UI", 10), justify="left",
@@ -749,25 +808,24 @@ class MinerSentryApp:
                          font=("Consolas", 9), selectbackground=ACCENT,
                          relief="flat", highlightthickness=0, activestyle="none")
         box.pack(fill="both", expand=True, padx=14)
-        newest_first = list(reversed(records))
-        for record in newest_first:
-            box.insert("end", "  " + _describe_removal(record))
+        for action in actions:
+            box.insert("end", "  " + action["label"])
         box.selection_set(0)
 
         def restore() -> None:
             selection = box.curselection()
             if not selection:
                 return
-            record = newest_first[selection[0]]
-            result = persist_mod.undo_removal(record)
-            self._add_event(("removal undone: " if result.ok
+            action = actions[selection[0]]
+            result = action["undo"]()
+            self._add_event((f"{action['verb']}: " if result.ok
                              else "undo failed: ") + result.message)
             self._set_status(result.message)
             if result.ok:
-                messagebox.showinfo("Undo a removal", result.message, parent=win)
+                messagebox.showinfo("Undo an action", result.message, parent=win)
                 win.destroy()
             else:
-                messagebox.showerror("Undo a removal", result.message, parent=win)
+                messagebox.showerror("Undo an action", result.message, parent=win)
 
         row = tk.Frame(win, bg=BG)
         row.pack(fill="x", padx=14, pady=12)
@@ -888,8 +946,79 @@ class MinerSentryApp:
             messagebox.showerror("Quarantine", r.message)
         else:
             messagebox.showinfo("Quarantined", r.message +
-                                "\n\nUndo it from the quarantine folder under "
-                                "%LOCALAPPDATA%\\MinerSentry.")
+                                "\n\nPut it back with Undo an action.")
+
+    def block_selected(self) -> None:
+        """Block outbound traffic to an address the selected process uses.
+
+        The miner stays up and keeps failing to submit, which is less
+        disruptive than killing it and shows whether the address mattered.
+        The addresses are read from the live process at the moment of the
+        click, not from an older pass.
+        """
+        pid, row = self._selected()
+        if pid is None:
+            return
+        name = row.name if row else f"PID {pid}"
+        try:
+            conns = psutil.Process(pid).net_connections(kind="inet")
+        except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+            messagebox.showinfo("Block address",
+                                f"Could not read the connections of {name}: "
+                                f"{type(e).__name__}. Run as Administrator to see "
+                                f"other users' processes.")
+            return
+        addresses = blockable_addresses(conns)
+        if not addresses:
+            messagebox.showinfo("Block address",
+                                f"{name} has no remote address that can be blocked.")
+            return
+        if len(addresses) == 1:
+            self._confirm_block(name, addresses[0], parent=self.root)
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Block address")
+        win.configure(bg=BG)
+        win.transient(self.root)
+        tk.Label(win, bg=BG, fg=FG, font=("Segoe UI", 10), justify="left",
+                 text=f"{name} is connected to these addresses. Block one:"
+                 ).pack(anchor="w", padx=14, pady=(12, 6))
+        box = tk.Listbox(win, bg=PANEL, fg=FG, width=60, height=min(10, len(addresses)),
+                         font=("Consolas", 9), selectbackground=ACCENT,
+                         relief="flat", highlightthickness=0, activestyle="none")
+        box.pack(fill="both", expand=True, padx=14)
+        for ip in addresses:
+            box.insert("end", "  " + ip)
+        box.selection_set(0)
+
+        def block() -> None:
+            selection = box.curselection()
+            if selection and self._confirm_block(name, addresses[selection[0]],
+                                                 parent=win):
+                win.destroy()
+
+        buttons = tk.Frame(win, bg=BG)
+        buttons.pack(fill="x", padx=14, pady=12)
+        self._btn(buttons, "Block selected", block, "#9e3b3b").pack(side="left")
+        self._btn(buttons, "Close", win.destroy, "#30363d").pack(side="right")
+
+    def _confirm_block(self, name: str, ip: str, parent) -> bool:
+        if not messagebox.askyesno(
+                "Block address",
+                f"Block all outbound traffic from this machine to {ip}?\n\n"
+                f"{name} is connected to it. This adds one firewall rule and "
+                f"needs Administrator. Undo it with Undo an action.",
+                parent=parent):
+            return False
+        r = quarantine_mod.block_ip(ip)
+        self._set_status(r.message)
+        self._add_event(("blocked: " if r.ok else "block failed: ") + r.message)
+        if r.ok:
+            messagebox.showinfo("Block address", r.message, parent=parent)
+        else:
+            messagebox.showerror("Block address", r.message, parent=parent)
+        return r.ok
 
     def _set_status(self, text: str) -> None:
         self.status.configure(text="  " + text)

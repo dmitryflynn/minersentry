@@ -339,6 +339,8 @@ def test_the_undo_dialog_opens_and_lists_the_removals(tk_root, monkeypatch):
          "stored": r"Q\Evil.lnk"},
     ]
     monkeypatch.setattr(gui_mod.persist_mod, "removals", lambda: records)
+    monkeypatch.setattr(gui_mod.quarantine_mod, "quarantined", lambda: [])
+    monkeypatch.setattr(gui_mod.quarantine_mod, "blocked", lambda: [])
 
     app = SimpleNamespace(root=tk_root, _add_event=lambda s: None,
                           _set_status=lambda s: None,
@@ -362,6 +364,8 @@ def test_the_undo_dialog_says_so_when_there_is_nothing_to_undo(tk_root, monkeypa
     from minersentry import gui as gui_mod
     told = []
     monkeypatch.setattr(gui_mod.persist_mod, "removals", lambda: [])
+    monkeypatch.setattr(gui_mod.quarantine_mod, "quarantined", lambda: [])
+    monkeypatch.setattr(gui_mod.quarantine_mod, "blocked", lambda: [])
     monkeypatch.setattr(gui_mod.messagebox, "showinfo",
                         lambda title, message, **k: told.append(message))
     MinerSentryApp.undo_removal(SimpleNamespace(root=tk_root))

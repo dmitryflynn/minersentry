@@ -324,8 +324,17 @@ appears as `msentry_target.exe` when run with `--unsigned`.)
   refuses if the PID now belongs to a different process than the row showed.
 - **Quarantine binary** — move the executable somewhere it cannot launch,
   recording where it came from so it can be put back.
-- **Undo a removal** — put back an autostart entry that was removed, newest
-  first.
+- **Block its address** — add a firewall rule blocking outbound traffic to an
+  address the selected process is connected to. The miner stays up and its
+  submissions fail. Loopback, link-local and multicast addresses are never
+  offered; a LAN address is, since a miner's proxy is often one. Needs
+  Administrator.
+- **Undo an action** — one list, newest first, of everything that can be put
+  back: autostart removals, quarantined binaries and firewall blocks. Each is
+  undone the right way for what it was.
+
+The scan controls sit on the top row and the actions on the selected process on
+the row below it.
 
 ## Headless scan & benchmark
 
@@ -556,12 +565,25 @@ depends on remembering what was done:
 | Action | What it does | Undo |
 |---|---|---|
 | Suspend | freezes the process; it stops earning, stays inspectable | Resume (the GUI offers it after suspending) |
-| Remove autostart | deletes the registry value, task, or startup file that revives it | **Undo a removal** in the GUI, or `minersentry-scan --autostart-undo` |
-| Quarantine | moves the binary where it cannot launch, remembering its home | move it back from `%LOCALAPPDATA%\MinerSentry\quarantine` (the journal records where it came from) |
+| Remove autostart | deletes the registry value, task, or startup file that revives it | **Undo an action** in the GUI, or `minersentry-scan --autostart-undo` |
+| Quarantine | moves the binary where it cannot launch, remembering its home | **Undo an action**, or `minersentry-scan --restore FILE` |
+| Block address | firewall rule dropping outbound traffic to one address (`netsh` on Windows; `iptables`, or `ip6tables` for IPv6, on Linux) | **Undo an action**, or `minersentry-scan --unblock IP` |
 | Terminate | ends it, as before | none |
 
-Blocking a pool address with a firewall rule exists as `quarantine.block_ip` /
-`unblock_ip` in the Python API, but neither the GUI nor the CLI offers it yet.
+The same actions from the command line:
+
+```bash
+minersentry-scan --block 203.0.113.7       # needs Administrator / root
+minersentry-scan --blocked                 # what this tool has blocked
+minersentry-scan --unblock 203.0.113.7
+minersentry-scan --quarantined             # what is held, and where it came from
+minersentry-scan --restore xmrig.exe       # by file name, original path, or stored path
+```
+
+Each takes `--json`. A `--restore` that matches more than one file restores
+nothing and lists the candidates. The list of blocks is read back from the
+journal, not from the firewall, so a rule deleted by hand still shows until it
+is unblocked here.
 
 Autostart removals are verified by execution, not only by unit test. A test
 that monkeypatches `subprocess.run` or `winreg` proves the right command was
@@ -642,14 +664,21 @@ Two files, deliberately not equal in authority:
 | File | Who can write it | What it may change |
 |---|---|---|
 | `%ProgramFiles%\MinerSentry\config.json` (`/etc/minersentry/config.json`) | Administrator / root only | everything |
-| `%LOCALAPPDATA%\MinerSentry\config.json` (`~/MinerSentry/config.json`) | the logged-in user, and so anything running as them | scan timing within bounds; **adding** miner names and pool ports |
+| `%LOCALAPPDATA%\MinerSentry\config.json` (`~/MinerSentry/config.json`) | the logged-in user, and so anything running as them | scan timing within fixed bounds, and never slower than the admin file sets; **adding** miner names and pool ports |
 
 Anything running as the user can write the per-user file, malware included. One
 line there used to be enough to switch detection off — raise the verdict
 thresholds, or add `"trusted_dirs": ["C:\\"]` to trust the whole disk. So that
-file may now only make MinerSentry *more* suspicious, never less. Everything it
-tries to relax is ignored and reported in the event log (`config_warnings` in
-`--json`). Real tuning belongs in the admin file, which is honored only when it
+file can no longer relax detection. Everything it tries to relax is ignored and
+reported in the event log (`config_warnings` in `--json`).
+
+Scan timing is the one exception, on purpose. A user on a laptop may want
+scanning less often than the defaults, and that is allowed within fixed bounds:
+`scan_interval` 1–10 s, `gpu_sample_interval` 2–60 s, `deep_auto_interval`
+15–120 s. Those bounds keep a slowed scan inside the window where a miner still
+shows up. When the admin file sets one of these, its value is a ceiling the
+per-user file cannot exceed, so an administrator who wants a fast cadence gets
+it. Real tuning belongs in the admin file, which is honored only when it
 is genuinely protected: inside Program Files on Windows, root-owned and not
 group- or world-writable on Linux. `--config FILE` loads one file and trusts it
 fully, for testing.
