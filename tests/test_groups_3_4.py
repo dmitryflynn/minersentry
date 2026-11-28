@@ -248,9 +248,42 @@ def test_alert_threshold_ranking():
     assert not service.should_alert("Clean", "Suspicious")
 
 
-def test_toast_script_escapes_quotes():
-    s = service._toast_script("it's bad", "xmrig's pool")
-    assert "it''s bad" in s and "xmrig''s pool" in s
+def test_toast_text_travels_in_the_environment_never_the_script():
+    """A typographic quote ends a PowerShell single-quoted string, so a
+    process named with one ran code as SYSTEM through the toast."""
+    evil = "x’))|Out-Null;Start-Process calc;$null=((’.exe"
+    env = service._toast_env("it's bad", evil)
+    assert env == {"MINERSENTRY_TOAST_TITLE": "it's bad",
+                   "MINERSENTRY_TOAST_BODY": evil}
+    assert "calc" not in service.TOAST_SCRIPT
+    assert "$env:MINERSENTRY_TOAST_BODY" in service.TOAST_SCRIPT
+
+
+def test_a_nul_in_the_toast_text_cannot_break_the_environment_block():
+    assert service._toast_env("a\0b", "c\0d") == {
+        "MINERSENTRY_TOAST_TITLE": "ab", "MINERSENTRY_TOAST_BODY": "cd"}
+
+
+def test_notify_hands_the_text_to_powershell_as_environment(monkeypatch):
+    calls = []
+    monkeypatch.setattr(service.sys, "platform", "win32")
+    monkeypatch.setattr(service.powershell, "run",
+                        lambda script, timeout, env=None: calls.append((script, env))
+                        or SimpleNamespace(returncode=0))
+    assert service.notify("t", "x’;evil;’", Config(notify_command="")) == "toast"
+    script, env = calls[0]
+    assert script == service.TOAST_SCRIPT
+    assert env["MINERSENTRY_TOAST_BODY"] == "x’;evil;’"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="needs powershell.exe")
+def test_live_powershell_reads_the_text_without_running_it():
+    from minersentry import powershell
+    evil = "x’))|Out-Null;Write-Output INJECTED;$null=((’.exe"
+    r = powershell.run("Write-Output $env:MINERSENTRY_TOAST_BODY", timeout=60,
+                       env=service._toast_env("t", evil))
+    lines = r.stdout.strip().splitlines()
+    assert len(lines) == 1 and "INJECTED" in lines[0] and lines[0] != "INJECTED"
 
 
 def test_install_commands_are_well_formed():
