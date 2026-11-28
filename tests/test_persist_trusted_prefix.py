@@ -8,7 +8,11 @@ import pytest
 from minersentry import persistence as P
 from minersentry.config import Config
 
-CFG = Config()
+# Explicit Windows directories: Config() picks POSIX ones off Windows, so the
+# C:\ paths below were judged against /usr/bin on the Linux runners and the
+# real-Program-Files cases failed there.
+CFG = Config(trusted_dirs=(r"c:\program files", r"c:\program files (x86)",
+                           r"c:\windows\system32", r"c:\windows\syswow64"))
 
 
 def _labels(exe):
