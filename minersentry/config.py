@@ -490,10 +490,32 @@ def user_config_path() -> str:
     return os.path.join(base, "MinerSentry", "config.json")
 
 
+def program_files() -> str:
+    r"""Where Program Files really is, from HKLM rather than the environment.
+
+    `%ProgramFiles%` is an environment variable, and a user-level variable of
+    the same name in HKCU\Environment overrides it for every process that
+    user starts, elevated ones included. Anything running as the user could
+    point it at a folder of its own, and the "admin-only" config file there
+    passed the protection check below, because that check compared the file
+    against the same overridden variable. The registry value is in HKLM,
+    which only an administrator can change.
+    """
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SOFTWARE\Microsoft\Windows\CurrentVersion") as key:
+            value, _ = winreg.QueryValueEx(key, "ProgramFilesDir")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    except (ImportError, OSError):
+        pass
+    return r"C:\Program Files"
+
+
 def system_config_path() -> str:
     if _IS_WINDOWS:
-        base = os.environ.get("ProgramFiles") or r"C:\Program Files"
-        return os.path.join(base, "MinerSentry", "config.json")
+        return os.path.join(program_files(), "MinerSentry", "config.json")
     return "/etc/minersentry/config.json"
 
 
@@ -505,7 +527,7 @@ def _system_file_is_protected(path: str, warnings: list[str]) -> bool:
     if _IS_WINDOWS:
         # Creating anything under Program Files needs admin. Refuse a path that
         # resolves elsewhere (a junction planted to point at a user folder).
-        base = os.path.realpath(os.environ.get("ProgramFiles") or r"C:\Program Files")
+        base = os.path.realpath(program_files())
         if not real.lower().startswith(base.lower().rstrip("\\") + "\\"):
             warnings.append(f"ignored {path}: resolves outside Program Files")
             return False
